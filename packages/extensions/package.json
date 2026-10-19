@@ -1,0 +1,15 @@
+{
+  "name": "@keystone/extensions",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Extension manifest validation, registry, activation gating and the conformance kit",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@keystone/kernel": "workspace:*",
+    "@keystone/schemas": "workspace:*"
+  }
+}

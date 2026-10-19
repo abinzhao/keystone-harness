@@ -1,0 +1,24 @@
+{
+  "name": "@keystone/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Keystone headless client: project intake, task runs, recovery, branching, proof export and replay",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "bin": {
+    "keystone": "./src/bin.ts"
+  },
+  "dependencies": {
+    "@keystone/extensions": "workspace:*",
+    "@keystone/i18n": "workspace:*",
+    "@keystone/kernel": "workspace:*",
+    "@keystone/models": "workspace:*",
+    "@keystone/runtime": "workspace:*",
+    "@keystone/schemas": "workspace:*",
+    "@keystone/tools": "workspace:*",
+    "@keystone/verifiers": "workspace:*"
+  }
+}

@@ -1,0 +1,33 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+*.tsbuildinfo
+
+# keystone local runtime data (never commit project cognition, evidence, or proofs)
+.keystone/
+*.keystone-tmp
+
+# logs and diagnostics
+*.log
+logs/
+coverage/
+.tmp/
+tmp/
+
+# editor and OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# secrets — BYOK credentials must never be committed
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json

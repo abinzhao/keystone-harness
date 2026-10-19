@@ -1,0 +1,11 @@
+{
+  "name": "@keystone/schemas",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Authoritative versioned schemas, runtime validators and canonical encoding for Keystone Run Protocol objects",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

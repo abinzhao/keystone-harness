@@ -1,0 +1,19 @@
+{
+  "name": "@keystone/extension-no-debug-statements",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Reference Keystone extension: a verifier that fails when the change set leaves debug statements behind",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@keystone/schemas": "workspace:*",
+    "@keystone/verifiers": "workspace:*"
+  },
+  "devDependencies": {
+    "@keystone/extensions": "workspace:*",
+    "@keystone/kernel": "workspace:*"
+  }
+}

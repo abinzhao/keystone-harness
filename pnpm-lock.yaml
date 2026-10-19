@@ -1,0 +1,144 @@
+lockfileVersion: '6.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.5
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
+  packages/cli:
+    dependencies:
+      '@keystone/extensions':
+        specifier: workspace:*
+        version: link:../extensions
+      '@keystone/i18n':
+        specifier: workspace:*
+        version: link:../i18n
+      '@keystone/kernel':
+        specifier: workspace:*
+        version: link:../kernel
+      '@keystone/models':
+        specifier: workspace:*
+        version: link:../models
+      '@keystone/runtime':
+        specifier: workspace:*
+        version: link:../runtime
+      '@keystone/schemas':
+        specifier: workspace:*
+        version: link:../schemas
+      '@keystone/tools':
+        specifier: workspace:*
+        version: link:../tools
+      '@keystone/verifiers':
+        specifier: workspace:*
+        version: link:../verifiers
+
+  packages/extension-no-debug-statements:
+    dependencies:
+      '@keystone/schemas':
+        specifier: workspace:*
+        version: link:../schemas
+      '@keystone/verifiers':
+        specifier: workspace:*
+        version: link:../verifiers
+    devDependencies:
+      '@keystone/extensions':
+        specifier: workspace:*
+        version: link:../extensions
+      '@keystone/kernel':
+        specifier: workspace:*
+        version: link:../kernel
+
+  packages/extensions:
+    dependencies:
+      '@keystone/kernel':
+        specifier: workspace:*
+        version: link:../kernel
+      '@keystone/schemas':
+        specifier: workspace:*
+        version: link:../schemas
+
+  packages/i18n: {}
+
+  packages/kernel:
+    dependencies:
+      '@keystone/schemas':
+        specifier: workspace:*
+        version: link:../schemas
+
+  packages/models:
+    dependencies:
+      '@keystone/schemas':
+        specifier: workspace:*
+        version: link:../schemas
+
+  packages/runtime:
+    dependencies:
+      '@keystone/extensions':
+        specifier: workspace:*
+        version: link:../extensions
+      '@keystone/i18n':
+        specifier: workspace:*
+        version: link:../i18n
+      '@keystone/kernel':
+        specifier: workspace:*
+        version: link:../kernel
+      '@keystone/models':
+        specifier: workspace:*
+        version: link:../models
+      '@keystone/schemas':
+        specifier: workspace:*
+        version: link:../schemas
+      '@keystone/tools':
+        specifier: workspace:*
+        version: link:../tools
+      '@keystone/verifiers':
+        specifier: workspace:*
+        version: link:../verifiers
+
+  packages/schemas: {}
+
+  packages/tools:
+    dependencies:
+      '@keystone/kernel':
+        specifier: workspace:*
+        version: link:../kernel
+      '@keystone/schemas':
+        specifier: workspace:*
+        version: link:../schemas
+
+  packages/verifiers:
+    dependencies:
+      '@keystone/kernel':
+        specifier: workspace:*
+        version: link:../kernel
+      '@keystone/schemas':
+        specifier: workspace:*
+        version: link:../schemas
+
+packages:
+
+  /@types/node@22.20.5:
+    resolution: {integrity: sha512-U2+DNr+wSjpsTS/wZGYHq7GcwfuSmKiKvoPvK22zwTlRhU91yOniN4qRR5KhIjvif7ysw/dz/hKmfDH0Ris4aA==}
+    dependencies:
+      undici-types: 6.21.0
+    dev: true
+
+  /typescript@5.9.3:
+    resolution: {integrity: sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==}
+    engines: {node: '>=14.17'}
+    hasBin: true
+    dev: true
+
+  /undici-types@6.21.0:
+    resolution: {integrity: sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ==}
+    dev: true

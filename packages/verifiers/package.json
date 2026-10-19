@@ -1,0 +1,15 @@
+{
+  "name": "@keystone/verifiers",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Built-in Keystone verifiers: tests, typecheck, lint, build, scope, project rules",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@keystone/kernel": "workspace:*",
+    "@keystone/schemas": "workspace:*"
+  }
+}

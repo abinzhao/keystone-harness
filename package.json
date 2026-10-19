@@ -1,0 +1,24 @@
+{
+  "name": "keystone-harness",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Evidence-native, local-first engineering agent harness",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "packageManager": "pnpm@8.15.9",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test \"packages/*/test/**/*.test.ts\"",
+    "test:watch": "node --test --watch \"packages/*/test/**/*.test.ts\"",
+    "bench": "node packages/runtime/bench/perf.ts",
+    "keystone": "node packages/cli/src/bin.ts",
+    "verify": "pnpm run typecheck && pnpm run test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}

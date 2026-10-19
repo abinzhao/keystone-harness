@@ -1,0 +1,15 @@
+{
+  "name": "@keystone/tools",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Built-in Keystone tools: filesystem, search, command execution, git",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@keystone/kernel": "workspace:*",
+    "@keystone/schemas": "workspace:*"
+  }
+}

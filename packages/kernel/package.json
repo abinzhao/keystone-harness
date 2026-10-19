@@ -1,0 +1,14 @@
+{
+  "name": "@keystone/kernel",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Authoritative Keystone state: ledger, state machine, contract, leases, run graph, evidence, proof, experience",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@keystone/schemas": "workspace:*"
+  }
+}

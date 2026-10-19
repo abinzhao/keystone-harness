@@ -1,0 +1,20 @@
+{
+  "name": "@keystone/runtime",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Keystone composition root: Builder and Assurance loops, context planning, autonomy and intervention",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@keystone/extensions": "workspace:*",
+    "@keystone/i18n": "workspace:*",
+    "@keystone/kernel": "workspace:*",
+    "@keystone/models": "workspace:*",
+    "@keystone/schemas": "workspace:*",
+    "@keystone/tools": "workspace:*",
+    "@keystone/verifiers": "workspace:*"
+  }
+}

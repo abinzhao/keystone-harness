@@ -1,0 +1,12 @@
+{
+  "name": "@keystone/i18n",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Presentation-layer localisation: language resolution and zh-CN/en message catalogs for user-facing text",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {}
+}
