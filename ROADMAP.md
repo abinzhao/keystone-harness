@@ -1,91 +1,62 @@
-# Roadmap (ROADMAP)
+# Roadmap
 
-This roadmap aligns with the three tiers P0/P1/P2 in Section 4 (version scope) of the [product requirements](./需求文档.md). P0 is broken down into verifiable milestones M0–M4; each milestone gives its **goal / deliverables / acceptance criteria**, and the acceptance criteria aim to be observable and reproducible.
+This roadmap is organised into three tiers — **Current**, **Next**, **Explore** — and deliberately uses **no calendar dates**. Every committed item carries an **entry gate** (what must be true before we commit to it) and an **exit gate** (what observable, reproducible result proves it is done). "Explore" items are research only: we name what would make us commit, but we do not promise a delivery.
 
-> Current status (against this file's acceptance criteria):
->
-> - **M0 complete**: governance documents, ADR-0001..0005, the architecture description, the TypeScript monorepo, and the type-check and test scripts are all in place, and the root commands are runnable.
-> - **M1 complete**: the kernel closed loop (project onboarding and snapshots, Contract compilation/revision/import-export, Run Graph with checkpoints/branching/recovery/replay, evidence levels and Proof Graph, evidence invalidation, bounded automatic repair, Experience Firewall, machine-readable formats) is implemented and test-covered.
-> - **M2 complete**: Context Plan, Capability Lease and the unified execution boundary, Autonomy Envelope and human intervention, verifiers and budgets, proof export, cloud/local model interfaces and switching, the four run modes (minimal/standard/isolated/replay) with degradation recording, and Git and workspace operations (isolated mode based on `git worktree`). **Known gap**: Git write operations (commit/rollback) are not implemented; only read-only Git tools + worktree isolation.
-> - **M3 complete**: Manifest validation and integrity, installation review, the conformance suite, the registry, activation gating and isolation, and the runnable reference extension `@keystone/extension-no-debug-statements` (with end-to-end registration/activation/isolation tests).
-> - **M4 partially complete**: the local Run Protocol service (loopback + token authentication) and the four-zone workbench single page (task list / goal and completion criteria / proof and evidence / human intervention) have been delivered, and rendering and data were verified in a real browser. **Not complete**: Tauri packaging, signing and notarization, native windows and system integration (menus, tray, deep links).
-> - **Performance**: measurement scripts and a first baseline have been established (`docs/performance/baseline-2026-10-19.md`). The local data layer is in the millisecond p95 range; **workspace scanning is not included in the measurements**, so NFR-PERF-01 does not yet constitute complete verification.
->
-> The P1/P2 scope is listed as in PRD 4.2/4.3, without further breakdown.
+> Reading status: a tier is not a release promise. It records where we have chosen to focus *now*, what we have queued *next*, and what we are deliberately *not* committing to. If an entry/exit gate is not met, the item is simply not done — no milestone date is missed.
 
-## P0: Evidence-native single-project closed loop
+**Product surface today vs. the end state.** Today is a developer-preview, CLI-first surface: the audience is the SDK, the Run Protocol, debug traces, and the evaluation harness. The ordinary-user end state is **zero-config progressive disclosure** — the workbench hides mechanics by default, shows a *preview* before any irreversible action, leaves a *receipt* after completion, pauses at *exceptions*, and supports *replay* of the whole run on demand. We build toward that end state on the same runtime; none of it is claimed shipped today.
 
-### M0 — Engineering foundation and documentation baseline
+## Current — committed, shipped or in flight
 
-| Item | Content |
-|---|---|
-| Goal | Establish a contributable engineering and documentation baseline so that kernel invariants, contracts, and the security model are fixed ahead of the implementation |
-| Deliverables | Governance documents (`AGENTS.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, `GOVERNANCE.md`, `SUPPORT.md`, `ROADMAP.md`, `CHANGELOG.md`); `docs/adr/` and the first ADRs; `docs/research/` competitive analysis; the TypeScript monorepo skeleton (`packages/` boundaries, Node native type stripping + `node:test`, type-check and test scripts) |
-| Acceptance criteria | The root commands `pnpm install`, type checking, and tests are executable; each `packages/` boundary conforms to `AGENTS.md` §3; at least 1 ADR is `Accepted`; kernel invariants can be traced item by item in the documentation |
+> **Delivery posture:** this is a developer-preview, CLI-first release. The shipped surface is the kernel, runtime, headless CLI, and the loopback workbench for developers; the ordinary-user desktop shell is not implemented and is the not-started item below.
 
-### M1 — Kernel closed loop without UI
+| Item | Status | Entry gate | Exit gate |
+|---|---|---|---|
+| P0 evidence-native single-project loop (kernel closed loop, runtime + CLI, extension SDK) | Shipped | Engineering baseline (`pnpm install` / typecheck / test runnable; ADR-0001..0005 accepted) | Replaying the event graph yields a consistent authoritative state; a task reaches `proven` only when every required condition has valid, non-invalidated evidence and model text cannot trigger it; out-of-scope writes pause and await a user decision. |
+| Local Run Protocol server + four-zone workbench | In flight | CLI/runtime loop exists; protocol objects export the same JSON Schema used for validation | Loopback server with bearer token; workbench renders task list, goal/completion conditions, proof & evidence, and intervention replies in a real browser; `minimal` / `standard` / `isolated` / `replay` modes selectable per run. |
+| Universal-foundation layering | In flight | Kernel already does not call models or touch the network; extensions already go through manifest + conformance | The kernel package contains no engineering-only semantics; engineering-specific facts live in adapters/extensions; a second (non-engineering) scenario can be expressed without changing kernel invariants. |
+| Git write operations | Known gap | Read-only git tools + `git worktree` isolation exist | Commit / rollback run only inside a scoped, short-lived Capability Lease; out-of-scope git writes pause; operations are replayed deterministically. |
+| Cross-platform hardening (Windows) | Preview | macOS verified on real hardware; resolution layer implemented and unit-tested | The end-to-end suite runs green on a Windows machine; process-group kill semantics and `.cmd` shim escaping are covered by e2e, not only unit, tests. |
 
-| Item | Content |
-|---|---|
-| Goal | Without a desktop shell, use the kernel + CLI to run the minimal closed loop of "onboard project → define outcome → execute → verify → prove → isolate experience" |
-| Deliverables | Local Git project onboarding, workspace snapshots, and a basic Project World Model (with provenance, applicable snapshot, trust level, and invalidation conditions); Outcome Contract compilation, revision, conflict surfacing, and versioning; a branchable Run Graph, checkpoints, pause, recovery, derivation, and state replay; Verifiers and evidence levels (E0–E4), Proof Graph, outcome proof and evidence invalidation, bounded automatic repair; Experience Firewall, candidate experience isolation, and user corrections; machine-readable Contract / event / Evidence / Proof formats |
-| Acceptance criteria | Replaying state over the same event graph yields a consistent authoritative state (NFR-REL-05); a task enters "proven" only when all required completion criteria have evidence at the prescribed level that has not been invalidated, and model text cannot trigger it; after workspace changes, affected evidence is precisely marked as invalidated along the Proof Graph; candidate experience does not enter context by default, and unpromoted experience does not appear in the execution context |
+The desktop shell (a thin Tauri wrapper around the existing workbench) is **not started**. Its entry gate is the workbench exit gate above; its exit gate is a native window that talks to the loopback server without forking runtime semantics. We do not package it until that seam is stable.
 
-### M2 — Runtime and CLI closed loop
+## Next — committed after the Current exit gates
 
-| Item | Content |
-|---|---|
-| Goal | Complete the runtime's governance capabilities so that tasks can execute continuously, explainably, and interruptibly within the user's hard boundaries |
-| Deliverables | Context Plan (provenance, budget, exclusions, invalidation conditions); Capability Lease and the unified execution boundary (files, code search, editing, standalone commands, Git and workspace operations); user hard boundaries and Autonomy Envelope, scope checking, non-modal human intervention; test/typecheck/lint/build/scope/diff/project-rule verification; cost and budget display; machine-readable proof export; compatible cloud and local model interfaces and model switching |
-| Acceptance criteria | All operations with side effects execute through a Capability Lease, and out-of-scope writes pause and can be rejected (PRD 8.4 EX-03); scope expansion must produce a reviewable user decision, and the Autonomy Envelope is not automatically expanded by the model/extension/past successes; model switching does not change a task's business state or completion criteria (NFR-REL-04); after the application exits, it can recover from a checkpoint (PRD 3.4); the CLI can perform state replay for the same task or export a machine-readable proof (PRD 14.12) |
+These are queued, but their entry gates depend on items still in flight; we will not start an item whose entry gate is unmet.
 
-### M3 — Extension SDK and conformance testing
+| Item | Entry gate (what unlocks it) | Exit gate (what proves it) |
+|---|---|---|
+| IDE integration (ACP-compatible) + non-interactive CI runs | Workbench/RPC seam stable; a headless run mode that needs no human UI | An external ACP host can drive the same runtime; CI runs produce a machine-readable proof package with no human in the loop. |
+| Multi-project local management + worktree-isolated parallel write tasks | Single-project loop exit gate holds; isolation proven per task | Several projects share one runtime; parallel write tasks touch separate worktrees and never mutate each other's working copy or evidence. |
+| Governed adapters for MCP tools and Agent Skills | Extension manifest + conformance kit cover capability, data egress, and replayability | An MCP tool or a Skill is installed only after integrity, conformance, and risk disclosure; it cannot self-authorise, widen scope, or change completion rules. |
+| Second batch of language / framework adapters | Onboarding marks unrecognised entry points instead of guessing | A second language's build/test/entry points are discovered, versioned, and invalidated precisely on change. |
+| **Reproducible efficacy scorecard / Harness gain** | A stable task set with hidden or independent acceptance scripts exists; each run records model, harness version, plugins, permissions, and environment | On a fixed task set, Standard vs Minimal mode isolates harness gain from model capability; the published scorecard reports variance, failure types, and the leadership-gate metrics (verification completion rate, intervention rate, context cost) as reproducible numbers — not only surface features. |
 
-| Item | Content |
-|---|---|
-| Goal | Open up governed extension points so that contributors can plug in capabilities without touching the kernel |
-| Deliverables | Extension Manifest (name, version, publisher, integrity, capabilities, IO Schema, data egress, producible Observation/Evidence, replayability, idempotency, uninstall behavior); minimal Model/Tool/Verifier SDK; conformance tests (Conformance Kit) and a reference extension; extension activation/isolation/degradation flows |
-| Acceptance criteria | Extension installation/upgrade goes through integrity checking, dependency resolution, conformance testing, risk disclosure, and user confirmation; extensions cannot authorize themselves, replace kernel completion rules, or disable safe mode (PRD 8.11, 11.7); when an extension crashes/times out/violates its Manifest it is isolated and checkpoints are retained; installing a reference extension reveals its capabilities, permissions, data egress, and conformance test results (PRD 14.13) |
+## Explore — research only, not committed
 
-### M4 — Desktop workbench
+No exit gate is promised here. We record the **entry condition** that would move an item into Next; until then it is investigation, not a commitment.
 
-| Item | Content |
-|---|---|
-| Goal | Provide ordinary users' primary working surface through a thin Tauri shell, without changing kernel semantics |
-| Deliverables | Four-zone workbench (title bar / left / center / right / bottom, with fixed responsibilities); task list and isolation switching; execution trace; outcome proof panel; input area; settings and local data management (BYOK, local data viewing and cleanup, protocol and runtime compatibility) |
-| Acceptance criteria | Fully walk through all the closed loops of first-release acceptance 1–13 in PRD Section 14; zone responsibilities and information priority are not changed by visual adjustments (PRD 8.9 UI-01); when switching tasks, the goal, workspace, project understanding, and evidence remain isolated; the p95 target from cold start to being able to view persisted tasks is ≤ 1.5 seconds (NFR-PERF-01, requiring baseline hardware and dataset in a public performance specification) |
+- **Remote agent delegation (A2A-shaped).** *Entry condition:* a concrete user need for cross-machine hand-off, plus a demonstrated way to carry provenance, leases, and proof across the boundary without weakening kernel invariants.
+- **Team-shared project rules, experience, and proofs.** *Entry condition:* local-first multi-device sync is proven, and a signed, replayable proof format exists that does not depend on a central server.
+- **Reference vertical packs beyond engineering** — personal, research, creation, enterprise, and physical-device/robotics. *Entry condition:* each pack is expressed as adapters + extensions with **zero kernel change**, and its completion judge remains a deterministic query over evidence. *Robotics adds a hard gate:* real-time safety is enforced by a layer outside the model/LLM, backed by device capability adapters — the model proposes, the safety layer decides. Until a pack clears its gate it is research, not a delivered vertical.
+- **Provider wire convergence (Responses / OpenAI-compatible shape).** *Entry condition:* the kernel-required adapter surface stays a thin wrapper; we track it in the [evidence note](./docs/research/2026-10-20-future-agent-foundation-evidence.md) and adopt it only when it lowers lock-in without changing semantics.
 
-> First-release acceptance (PRD §14) is M4's overall exit criterion; the acceptance criteria of M1–M3 are its observable subsets under no UI / partial capability.
+## Scope ambition vs. what is built
 
-## P1: Cross-surface, isolated parallelism, and ecosystem
+The foundation's ambition is to support **personal, research, creation, enterprise, and physical-device/robotics scenario packs** on top of the same kernel. **Today only the engineering pack is built.** The others are in scope as an architecture goal (zero kernel change, deterministic-evidence completion) and sit in Explore; none is delivered or claimed working.
 
-Aligned with PRD 4.2:
+## Explicitly out of scope / forbidden
 
-- ACP-compatible IDE integration and non-interactive CI runs.
-- Unified management of multiple local projects.
-- Parallel write tasks isolated by worktree or separate workspace.
-- Sub-agents enabled by benefit and isolated in context and permissions.
-- Project Analyzer, Workspace Runtime, and Protocol Adapter SDK.
-- MCP and Agent Skills integration and Harness Lab.
-- Second batch of programming language and engineering framework adaptations.
-- Differential verification, isolated replay, mutation checking, and richer semantic verification.
-- Positive transfer, negative transfer, and forgetting evaluation for experience.
+Multi-agent "software factories" that treat agent count as the goal and are on by default; a centralised hosted cloud admin back-end; mobile clients and remote signing as a launch target; automatic payments, email sending, and production deployment without an explicit lease; plugin or Skill marketplaces without isolation, conformance, and permission declarations; automatically promoting a single failure into a long-term project rule; allowing extensions to replace the state machine, authority issuance, evidence integrity, or completion determination; using a model's chain of thought as proof, an audit record, or a user deliverable.
 
-## P2: Remote collaboration and open ecosystem
+## How we judge "done"
 
-Aligned with PRD 4.3:
+Keystone does not claim leadership by feature count. A stable release must satisfy the cross-stage leadership gate under the same model, same task, same permissions, same time, and same token budget:
 
-- A2A-compatible remote agent delegation.
-- Remote and clustered Workspace Runtime.
-- Team-shared project rules, experience, and proofs.
-- Signed proofs, external trusted verification, and cross-machine replay.
-- An ecosystem of verifiers, rules, Workspace, and experience templates.
-- Multi-agent branch comparison, controlled merging, and task-graph collaboration.
+1. measurably better on at least one core dimension (verification completion rate, human-intervention rate, or context cost) than the best current reproducible baseline;
+2. with no regression on escape rate, out-of-scope change rate, or lifecycle safety;
+3. with deterministic evidence for recovery, replay, and branch comparison;
+4. with observable positive transfer from long-term experience and no negative transfer or forgetting beyond the release gate;
+5. where new models, extensions, protocols, or policies cannot break the Contract / Lease / Provenance / Evidence / Proof invariants.
 
-## Currently out of scope (PRD 4.4)
-
-General-purpose everyday office agents; multi-agent software factories that make agent count the goal and are enabled by default; centralized enterprise web admin backends; mobile clients and remote signing; automatic payments, email sending, and production deployment; plugin or Skill marketplaces without isolation, conformance testing, and permission declarations; automatically escalating a single failure into a long-term project rule; allowing extensions to replace the state machine, permission issuance, evidence integrity, or completion determination; using a model's chain of thought as proof, an audit record, or a user deliverable.
-
-## Leadership gate (PRD 13.1)
-
-Keystone does not claim leadership by feature count. A stable release must satisfy the cross-stage leadership gate under the same model, same task, same permissions, same time, and same token budget; the specific numeric thresholds are determined by public baseline evaluations and are not presupposed without data. Any statement of "leadership" must cite the current scorecard and a reproducible experiment (PRD 18.6).
+Numeric thresholds are set by public, reproducible baselines and are not preset without data. Any "leadership" statement must cite the current scorecard and a reproducible experiment.
