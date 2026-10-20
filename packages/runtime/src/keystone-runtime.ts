@@ -19,16 +19,21 @@ import { join, relative } from "node:path";
 
 import {
   defaultEnvelope,
-  detectProjectProfile,
   ExperienceFirewall,
   KernelSession,
   projectIdForWorkspace,
   ProjectFactStore,
-  scanWorkspace,
   type ContractPatch,
+  type ContractProposer,
   type EvaluationResult,
   type KeystonePaths,
 } from "@keystone/kernel";
+import {
+  compileContract,
+  detectProjectProfile,
+  resolveEngineeringAction,
+  scanWorkspace,
+} from "@keystone/pack-engineering";
 import {
   buildActionPrompt,
   ModelRouter,
@@ -80,6 +85,13 @@ export interface RuntimeOptions {
   readonly routes?: Partial<Record<ModelRole, readonly string[]>>;
   readonly tools?: readonly Tool<never>[];
   readonly verifiers?: readonly Verifier[];
+  /**
+   * Scenario pack that drafts the Outcome Contract. Defaults to the engineering
+   * `compileContract`; a non-engineering vertical (e.g. localization) injects its
+   * own proposer so its required conditions target extension-owned verifiers by
+   * id (ADR-0006). The kernel only folds whatever this returns into state.
+   */
+  readonly contractProposer?: ContractProposer;
   readonly mode?: RunMode;
   readonly actorId?: string;
 }
@@ -197,6 +209,7 @@ export class KeystoneRuntime {
   private readonly router = new ModelRouter();
   private readonly tools: readonly Tool<never>[];
   private readonly verifiers: readonly Verifier[];
+  private readonly contractProposer: ContractProposer;
   private readonly mode: RunMode;
   private readonly actorId: string;
 
@@ -204,6 +217,8 @@ export class KeystoneRuntime {
     this.paths = options.paths;
     this.tools = options.tools ?? builtinTools();
     this.verifiers = options.verifiers ?? builtinVerifiers();
+    // Engineering remains the default vertical; a non-engineering pack injects its own.
+    this.contractProposer = options.contractProposer ?? compileContract;
     this.mode = options.mode ?? "standard";
     this.actorId = options.actorId ?? "keystone";
 
@@ -263,6 +278,11 @@ export class KeystoneRuntime {
       request: options.request,
       references: options.references,
       actorId: this.actorId,
+      // The wired scenario pack drafts the Outcome Contract and resolves which
+      // capability a proposal needs; the kernel only folds the result into
+      // authoritative state (ADR-0006, M1).
+      proposeContract: this.contractProposer,
+      resolveAction: resolveEngineeringAction,
     });
     options.onTaskCreated?.(session.taskId);
 

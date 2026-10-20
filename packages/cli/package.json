@@ -16,6 +16,7 @@
     "@keystone/i18n": "workspace:*",
     "@keystone/kernel": "workspace:*",
     "@keystone/models": "workspace:*",
+    "@keystone/pack-engineering": "workspace:*",
     "@keystone/runtime": "workspace:*",
     "@keystone/schemas": "workspace:*",
     "@keystone/tools": "workspace:*",

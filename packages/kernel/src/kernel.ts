@@ -21,7 +21,6 @@ import {
   type ActionProposal,
   type BranchId,
   type Budget,
-  type Capability,
   type CapabilityLease,
   type Checkpoint,
   type CheckpointReason,
@@ -47,7 +46,10 @@ import {
   type UserDecision,
 } from "@keystone/schemas";
 
-import { compileContract, type CompileContractResult } from "./contract/compile.ts";
+import type {
+  ContractProposal,
+  ContractProposer,
+} from "./contract/propose.ts";
 import { reviseContract, type ContractPatch, type ReviseContractResult } from "./contract/revise.ts";
 import { invalidateForWorkspaceChange } from "./evidence/invalidate.ts";
 import { listEvidence, recordEvidence, updateEvidence, type RecordEvidenceInput } from "./evidence/store.ts";
@@ -56,6 +58,7 @@ import { foldTaskState } from "./ledger/fold.ts";
 import { appendEvent, chainTip, readLedger, type LedgerRead } from "./ledger/ledger.ts";
 import { assertTransition } from "./ledger/transitions.ts";
 import { issueLease, type LeaseDenial, type LeaseIssueResult } from "./lease/lease.ts";
+import type { ActionCapabilityResolver } from "./lease/resolve.ts";
 import { buildProofGraph } from "./proof/graph.ts";
 import { renderProofPackage, type RenderProofPackageInput } from "./proof/package.ts";
 import { createBranch } from "./run/branches.ts";
@@ -86,6 +89,21 @@ export interface CreateTaskOptions {
   readonly references?: readonly TaskReference[];
   readonly requestedBy?: "user" | "cli" | "ci";
   readonly actorId?: string;
+  /**
+   * The scenario pack that drafts the Outcome Contract (ADR-0006). The runtime
+   * wires the engineering proposer; the kernel never supplies one itself, so a
+   * task without it cannot be compiled. Resumed/opened sessions do not need it
+   * because compilation only happens while the task is still `defining`.
+   */
+  readonly proposeContract?: ContractProposer;
+  /**
+   * The scenario policy that resolves a proposed action to a Capability and its
+   * resource values (ADR-0006, M1). The runtime wires the engineering resolver;
+   * the kernel hard-codes no intent→capability or tool→resource mapping.
+   * Authorising an action without it fails loudly. Resumed sessions that only
+   * read/replay never consult it.
+   */
+  readonly resolveAction?: ActionCapabilityResolver;
 }
 
 export interface OpenTaskOptions {
@@ -94,6 +112,12 @@ export interface OpenTaskOptions {
   /** Open a specific run branch. Defaults to the task's primary branch. */
   readonly branchId?: BranchId;
   readonly actorId?: string;
+  /**
+   * Re-wire the action resolver when a reopened session continues to authorise
+   * new work. Pure read/replay/proof paths never need it; it is optional so
+   * resumed sessions that only fold the ledger are unaffected (M1).
+   */
+  readonly resolveAction?: ActionCapabilityResolver;
 }
 
 export interface TaskSummary {
@@ -123,6 +147,8 @@ interface SessionInit {
   readonly ledgerFile: string;
   readonly actorId: string;
   readonly events: readonly RunEvent[];
+  readonly proposeContract?: ContractProposer;
+  readonly resolveAction?: ActionCapabilityResolver;
 }
 
 export class KernelSession {
@@ -131,6 +157,8 @@ export class KernelSession {
   private readonly branchIdValue: BranchId;
   private readonly ledgerFile: string;
   private readonly actorId: string;
+  private readonly proposeContract?: ContractProposer;
+  private readonly resolveAction?: ActionCapabilityResolver;
   private eventLog: RunEvent[];
   private folded: TaskState;
 
@@ -140,6 +168,8 @@ export class KernelSession {
     this.branchIdValue = init.branchId;
     this.ledgerFile = init.ledgerFile;
     this.actorId = init.actorId;
+    this.proposeContract = init.proposeContract;
+    this.resolveAction = init.resolveAction;
     this.eventLog = [...init.events];
     // A brand-new task has no events yet, so there is nothing to fold. Every
     // reader of `folded` is reached only after `create()` has appended
@@ -160,6 +190,8 @@ export class KernelSession {
       ledgerFile: options.paths.ledgerFile(taskId),
       actorId: options.actorId ?? "cli",
       events: [],
+      ...(options.proposeContract === undefined ? {} : { proposeContract: options.proposeContract }),
+      ...(options.resolveAction === undefined ? {} : { resolveAction: options.resolveAction }),
     });
 
     await session.append("task.created", {
@@ -190,6 +222,7 @@ export class KernelSession {
         ledgerFile: mainLedger,
         actorId: options.actorId ?? "cli",
         events: main.events,
+        ...(options.resolveAction === undefined ? {} : { resolveAction: options.resolveAction }),
       });
     }
 
@@ -212,6 +245,7 @@ export class KernelSession {
       ledgerFile: branchLedger,
       actorId: options.actorId ?? "cli",
       events: read.events,
+      ...(options.resolveAction === undefined ? {} : { resolveAction: options.resolveAction }),
     });
   }
 
@@ -280,9 +314,18 @@ export class KernelSession {
     readonly facts?: readonly ProjectFact[];
     readonly budget?: Budget;
     readonly autonomy: OutcomeContract["autonomy"];
-  }): Promise<CompileContractResult> {
+  }): Promise<ContractProposal> {
     this.requireStatus(["defining"], "compile the Outcome Contract");
-    const result = compileContract({
+    const proposer = this.proposeContract;
+    if (proposer === undefined) {
+      // The kernel never drafts engineering content itself. A session compiled
+      // without a wired scenario pack fails loudly rather than guessing (I8).
+      throw new KernelError(
+        "no_contract_proposer",
+        "no scenario pack is wired to propose an Outcome Contract for this task",
+      );
+    }
+    const result = proposer({
       taskId: this.taskIdValue,
       projectId: this.folded.projectId,
       request: this.request(),
@@ -536,13 +579,25 @@ export class KernelSession {
       throw new KernelError("no_contract", "cannot authorise an action without a contract");
     }
 
-    const capability = capabilityFor(proposal);
+    const resolver = this.resolveAction;
+    if (resolver === undefined) {
+      // The kernel never hard-codes the intent→capability / tool→resource mapping
+      // (ADR-0006, M1). Authorising without a wired scenario policy fails loudly
+      // rather than guessing what an action may do.
+      throw new KernelError(
+        "no_action_resolver",
+        "no scenario pack is wired to resolve action capabilities for this task",
+      );
+    }
+
+    const resolution = resolver(proposal);
+    const capability = resolution.capability;
     if (capability === undefined) {
       const denial: LeaseDenial = {
         code: "resource_not_in_lease",
         detail:
           `intent "${proposal.intent}" is not a leasable capability; ` +
-          "only the kernel decides what a task may do",
+          "only the wired scenario policy decides what a task may do",
       };
       await this.recordRefusal(proposal, denial);
       return { ok: false, denial };
@@ -553,7 +608,7 @@ export class KernelSession {
       branchId: this.branchIdValue,
       subject: { kind: "builder_loop", id: proposal.modelRef.id },
       capability,
-      resourceValues: resourceValuesFor(proposal),
+      resourceValues: resolution.resourceValues,
       contract,
       envelope: contract.autonomy,
       ...(options.maxCalls === undefined ? {} : { maxCalls: options.maxCalls }),
@@ -1017,63 +1072,6 @@ function describeTaskState(state: TaskState): string {
     `${evidence} evidence record(s)`,
     pending === 0 ? "no pending decisions" : `${pending} pending decision(s)`,
   ].join(" · ");
-}
-
-/** Map a proposal to the capability it needs. `undefined` means "not leasable". */
-export function capabilityFor(proposal: ActionProposal): Capability | undefined {
-  switch (proposal.intent) {
-    case "read":
-    case "search":
-      return "fs.read";
-    case "write":
-      return "fs.write";
-    case "delete":
-      return "fs.delete";
-    case "execute":
-      return "cmd.exec";
-    case "network":
-      return "net.fetch";
-    case "git":
-      return proposal.requestedCapabilities.includes("git.write") ? "git.write" : "git.read";
-    case "ask_user":
-    case "finish":
-      return undefined;
-  }
-}
-
-/** The resources a proposal touches, in the vocabulary the lease understands. */
-export function resourceValuesFor(proposal: ActionProposal): readonly string[] {
-  const parameters = proposal.parameters;
-  const asString = (key: string): string | undefined =>
-    typeof parameters[key] === "string" ? (parameters[key] as string) : undefined;
-
-  switch (proposal.tool.id) {
-    case "fs.read_file":
-    case "fs.write_file":
-    case "fs.delete_file":
-    case "fs.list_dir": {
-      const path = asString("path");
-      return path === undefined ? [] : [path];
-    }
-    case "fs.search_text":
-      return [asString("glob") ?? "**"];
-    case "cmd.run": {
-      const command = asString("command");
-      return command === undefined ? [] : [command];
-    }
-    case "git.status":
-    case "git.diff":
-    case "git.show_head":
-      return ["."];
-    default: {
-      // An extension-provided tool must still name what it touches, so the
-      // proposal's declared effects become the resource list.
-      const targets = proposal.expectedEffects
-        .map((effect) => effect.target)
-        .filter((target) => target !== "");
-      return targets;
-    }
-  }
 }
 
 function denialCodeForEvent(code: LeaseDenial["code"]): string {

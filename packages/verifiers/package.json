@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@keystone/kernel": "workspace:*",
-    "@keystone/schemas": "workspace:*"
+    "@keystone/schemas": "workspace:*",
+    "@keystone/spawn": "workspace:*"
   }
 }

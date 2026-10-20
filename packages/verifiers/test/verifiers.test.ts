@@ -360,3 +360,104 @@ test("built-in verifier registry is complete and addressable", () => {
   assert.equal(verifierDescriptors().length, VERIFIER_IDS.length);
   assert.equal(getVerifier("verifier.test")?.descriptor.kind, "test");
 });
+
+import type { Verifier } from "../src/types.ts";
+
+function fakeVerifier(over: Partial<Verifier["descriptor"]>): Verifier {
+  return {
+    descriptor: {
+      kind: "custom",
+      id: "extension.demo.e2",
+      version: "1.0.0",
+      evidenceLevel: "E2",
+      canSatisfyRequiredCondition: true,
+      independence: { mode: "separate_process", independentOf: ["builder_loop_process"] },
+      timeoutMs: 1_000,
+      requiresCommand: false,
+      description: "fake",
+      ...over,
+    },
+    async run() {
+      return {
+        status: "passed",
+        summary: "fake",
+        outputBytes: 0,
+        truncated: false,
+        durationMs: 0,
+      };
+    },
+  };
+}
+
+test("an injected verifier is dispatched by explicit id ahead of kind fallback", () => {
+  // The condition names a custom id the built-ins do not own.
+  const contract = makeContract([
+    { conditionId: "cond.custom", kind: "custom" },
+  ]);
+  // makeContract writes id = `verifier.${kind}`; override to point at the extension.
+  const customCondition = contract.completionConditions[0];
+  assert.ok(customCondition !== undefined);
+  customCondition.verifier.id = "extension.demo.e2";
+
+  // Without the injected verifier the custom kind is unsupported.
+  const without = planVerification(contract);
+  assert.deepEqual(without.planned.map((g) => g.verifier.descriptor.id), []);
+  assert.equal(without.unsupported.length, 1);
+
+  // With it injected, the condition is routed to the extension by id.
+  const injected = fakeVerifier({});
+  const withExt = planVerification(contract, { verifiers: [injected] });
+  assert.deepEqual(withExt.unsupported.map((u) => u.condition.conditionId), []);
+  assert.equal(withExt.planned.length, 1);
+  const customGroup = withExt.planned[0];
+  assert.ok(customGroup !== undefined);
+  assert.equal(customGroup.verifier, injected);
+  assert.deepEqual(customGroup.conditions.map((c) => c.conditionId), ["cond.custom"]);
+});
+
+test("an injected verifier shadows a built-in by id", () => {
+  const contract = makeContract([{ conditionId: "cond.test", kind: "test", command: "true" }]);
+  const shadow = fakeVerifier({ id: "verifier.test", kind: "test" });
+  const plan = planVerification(contract, { verifiers: [shadow] });
+  assert.equal(plan.planned.length, 1);
+  const shadowGroup = plan.planned[0];
+  assert.ok(shadowGroup !== undefined);
+  assert.equal(shadowGroup.verifier, shadow, "the injected verifier must win on id collision");
+});
+
+test("a condition demanding a higher level than the verifier produces is unsupported, not downgraded", () => {
+  const contract = makeContract([
+    // required true (default), min E3, but the E2 injected verifier cannot reach E3.
+    { conditionId: "cond.deep", kind: "custom", minEvidenceLevel: "E3" },
+  ]);
+  const deepCondition = contract.completionConditions[0];
+  assert.ok(deepCondition !== undefined);
+  deepCondition.verifier.id = "extension.demo.e2";
+  const plan = planVerification(contract, { verifiers: [fakeVerifier({ evidenceLevel: "E2" })] });
+  assert.equal(plan.planned.length, 0);
+  assert.equal(plan.unsupported.length, 1);
+  const downgradeEntry = plan.unsupported[0];
+  assert.ok(downgradeEntry !== undefined);
+  assert.match(downgradeEntry.reason, /refusing to silently downgrade/);
+});
+
+test("a required independence condition cannot be served by a same-process verifier", () => {
+  const contract = makeContract([
+    { conditionId: "cond.indep", kind: "custom", requiresIndependence: true },
+  ]);
+  const indepCondition = contract.completionConditions[0];
+  assert.ok(indepCondition !== undefined);
+  indepCondition.verifier.id = "extension.weak.same";
+  const sameProcess = fakeVerifier({
+    id: "extension.weak.same",
+    evidenceLevel: "E2",
+    canSatisfyRequiredCondition: true,
+    independence: { mode: "same_process", independentOf: [] },
+  });
+  const plan = planVerification(contract, { verifiers: [sameProcess] });
+  assert.equal(plan.planned.length, 0);
+  assert.equal(plan.unsupported.length, 1);
+  const indepEntry = plan.unsupported[0];
+  assert.ok(indepEntry !== undefined);
+  assert.match(indepEntry.reason, /same process/);
+});

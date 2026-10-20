@@ -18,7 +18,8 @@
 
 import { spawn } from "node:child_process";
 
-import { putArtifact, resolveSpawnTarget, type KeystonePaths } from "@keystone/kernel";
+import { putArtifact, type KeystonePaths } from "@keystone/kernel";
+import { resolveSpawnTarget } from "@keystone/spawn";
 
 import type { VerifierOutcome } from "./types.ts";
 

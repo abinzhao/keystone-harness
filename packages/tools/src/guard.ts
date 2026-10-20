@@ -18,10 +18,10 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 
 import {
   putJsonArtifact,
-  resolveSpawnTarget,
   validateLease,
   type KeystonePaths,
 } from "@keystone/kernel";
+import { resolveSpawnTarget } from "@keystone/spawn";
 import {
   arrayOf,
   bool,

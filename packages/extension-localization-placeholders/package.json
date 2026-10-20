@@ -1,0 +1,19 @@
+{
+  "name": "@keystone/extension-localization-placeholders",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Reference Keystone extension: a deterministic checker that proves a translated message catalog keeps every placeholder the source uses (and invents none)",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@keystone/schemas": "workspace:*",
+    "@keystone/verifiers": "workspace:*"
+  },
+  "devDependencies": {
+    "@keystone/extensions": "workspace:*",
+    "@keystone/kernel": "workspace:*"
+  }
+}

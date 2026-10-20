@@ -29,9 +29,13 @@ import {
   type WorkspaceSnapshot,
 } from "@keystone/schemas";
 
-import { readJsonFile } from "../storage/atomic.ts";
-import { projectIdForWorkspace } from "../storage/paths.ts";
-import { globToRegExp } from "../scope/scope.ts";
+// Storage-layout and scope primitives stay owned by the kernel (ADR-0005); this
+// pack consumes them rather than re-implementing the on-disk layout.
+import {
+  globToRegExp,
+  projectIdForWorkspace,
+  readJsonFile,
+} from "@keystone/kernel";
 
 /**
  * Non-Git workspaces are refused outright in the first release: recovery,

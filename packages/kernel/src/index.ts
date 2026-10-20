@@ -11,7 +11,6 @@
 
 export * from "./storage/atomic.ts";
 export * from "./storage/paths.ts";
-export * from "./exec/spawn-target.ts";
 export * from "./storage/artifacts.ts";
 export * from "./ledger/events.ts";
 export * from "./ledger/transitions.ts";
@@ -20,15 +19,15 @@ export * from "./ledger/ledger.ts";
 export * from "./scope/scope.ts";
 export * from "./autonomy/envelope.ts";
 export * from "./lease/lease.ts";
+export * from "./lease/resolve.ts";
 export * from "./provenance/registry.ts";
-export * from "./project/scan.ts";
 export * from "./project/model.ts";
 export * from "./evidence/store.ts";
 export * from "./evidence/invalidate.ts";
 export * from "./proof/evaluate.ts";
 export * from "./proof/graph.ts";
 export * from "./proof/package.ts";
-export * from "./contract/compile.ts";
+export * from "./contract/propose.ts";
 export * from "./contract/revise.ts";
 export * from "./contract/export.ts";
 export * from "./experience/firewall.ts";

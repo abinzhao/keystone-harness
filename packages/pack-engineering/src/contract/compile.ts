@@ -1,8 +1,10 @@
 /**
- * The result compiler: user request + known context -> Outcome Contract.
+ * The engineering result compiler: user request + known context -> Outcome Contract.
  *
- * `compileContract` produces the machine-readable statement of "done" (PRD
- * OT-02). Two rules shape every branch below:
+ * `compileContract` drafts the machine-readable statement of "done" (PRD OT-02)
+ * for the software-engineering vertical (ADR-0006). It *proposes* a contract;
+ * the kernel folds the returned contract into a `contract.compiled` event. Two
+ * rules shape every branch below:
  *
  *  - Nothing is invented. Every scope entry, invariant and condition traces
  *    back to the request, its references, or the project profile. When the
@@ -17,9 +19,13 @@
 import { posix } from "node:path";
 
 import {
+  type ContractProposal,
+  type ContractProposalInput,
+  type ContractQuestion,
+} from "@keystone/kernel";
+import {
   newId,
   outcomeContractSchema,
-  type AutonomyEnvelope,
   type Budget,
   type CompletionCondition,
   type ExitCondition,
@@ -31,34 +37,12 @@ import {
   type ScopeEntry,
 } from "@keystone/schemas";
 
-export interface ContractQuestion {
-  /** Matches `localIdValidator` so it can round-trip as an uncertainty id. */
-  readonly questionId: string;
-  readonly question: string;
-  readonly affects: "implementation" | "scope" | "verification";
-  readonly suggestedAnswer: string;
-}
+/** Re-exported so the pack's public surface stays self-describing. */
+export type { ContractQuestion } from "@keystone/kernel";
 
-export interface CompileContractInput {
-  readonly taskId: string;
-  readonly projectId: string;
-  /** The user's request, verbatim. */
-  readonly request: string;
-  readonly references?: readonly {
-    kind: "file" | "directory" | "issue" | "log" | "url" | "text";
-    value: string;
-  }[];
-  readonly profile: ProjectProfile;
-  readonly facts?: readonly ProjectFact[];
-  /** Defaults the user or the project provides (e.g. the project's Autonomy Envelope). */
-  readonly autonomy: AutonomyEnvelope;
-  readonly budget?: Budget;
-}
-
-export interface CompileContractResult {
-  readonly contract: OutcomeContract;
-  readonly questions: readonly ContractQuestion[];
-}
+/** Backward-compatible aliases for callers written against the pre-pack API. */
+export type CompileContractInput = ContractProposalInput;
+export type CompileContractResult = ContractProposal;
 
 const MAX_GOAL_CHARS = 200;
 

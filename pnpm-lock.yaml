@@ -29,6 +29,9 @@ importers:
       '@keystone/models':
         specifier: workspace:*
         version: link:../models
+      '@keystone/pack-engineering':
+        specifier: workspace:*
+        version: link:../pack-engineering
       '@keystone/runtime':
         specifier: workspace:*
         version: link:../runtime
@@ -41,6 +44,22 @@ importers:
       '@keystone/verifiers':
         specifier: workspace:*
         version: link:../verifiers
+
+  packages/extension-localization-placeholders:
+    dependencies:
+      '@keystone/schemas':
+        specifier: workspace:*
+        version: link:../schemas
+      '@keystone/verifiers':
+        specifier: workspace:*
+        version: link:../verifiers
+    devDependencies:
+      '@keystone/extensions':
+        specifier: workspace:*
+        version: link:../extensions
+      '@keystone/kernel':
+        specifier: workspace:*
+        version: link:../kernel
 
   packages/extension-no-debug-statements:
     dependencies:
@@ -81,6 +100,15 @@ importers:
         specifier: workspace:*
         version: link:../schemas
 
+  packages/pack-engineering:
+    dependencies:
+      '@keystone/kernel':
+        specifier: workspace:*
+        version: link:../kernel
+      '@keystone/schemas':
+        specifier: workspace:*
+        version: link:../schemas
+
   packages/runtime:
     dependencies:
       '@keystone/extensions':
@@ -95,6 +123,9 @@ importers:
       '@keystone/models':
         specifier: workspace:*
         version: link:../models
+      '@keystone/pack-engineering':
+        specifier: workspace:*
+        version: link:../pack-engineering
       '@keystone/schemas':
         specifier: workspace:*
         version: link:../schemas
@@ -104,8 +135,14 @@ importers:
       '@keystone/verifiers':
         specifier: workspace:*
         version: link:../verifiers
+    devDependencies:
+      '@keystone/extension-localization-placeholders':
+        specifier: workspace:*
+        version: link:../extension-localization-placeholders
 
   packages/schemas: {}
+
+  packages/spawn: {}
 
   packages/tools:
     dependencies:
@@ -115,6 +152,9 @@ importers:
       '@keystone/schemas':
         specifier: workspace:*
         version: link:../schemas
+      '@keystone/spawn':
+        specifier: workspace:*
+        version: link:../spawn
 
   packages/verifiers:
     dependencies:
@@ -124,6 +164,9 @@ importers:
       '@keystone/schemas':
         specifier: workspace:*
         version: link:../schemas
+      '@keystone/spawn':
+        specifier: workspace:*
+        version: link:../spawn
 
 packages:
 

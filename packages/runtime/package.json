@@ -13,8 +13,12 @@
     "@keystone/i18n": "workspace:*",
     "@keystone/kernel": "workspace:*",
     "@keystone/models": "workspace:*",
+    "@keystone/pack-engineering": "workspace:*",
     "@keystone/schemas": "workspace:*",
     "@keystone/tools": "workspace:*",
     "@keystone/verifiers": "workspace:*"
+  },
+  "devDependencies": {
+    "@keystone/extension-localization-placeholders": "workspace:*"
   }
 }

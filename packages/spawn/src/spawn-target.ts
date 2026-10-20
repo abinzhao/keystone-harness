@@ -7,6 +7,11 @@
  * so it stays out of the kernel's state authority and can be unit tested for
  * any platform by passing `platform` explicitly.
  *
+ * Why this lives in its own neutral package rather than the engineering pack:
+ * both generic execution boundaries need it, and neither should depend on a
+ * scenario pack just to run a command (ADR-0006, M1). It carries no task,
+ * contract, or engineering vocabulary — only OS/process-launch compatibility.
+ *
  * Why it exists: on Windows the package-manager launchers a verifier relies on
  * (`npm`, `pnpm`, `yarn`, `npx`) are not executables but `.cmd` shims. Two
  * problems follow, and both must be handled or Windows support is a lie:

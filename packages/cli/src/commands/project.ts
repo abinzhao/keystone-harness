@@ -7,7 +7,12 @@
  * the desktop client reads.
  */
 
-import { detectProjectProfile, NotAGitRepositoryError, projectIdForWorkspace, scanWorkspace } from "@keystone/kernel";
+import { projectIdForWorkspace } from "@keystone/kernel";
+import {
+  detectProjectProfile,
+  NotAGitRepositoryError,
+  scanWorkspace,
+} from "@keystone/pack-engineering";
 
 import { getBoolean, parseArgs, UsageError } from "../args.ts";
 import { createOutput } from "../output.ts";

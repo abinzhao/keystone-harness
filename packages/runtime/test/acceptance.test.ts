@@ -22,8 +22,9 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
-import { KernelSession, scanWorkspace } from "@keystone/kernel";
+import { KernelSession } from "@keystone/kernel";
 import { createSequenceAdapter, scriptedModelDescriptor } from "@keystone/models";
+import { scanWorkspace } from "@keystone/pack-engineering";
 import { newId } from "@keystone/schemas";
 import { KeystoneRuntime } from "../src/index.ts";
 import {

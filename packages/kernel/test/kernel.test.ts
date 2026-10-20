@@ -17,9 +17,11 @@ import {
   actionProposalSchema,
   autonomyEnvelopeSchema,
   newId,
+  outcomeContractSchema,
   projectProfileSchema,
   type ActionProposal,
   type AutonomyEnvelope,
+  type OutcomeContract,
   type ProjectId,
   type ProjectProfile,
 } from "@keystone/schemas";
@@ -28,6 +30,9 @@ import {
   KernelError,
   KernelSession,
   resolveKeystonePaths,
+  type ActionCapabilityResolver,
+  type ContractProposal,
+  type ContractProposalInput,
 } from "../src/index.ts";
 
 async function tempHome(): Promise<string> {
@@ -102,6 +107,91 @@ interface Started {
   readonly home: string;
 }
 
+/**
+ * A deterministic proposer for the kernel lifecycle tests. The kernel does not
+ * draft engineering contracts (ADR-0006); these tests pin the state machine, so
+ * they supply a controlled contract rather than the engineering pack's heuristics.
+ */
+function stubProposer(input: ContractProposalInput): ContractProposal {
+  const referenced = (input.references ?? [])
+    .filter((ref) => ref.kind === "file" || ref.kind === "directory")
+    .map((ref) =>
+      ref.kind === "file"
+        ? ({ kind: "path", pattern: ref.value, intent: "write" } as const)
+        : ({ kind: "directory", pattern: ref.value, intent: "write" } as const),
+    );
+  const include = referenced.length > 0 ? referenced : [{ kind: "directory", pattern: "src", intent: "write" } as const];
+  const contract = outcomeContractSchema.parse({
+    contractId: newId("contract"),
+    version: 1,
+    taskId: input.taskId,
+    projectId: input.projectId,
+    createdAt: new Date().toISOString(),
+    createdBy: "kernel",
+    goal: input.request,
+    scope: { include, exclude: [], unknown: [] },
+    invariants: [],
+    completionConditions: [
+      {
+        conditionId: "cond.target_tests",
+        description: "the change passes the project's tests",
+        verifier: { kind: "test", id: "verifier.test", version: "1.0.0" },
+        minEvidenceLevel: "E2",
+        requiresIndependence: false,
+        required: true,
+      },
+    ],
+    budget: input.budget ?? { maxTokens: 100_000, maxWallClockMs: 3_600_000, maxRetries: 3 },
+    autonomy: input.autonomy,
+    uncertainties: [],
+    interventionTriggers: ["ambiguity"],
+    exitConditions: [
+      { exitId: "exit.budget", kind: "budget_exhausted", description: "the task budget is exhausted" },
+    ],
+    status: "ready",
+    schemaVersion: "keystone.contract.outcome@1.0.0",
+  }) as OutcomeContract;
+  return { contract, questions: [] };
+}
+
+/**
+ * A deterministic action resolver for the kernel lifecycle tests. The kernel
+ * resolves no intent→capability mapping itself (ADR-0006, M1); these tests pin
+ * the *seam* and the lease state machine, so they supply a controlled resolver
+ * that mirrors the engineering pack's mapping. The exact engineering behaviour
+ * is pinned in `@keystone/pack-engineering`'s own regression test.
+ */
+const testActionResolver: ActionCapabilityResolver = (proposal) => {
+  const capability = (): import("@keystone/schemas").Capability | undefined => {
+    switch (proposal.intent) {
+      case "read":
+      case "search":
+        return "fs.read";
+      case "write":
+        return "fs.write";
+      case "delete":
+        return "fs.delete";
+      case "execute":
+        return "cmd.exec";
+      case "network":
+        return "net.fetch";
+      case "git":
+        return proposal.requestedCapabilities.includes("git.write") ? "git.write" : "git.read";
+      case "ask_user":
+      case "finish":
+        return undefined;
+    }
+  };
+  const path =
+    typeof proposal.parameters["path"] === "string"
+      ? (proposal.parameters["path"] as string)
+      : undefined;
+  return {
+    capability: capability(),
+    resourceValues: path === undefined ? [] : [path],
+  };
+};
+
 /** A task that has a contract and is executing — the state most work starts from. */
 async function startTask(writePaths: readonly string[] = ["src/**"]): Promise<Started> {
   const home = await tempHome();
@@ -114,6 +204,8 @@ async function startTask(writePaths: readonly string[] = ["src/**"]): Promise<St
     request: "Fix the duplicate session refresh in src/auth/session.ts",
     references: [{ kind: "file", value: "src/auth/session.ts" }],
     actorId: "test",
+    proposeContract: stubProposer,
+    resolveAction: testActionResolver,
   });
 
   await session.submit();
@@ -339,6 +431,101 @@ test("the autonomy envelope cannot be widened by the task itself", async () => {
       !api.some((name) => /widen|autonomy/i.test(name)),
       `no method may widen the envelope from inside a task, found: ${api.join(", ")}`,
     );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("authorising fails loudly when no action resolver is wired (a composition error)", async () => {
+  const home = await tempHome();
+  try {
+    const paths = resolveKeystonePaths(home);
+    const projectId = newId("proj") as ProjectId;
+    // The session has a contract proposer but deliberately no action resolver.
+    const session = await KernelSession.create({
+      paths,
+      projectId,
+      request: "apply a fix",
+      actorId: "test",
+      proposeContract: stubProposer,
+    });
+    await session.submit();
+    await session.compile({
+      profile: profileFor(projectId),
+      autonomy: autonomyFor(projectId, ["src/**"]),
+    });
+    await session.start();
+
+    await assert.rejects(
+      () => session.authorize(proposalFor(session)),
+      (error: unknown) => {
+        assert.ok(error instanceof KernelError);
+        assert.equal(error.code, "no_action_resolver");
+        return true;
+      },
+    );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a resolver that declares a proposal un-leasable produces an on-record default-denial", async () => {
+  const home = await tempHome();
+  try {
+    const paths = resolveKeystonePaths(home);
+    const projectId = newId("proj") as ProjectId;
+    const denyAll: ActionCapabilityResolver = () => ({
+      capability: undefined,
+      resourceValues: [],
+    });
+    const session = await KernelSession.create({
+      paths,
+      projectId,
+      request: "apply a fix",
+      actorId: "test",
+      proposeContract: stubProposer,
+      resolveAction: denyAll,
+    });
+    await session.submit();
+    await session.compile({
+      profile: profileFor(projectId),
+      autonomy: autonomyFor(projectId, ["src/**"]),
+    });
+    await session.start();
+
+    const result = await session.authorize(proposalFor(session));
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.denial.code, "resource_not_in_lease");
+      assert.match(result.denial.detail, /not a leasable capability/);
+    }
+    const rejections = session.events().filter((event) => event.type === "action.rejected");
+    assert.equal(rejections.length, 1, "the refusal must be on the record");
+    const leases = session.events().filter((event) => event.type === "lease.issued");
+    assert.equal(leases.length, 0, "no lease may be issued for a denied action");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("the action resolver never changes folded or replayed state (resumed sessions are unaffected)", async () => {
+  const { session, home } = await startTask();
+  try {
+    // Issue one lease while a resolver is wired.
+    const granted = await session.authorize(proposalFor(session));
+    assert.equal(granted.ok, true);
+    const statusWithResolver = session.state().status;
+    const seqWithResolver = session.state().seq;
+
+    // Reopen the very same ledger with no resolver wired at all.
+    const reopened = await KernelSession.open({
+      paths: resolveKeystonePaths(home),
+      taskId: session.taskId,
+    });
+    assert.equal(reopened.state().status, statusWithResolver);
+    assert.equal(reopened.state().seq, seqWithResolver);
+    assert.equal(reopened.replay().consistent, true);
+    assert.ok(reopened.contract() !== undefined);
   } finally {
     await rm(home, { recursive: true, force: true });
   }

@@ -24,7 +24,6 @@ import {
   KernelSession,
   listBranches,
   projectIdForWorkspace,
-  scanWorkspace,
   summarizeBranch,
 } from "@keystone/kernel";
 import {
@@ -38,6 +37,7 @@ import {
   type ModelAdapter,
   type ModelRole,
 } from "@keystone/models";
+import { scanWorkspace } from "@keystone/pack-engineering";
 import { KeystoneRuntime, type RunMode } from "@keystone/runtime";
 import {
   autonomyEnvelopeSchema,

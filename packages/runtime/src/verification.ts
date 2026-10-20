@@ -60,6 +60,9 @@ export async function runVerification(input: VerificationRunInput): Promise<Veri
     ...(input.onlyConditionIds === undefined
       ? {}
       : { affectedConditionIds: input.onlyConditionIds }),
+    // Extensions/packs inject verifiers by explicit id; planning resolves them
+    // ahead of the built-in kind lookup and refuses any silent downgrade.
+    verifiers,
   });
 
   const evidence: EvidenceRecord[] = [];
