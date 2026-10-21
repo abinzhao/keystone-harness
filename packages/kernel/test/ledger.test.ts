@@ -421,3 +421,19 @@ test("verifyChain reports the genesis expectations for a fresh chain", () => {
   assert.equal(tip.prevHash, fixture.events[fixture.events.length - 1]?.hash);
   assert.deepEqual(verifyChain([]), { ok: true });
 });
+
+test("append rejects a duplicate tip and a torn tail before publishing another event", async () => {
+  const dir = await tempDir();
+  try {
+    const file = join(dir, "ledger.jsonl");
+    const fixture = buildFixture();
+    await appendEvent(file, fixture.events[0]!);
+    await assert.rejects(() => appendEvent(file, fixture.events[0]!), /tip|sequence|stale/i);
+    const bytes = await readFile(file, "utf8");
+    await writeFile(file, `${bytes}{"unfinished":`);
+    await assert.rejects(() => appendEvent(file, fixture.events[1]!), /torn|recover/i);
+    assert.equal(await readFile(file, "utf8"), `${bytes}{"unfinished":`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

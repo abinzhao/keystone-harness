@@ -82,6 +82,12 @@ export interface RunCapturedOptions {
   readonly timeoutMs: number;
   readonly maxBytes: number;
   readonly signal?: AbortSignal;
+  readonly boundary?: CommandBoundary;
+}
+
+export interface CommandBoundary {
+  authorize(command: string, args: readonly string[], options: RunCapturedOptions): Promise<string | undefined>;
+  complete(leaseId: string, result: CapturedRun): Promise<void>;
 }
 
 export interface CapturedRun {
@@ -103,8 +109,11 @@ export async function runCaptured(
   options: RunCapturedOptions,
 ): Promise<CapturedRun> {
   const started = Date.now();
-
-  return await new Promise<CapturedRun>((resolve) => {
+  const leaseId = await options.boundary?.authorize(command, args, options);
+  if (options.boundary !== undefined && leaseId === undefined) {
+    return { status: "blocked", stdout: "", stderr: "", outputBytes: 0, truncated: false, durationMs: 0, blockedReason: "verification command was refused by the task execution boundary" };
+  }
+  const result = await new Promise<CapturedRun>((resolve) => {
     let settled = false;
     let timedOut = false;
     let aborted = false;
@@ -124,11 +133,13 @@ export async function runCaptured(
       shell: false,
       windowsVerbatimArguments: target.windowsVerbatimArguments,
       stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
     });
 
     const kill = (): void => {
       try {
-        child.kill("SIGKILL");
+        if (child.pid !== undefined && process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
+        else child.kill("SIGKILL");
       } catch {
         // The process already exited; nothing to stop.
       }
@@ -216,6 +227,8 @@ export async function runCaptured(
       })();
     });
   });
+  if (leaseId !== undefined) await options.boundary?.complete(leaseId, result);
+  return result;
 }
 
 /**

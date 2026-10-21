@@ -48,6 +48,8 @@ export interface VerifierContext {
   readonly changedPaths: readonly string[];
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
+  /** Supplied by the runtime; standalone verifier callers retain explicit control. */
+  readonly commandBoundary?: import("./run.ts").CommandBoundary;
 }
 
 export interface VerifierOutcome {

@@ -5,9 +5,8 @@
  * wires the existing semantics together without changing any of them:
  *
  *  - `install <path>` reads a *local* package, verifies its digest against the
- *    bytes that would run, runs the Conformance Kit, discloses the risks in
- *    plain language, and only then records the extension. A package that reaches
- *    outside the machine or is irreversible needs an explicit yes.
+ *    bytes that would run, discloses static checks and risks, obtains explicit
+ *    consent, then probes a temporary copy before recording the extension.
  *  - `activate` enforces the activation gate: conformance, integrity and — for
  *    egress — a live user decision. It can never widen a capability.
  *  - `inspect` shows the same review without changing any state.
@@ -24,6 +23,7 @@ import {
   defaultRegistryLocation,
   discoverSkills,
   prepareLocalInstall,
+  probeLocalInstall,
   summarizeConformance,
   type InstallReview,
 } from "@keystone/extensions";
@@ -52,7 +52,7 @@ function requiredPositional(args: { readonly positionals: readonly string[] }, w
 }
 
 /** A user-issued decision, valid in shape and `recordedBy: "user"`. */
-function userConfirmationDecision(rationale: string): UserDecision {
+function userConfirmationDecision(rationale: string, resources: readonly string[] = []): UserDecision {
   return userDecisionSchema.parse({
     decisionId: newId("dec"),
     taskId: newId("task"),
@@ -60,7 +60,7 @@ function userConfirmationDecision(rationale: string): UserDecision {
     at: nowIso(),
     decision: "allow",
     rationale,
-    appliesTo: { resources: [] },
+    appliesTo: { resources: [...resources] },
     recordedBy: "user",
   }) as UserDecision;
 }
@@ -78,7 +78,7 @@ async function askForConfirmation(
 ): Promise<boolean> {
   if (assumeYes) return true;
   if (!context.isTTY) return false;
-  context.stdout.write(`${question} [y/N] `);
+  context.stderr.write(`${question} [y/N] `);
   const source = context.stdin ?? process.stdin;
   let answer = "";
   for await (const chunk of source) {
@@ -121,23 +121,26 @@ async function runInspect(argv: readonly string[], context: CliContext): Promise
   output.section(t("Extension review"));
   printReview(output, prepared.read.review);
   output.keyValue({
-    "Integrity": prepared.read.integrityVerified
-      ? t("digest matches the entry on disk")
+    "Integrity": prepared.read.integrityBasis === "local_path_trust"
+      ? t("local-path trust only; no content digest verified")
+      : prepared.read.integrityVerified ? t("digest matches the entry on disk")
       : t("digest does NOT match the entry on disk"),
-    "Conformance": prepared.conformance.passed ? t("passed") : t("failed"),
+    "Static checks": prepared.staticChecksPassed ? t("passed") : t("failed"),
+    "Probes": t("pending consent; no third-party code executed"),
   });
-  if (!prepared.conformance.passed) {
+  if (!prepared.staticChecksPassed) {
     output.line(summarizeConformance(prepared.conformance));
   }
-  output.line(
-    prepared.gate.allowed
-      ? t("would be activatable without a separate confirmation")
-      : t("needs explicit confirmation before activation: {blockers}", {
-          blockers: prepared.gate.blockers.join("; "),
-        }),
-  );
+  output.line(t("Static review is not installation or runtime activation."));
   output.json({
     name: prepared.read.manifest.name,
+    phase: prepared.phase,
+    reviewHash: prepared.reviewHash,
+    files: prepared.files,
+    staticChecksPassed: prepared.staticChecksPassed,
+    probes: "pending_consent",
+    review: prepared.read.review,
+    integrityBasis: prepared.read.integrityBasis,
     integrityVerified: prepared.read.integrityVerified,
     conformance: { passed: prepared.conformance.passed, reportHash: prepared.conformance.reportHash },
     gate: prepared.gate,
@@ -160,11 +163,11 @@ async function runInstall(argv: readonly string[], context: CliContext): Promise
   const packageRoot = requiredPositional(args, "package path");
 
   const prepared = await prepareLocalInstall(packageRoot);
-  const { read, conformance, gate } = prepared;
+  const { read } = prepared;
 
   // Integrity is the first gate: a digest that does not match never reaches the
   // registry at all, so nothing untrusted can be recorded as installed.
-  if (!read.integrityVerified) {
+  if (read.integrityBasis === "entry_digest" && !read.integrityVerified) {
     output.error(
       t(
         "refusing to install: the manifest digest does not match the entry on disk; the package may have been altered",
@@ -172,41 +175,58 @@ async function runInstall(argv: readonly string[], context: CliContext): Promise
     );
     return 1;
   }
-  if (!conformance.passed) {
-    output.error(summarizeConformance(conformance));
-    output.error(t("refusing to install: the extension failed the Conformance Kit"));
+  if (!prepared.staticChecksPassed) {
+    output.error(summarizeConformance(prepared.conformance));
+    output.error(t("refusing to install: the extension failed static checks"));
+    return 1;
+  }
+  if (read.manifest.reversibility === "irreversible") {
+    output.error(t("refusing to install: an irreversible extension cannot be activated automatically"));
     return 1;
   }
 
   output.section(t("About to install"));
   printReview(output, read.review);
 
-  // A low-risk extension admits on its own merits. One that can reach outside
-  // the machine needs a live, explicit yes before it is even recorded.
-  const needsDecision = !gate.allowed && gate.requiresConfirmation;
-  if (needsDecision) {
-    const confirmed = await askForConfirmation(
-      context,
-      t("This extension can reach outside the machine. Install it?"),
-      getBoolean(args, "yes"),
-    );
-    if (!confirmed) {
-      output.error(t("not installed: you did not confirm the egress risk"));
-      return 1;
-    }
-  } else if (!gate.allowed) {
-    // Irreversible effects, or any other blocker a user decision cannot cure.
-    output.error(t("refusing to install: {blockers}", { blockers: gate.blockers.join("; ") }));
+  const disclosure = t(
+    "Approval runs third-party code in a copied temporary workspace (5s, 64KiB output limit). " +
+    "Node probes restrict filesystem/process access; this is not a network or OS sandbox. " +
+    "Other executables have only process/time/output isolation. No credentials are inherited. " +
+    "Registration does not activate it in a running runtime.",
+  );
+  output.line(disclosure);
+  if (getBoolean(args, "json")) {
+    context.stderr.write(`${JSON.stringify({
+      phase: "static", reviewHash: prepared.reviewHash, files: prepared.files,
+      review: read.review, integrityBasis: read.integrityBasis, disclosure,
+    })}\n`);
+  }
+  const confirmed = await askForConfirmation(
+    context, t("Approve the bounded probes and local installation?"), getBoolean(args, "yes"),
+  );
+  if (!confirmed) {
+    output.error(t("not installed: you did not approve the bounded probes"));
     return 1;
   }
 
+  const decision = userConfirmationDecision(
+    "confirmed bounded probes and local installation at keystone extension install",
+    [prepared.reviewHash],
+  );
+  const probed = await probeLocalInstall(packageRoot, { decision, reviewHash: prepared.reviewHash });
+  if (!probed.conformance.passed || !probed.gate.allowed) {
+    output.error(summarizeConformance(probed.conformance));
+    output.error(t("refusing to install: {blockers}", { blockers: probed.gate.blockers.join("; ") }));
+    return 1;
+  }
   const registry = openRegistry(context);
   await registry.load();
   const registered = await registry.register({
     manifest: read.manifest,
     source: { kind: "local_path", locator: resolve(packageRoot) },
-    integrityVerified: read.integrityVerified,
-    conformance,
+    integrityVerified: probed.read.integrityVerified,
+    conformance: probed.conformance,
+    approvedBy: [decision.decisionId],
   });
 
   output.line(
@@ -215,7 +235,11 @@ async function runInstall(argv: readonly string[], context: CliContext): Promise
       status: registered.status,
     }),
   );
-  output.json({ name: registered.manifest.name, status: registered.status });
+  output.line(t("Registry registration only; runtime activation: not observed."));
+  output.json({
+    name: registered.manifest.name, status: registered.status,
+    registryStatus: registered.status, runtimeActivation: "not_observed",
+  });
   return 0;
 }
 
@@ -246,7 +270,10 @@ async function runList(argv: readonly string[], context: CliContext): Promise<nu
       output.detail(`isolation: ${entry.isolationReason}`);
     }
   }
-  output.json(entries);
+  output.line(t("Registry status only; runtime activation: not observed."));
+  output.json(entries.map((entry) => ({
+    ...entry, registryStatus: entry.status, runtimeActivation: "not_observed",
+  })));
   return 0;
 }
 
@@ -279,8 +306,10 @@ async function runActivate(argv: readonly string[], context: CliContext): Promis
 
   if (withoutDecision.allowed) {
     const activated = await registry.activate(name);
-    output.line(t('activated "{name}" ({status}).', { name, status: activated.status }));
-    output.json({ name, status: activated.status });
+    output.line(t('registry status for "{name}": {status}; runtime activation: not observed.', {
+      name, status: activated.status,
+    }));
+    output.json({ name, status: activated.status, registryStatus: activated.status, runtimeActivation: "not_observed" });
     return 0;
   }
 
@@ -307,8 +336,10 @@ async function runActivate(argv: readonly string[], context: CliContext): Promis
     const activated = await registry.activate(name, {
       decision: userConfirmationDecision("confirmed at keystone extension activate"),
     });
-    output.line(t('activated "{name}" ({status}).', { name, status: activated.status }));
-    output.json({ name, status: activated.status });
+    output.line(t('registry status for "{name}": {status}; runtime activation: not observed.', {
+      name, status: activated.status,
+    }));
+    output.json({ name, status: activated.status, registryStatus: activated.status, runtimeActivation: "not_observed" });
     return 0;
   }
 

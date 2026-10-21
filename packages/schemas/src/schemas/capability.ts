@@ -96,13 +96,15 @@ export const resourceScopeSchema = defineSchema(
 
 export const leaseConstraintsSchema = defineSchema(
   "keystone.capability.constraints",
-  "1.0.0",
+  "1.1.0",
   objectOf({
     workingDirectory: optional(str()),
     timeoutMs: optional(int({ min: 1, max: 3_600_000 })),
     maxOutputBytes: optional(int({ min: 1 })),
     /** Required argv prefix, e.g. ["pnpm","test"] for a scoped test lease. */
     argvPrefix: optional(arrayOf(str(), { maxItems: 16 })),
+    /** Additive in 1.1: exact canonical parameters bound by the issuer. */
+    parametersHash: optional(str({ pattern: /^[0-9a-f]{64}$/ })),
     /** For `net.fetch`: allowed HTTP methods. */
     methods: optional(arrayOf(enumOf(["GET", "HEAD"] as const), { maxItems: 2 })),
     /** For `fs.write`: refuse to follow symlinks out of the workspace. */
@@ -127,7 +129,7 @@ export type LeaseStatus = (typeof LEASE_STATUSES)[number];
 
 export const capabilityLeaseSchema = defineSchema(
   "keystone.capability.lease",
-  "1.0.0",
+  "1.1.0",
   objectOf({
     leaseId: leaseIdValidator,
     taskId: taskIdValidator,

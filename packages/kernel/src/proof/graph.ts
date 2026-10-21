@@ -25,7 +25,7 @@ import {
   type ProofNodeStatus,
 } from "@keystone/schemas";
 
-import { evaluateCompletion } from "./evaluate.ts";
+import { evaluateCompletion, evaluateEvidenceAdmission } from "./evaluate.ts";
 
 // Re-exported so callers can build a decision from the same module graph layer
 // without importing the evaluator directly.
@@ -37,8 +37,8 @@ export interface ProofGraphInput {
   readonly branchId: string;
   /** Paths the change set actually touched (from git diff). */
   readonly changedPaths: readonly string[];
-  /** Fingerprint of the workspace the evidence describes. */
-  readonly workspaceFingerprint: string;
+  /** Current workspace fingerprint; omitted for a historical-only query. */
+  readonly workspaceFingerprint?: string;
   /** Evidence offered in support, already persisted. */
   readonly evidence: readonly EvidenceRecord[];
   /** Snapshot the evidence was observed in, when known. */
@@ -104,15 +104,22 @@ function conditionNodeStatus(
   }
 }
 
-function evidenceNodeStatus(record: EvidenceRecord): ProofNodeStatus {
-  switch (record.status) {
-    case "valid":
-      return "supported";
-    case "partially_invalid":
-      return "pending";
-    default:
-      return "invalid";
+function evidenceNodeState(
+  input: ProofGraphInput,
+  record: EvidenceRecord,
+): { status: ProofNodeStatus; reason?: string } {
+  const admissions = input.contract.completionConditions
+    .filter((condition) => record.conditionIds.includes(condition.conditionId))
+    .map((condition) => evaluateEvidenceAdmission(input, condition, record));
+  if (admissions.some((admission) => admission.admitted)) return { status: "supported" };
+  if (admissions.length === 0) {
+    return { status: "unsupported", reason: "evidence references no current completion condition" };
   }
+  const pending = admissions.find((admission) => admission.reasonCode === "pending");
+  return {
+    status: pending === undefined ? "invalid" : "pending",
+    reason: (pending ?? admissions[0])!.reason.slice(0, 2000),
+  };
 }
 
 export function buildProofGraph(input: ProofGraphInput): ProofGraph {
@@ -128,7 +135,7 @@ export function buildProofGraph(input: ProofGraphInput): ProofGraph {
   const byConditionId = new Map(
     decision.conditionResults.map((result) => [result.conditionId, result]),
   );
-  const conditionIds = new Set(input.contract.completionConditions.map((c) => c.conditionId));
+  const conditions = new Map(input.contract.completionConditions.map((condition) => [condition.conditionId, condition]));
 
   const nodes: {
     nodeId: string;
@@ -160,22 +167,14 @@ export function buildProofGraph(input: ProofGraphInput): ProofGraph {
   const snapshotNodeIds = new Map<string, string>();
 
   for (const record of input.evidence) {
-    const status = evidenceNodeStatus(record);
+    const { status, reason } = evidenceNodeState(input, record);
     nodes.push({
       nodeId: proofNodeId("evidence", record.evidenceId),
       kind: "evidence",
       refId: record.evidenceId,
       label: record.observation.summary.trim() === "" ? record.evidenceId : record.observation.summary,
       status,
-      ...(status === "supported"
-        ? {}
-        : {
-            reason: (
-              record.invalidatedBy.length > 0
-                ? `invalidated by: ${record.invalidatedBy.join("; ")}`
-                : `evidence status is ${record.status}`
-            ).slice(0, 2000),
-          }),
+      ...(reason === undefined ? {} : { reason }),
     });
 
     const observationIncomplete = record.observation.incomplete ?? [];
@@ -232,9 +231,9 @@ export function buildProofGraph(input: ProofGraphInput): ProofGraph {
     addEdge(evidenceNode, proofNodeId("validator", validatorRef(record.producer)), "validated_by");
     addEdge(evidenceNode, proofNodeId("snapshot", record.workspaceSnapshotId), "observed_in");
     for (const conditionId of record.conditionIds) {
-      // Only link to conditions that still exist; a removed condition has no
-      // node to point at (PRD OT-03).
-      if (conditionIds.has(conditionId)) {
+      // Retain rejected observations, but never give them a current support edge.
+      const condition = conditions.get(conditionId);
+      if (condition !== undefined && evaluateEvidenceAdmission(input, condition, record).admitted) {
         addEdge(evidenceNode, proofNodeId("condition", conditionId), "supports");
       }
     }

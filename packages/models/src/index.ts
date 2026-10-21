@@ -1,5 +1,7 @@
 export * from "./types.ts";
+export * from "./content.ts";
 export * from "./credentials.ts";
+export * from "./credential-broker.ts";
 export * from "./prompt.ts";
 export * from "./http.ts";
 export * from "./adapter-base.ts";

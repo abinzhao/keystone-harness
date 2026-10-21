@@ -15,7 +15,6 @@ import { join } from "node:path";
 
 import {
   enabledModels,
-  FileCredentialStore,
   keystoneConfigSchema,
   loadConfig,
   modelConfigEntrySchema,
@@ -33,6 +32,7 @@ import { getBoolean, getString, parseArgs, requireString, UsageError } from "../
 import { createOutput } from "../output.ts";
 import {
   parsePositiveInt,
+  credentialsFor,
   pathsFor,
   translatorForContext,
   type CliContext,
@@ -59,7 +59,7 @@ async function runList(argv: readonly string[], context: CliContext): Promise<nu
 
   const config = await readConfig(context);
   const paths = pathsFor(context);
-  const store = new FileCredentialStore({ credentialsDir: paths.credentialsDir });
+  const store = credentialsFor(context);
   const stored = new Set(
     (await store.listHandles()).filter((entry) => entry.present).map((entry) => entry.handle),
   );
@@ -258,7 +258,7 @@ async function runCredential(argv: readonly string[], context: CliContext): Prom
   const sub = argv[0];
   const rest = argv.slice(1);
   const paths = pathsFor(context);
-  const store = new FileCredentialStore({ credentialsDir: paths.credentialsDir });
+  const store = credentialsFor(context);
 
   if (sub === "list") {
     const args = parseArgs(rest, { flags: { json: "boolean", verbose: "boolean" } });
@@ -301,7 +301,7 @@ async function runCredential(argv: readonly string[], context: CliContext): Prom
     await store.set(handle, secret);
     const file = join(paths.credentialsDir, `${handle}.json`);
     const info = await stat(file).catch(() => undefined);
-    const mode = info === undefined ? "unknown" : modeString(info.mode);
+    const mode = info === undefined ? "broker" : modeString(info.mode);
     // Never echo the secret: only the handle and the file's permissions.
     output.line(
       t('Stored credential "{handle}" (file mode {mode}). The secret is never printed.', { handle, mode }),
@@ -350,8 +350,8 @@ export const command: CommandModule = {
     "",
     "keystone model credential set <handle>   # the secret is read from stdin",
     "keystone model credential list",
-    "  Credentials are stored under ~/.keystone/credentials with mode 0600 and are",
-    "  never printed.",
+    "  macOS uses the native Keychain broker; other platforms use the private file",
+    "  broker. Secrets are never printed. Legacy files require explicit migration.",
   ].join("\n"),
   run,
 };

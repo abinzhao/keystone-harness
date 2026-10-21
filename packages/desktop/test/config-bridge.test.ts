@@ -10,12 +10,16 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { resolveKeystonePaths } from "@keystone/kernel";
+import { FileCredentialStore } from "@keystone/models";
 
 import { DesktopConfigBridge } from "../src/index.ts";
 
 async function boot(): Promise<{ home: string; bridge: DesktopConfigBridge }> {
   const home = await mkdtemp(join(tmpdir(), "keystone-bridge-"));
-  return { home, bridge: new DesktopConfigBridge({ paths: resolveKeystonePaths(home) }) };
+  const paths = resolveKeystonePaths(home);
+  return { home, bridge: new DesktopConfigBridge({
+    paths, credentials: new FileCredentialStore({ credentialsDir: paths.credentialsDir }),
+  }) };
 }
 
 test("bootstrap reports no model on a fresh home", async () => {

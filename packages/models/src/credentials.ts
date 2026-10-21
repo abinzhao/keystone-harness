@@ -22,7 +22,7 @@ const SAFE_HANDLE = /^[a-z0-9][a-z0-9._-]{1,63}$/;
 export function assertSafeHandle(handle: string): void {
   if (!SAFE_HANDLE.test(handle)) {
     throw new Error(
-      `credential handle "${handle}" is invalid: use lowercase letters, digits, dot, dash or underscore`,
+      "credential handle is invalid: use lowercase letters, digits, dot, dash or underscore",
     );
   }
 }
@@ -50,13 +50,15 @@ export class FileCredentialStore implements CredentialResolver {
 
   /** Resolve a handle to its secret. Returns undefined when nothing is stored. */
   async resolve(handle: string): Promise<string | undefined> {
+    const path = this.pathFor(handle);
     try {
-      const text = await readFile(this.pathFor(handle), "utf8");
+      const text = await readFile(path, "utf8");
       const parsed = JSON.parse(text) as { secret?: unknown };
       return typeof parsed.secret === "string" ? parsed.secret : undefined;
     } catch (error) {
       if (isMissing(error)) return undefined;
-      throw error;
+      // JSON parse errors may include a snippet of the credential file.
+      throw new Error("credential store could not resolve the handle; check file integrity and permissions");
     }
   }
 

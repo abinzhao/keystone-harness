@@ -1,56 +1,44 @@
-/**
- * Native folder-selection bridge.
- *
- * The workbench needs a workspace path. A desktop user expects a "Choose folder…"
- * panel, not to type an absolute path. This shells out to the platform chooser
- * and returns a POSIX path. It is read-only: it opens no project and changes no
- * state; the user still confirms the chosen folder in the composer.
- *
- * macOS uses AppleScript's `choose folder` via the bundled `osascript`. On other
- * platforms this slice has no bridge, so it reports itself as unsupported rather
- * than guessing — typing a path always works (ADR-0008, Decision D).
- */
-
+/** NSOpenPanel selection only; opening a workspace remains a separate user action. */
 import { execFile } from "node:child_process";
+import { isAbsolute } from "node:path";
 import { promisify } from "node:util";
+import { nativeWindowSupported, windowHelperPath } from "./window.ts";
 
 const exec = promisify(execFile);
 
 export interface FolderPickResult {
-  /** False when the platform has no chooser in this slice, or the user cancelled. */
   readonly supported: boolean;
   readonly cancelled?: boolean;
-  /** The chosen absolute POSIX path, when one was picked. */
   readonly path?: string;
   readonly error?: string;
 }
 
-/** Whether this platform can show a native chooser at all. */
-export function folderPickerSupported(): boolean {
-  return process.platform === "darwin";
+export interface FolderPickerOptions {
+  readonly helperPath?: string;
+  readonly invoke?: (helperPath: string, args: readonly string[]) => Promise<{ readonly stdout: string }>;
 }
 
-export async function chooseFolder(prompt = "Choose a project folder"): Promise<FolderPickResult> {
-  if (!folderPickerSupported()) {
-    return {
-      supported: false,
-      error: "the native folder picker is only available on macOS in this build; type a path instead",
-    };
-  }
+export function folderPickerSupported(options: FolderPickerOptions = {}): boolean {
+  return nativeWindowSupported(options);
+}
+
+export async function chooseFolder(
+  prompt = "Choose a project folder", options: FolderPickerOptions = {},
+): Promise<FolderPickResult> {
+  if (!folderPickerSupported(options)) return {
+    supported: false, error: "native folder picker unavailable; build the macOS helper or type a path",
+  };
   try {
-    const script = `POSIX path of (choose folder with prompt ${JSON.stringify(prompt)})`;
-    const { stdout } = await exec("osascript", ["-e", script], { timeout: 120_000 });
-    const path = stdout.trim().replace(/\/$/, "");
-    if (path === "") return { supported: true, cancelled: true };
-    return { supported: true, path };
-  } catch (error) {
-    // User cancellation is osascript exit code 1 / User canceled — that is not an
-    // error, just "no folder".
-    const code = (error as { code?: number }).code;
-    if (code === 1) return { supported: true, cancelled: true };
-    return {
-      supported: true,
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
+    const invoke = options.invoke ?? ((helperPath, args) => exec(helperPath, [...args], {
+      timeout: 120_000, maxBuffer: 65_536,
+    }));
+    const { stdout } = await invoke(options.helperPath ?? windowHelperPath(), ["--pick-folder", "--prompt", prompt]);
+    const result: unknown = JSON.parse(stdout);
+    if (typeof result !== "object" || result === null) throw new Error();
+    const value = result as Record<string, unknown>;
+    if (value["supported"] !== true) throw new Error();
+    if (value["cancelled"] === true) return { supported: true, cancelled: true };
+    if (typeof value["path"] !== "string" || !isAbsolute(value["path"])) throw new Error();
+    return { supported: true, path: value["path"] };
+  } catch { return { supported: true, error: "native folder selection failed; type a path instead" }; }
 }

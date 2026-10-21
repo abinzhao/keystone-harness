@@ -8,8 +8,12 @@
  */
 
 export { DesktopShell, type DesktopShellOptions, type RuntimeTarget } from "./shell.ts";
-export { DesktopConfigBridge, type BootstrapInfo, type ModelSummary } from "./config-bridge.ts";
-export { chooseFolder, folderPickerSupported, type FolderPickResult } from "./folder-picker.ts";
+export {
+  DesktopConfigBridge, type DesktopConfigBridgeOptions, type BootstrapInfo,
+  type ModelSummary, type SaveModelInput, type SaveModelResult,
+  type ConnectionInput, type ConnectionTest,
+} from "./config-bridge.ts";
+export { chooseFolder, folderPickerSupported, type FolderPickResult, type FolderPickerOptions } from "./folder-picker.ts";
 export {
   acquireInstanceLock,
   InstanceAlreadyRunningError,

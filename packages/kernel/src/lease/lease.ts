@@ -21,6 +21,8 @@ import {
   newId,
   sha256Hex,
   contentHash,
+  canonicalJson,
+  decisionIsLive,
   type AutonomyEnvelope,
   type Capability,
   type CapabilityLease,
@@ -45,6 +47,8 @@ export type LeaseDenialCode =
   | "lease_revoked"
   | "lease_exhausted"
   | "resource_not_in_lease"
+  | "task_inactive"
+  | "parameters_not_in_lease"
   | "empty_resource_list";
 
 export interface LeaseDenial {
@@ -68,6 +72,7 @@ export interface IssueLeaseInput {
   readonly workingDirectory?: string;
   readonly timeoutMs?: number;
   readonly argvPrefix?: readonly string[];
+  readonly parametersHash?: string;
   /**
    * Attribution only: which user decision put this action inside the boundary.
    * It is recorded for audit and shown in the proof package, and it does not
@@ -141,7 +146,13 @@ export function issueLease(input: IssueLeaseInput): LeaseIssueResult {
     };
   }
 
-  if (input.reversibility === "irreversible") {
+  const decision = input.decision;
+  const confirmsExactOperation = decision !== undefined && decision.recordedBy === "user" &&
+    decision.taskId === input.taskId && decision.branchId === input.branchId &&
+    decisionIsLive(decision, new Date()) && decision.appliesTo.capability === capability &&
+    canonicalJson(decision.appliesTo.resources) === canonicalJson(values) &&
+    input.parametersHash !== undefined && decision.modifications?.["parametersHash"] === input.parametersHash;
+  if (input.reversibility === "irreversible" && !confirmsExactOperation) {
     return {
       ok: false,
       denial: {
@@ -177,6 +188,15 @@ export function issueLease(input: IssueLeaseInput): LeaseIssueResult {
   const ttl = Math.min(input.ttlMs ?? DEFAULT_TTL_MS, MAX_TTL_MS);
   const issuedAt = new Date();
   const mode = modeFor(capability);
+  const constraints = {
+    ...(input.workingDirectory === undefined ? {} : { workingDirectory: input.workingDirectory }),
+    ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
+    ...(input.argvPrefix === undefined ? {} : { argvPrefix: [...input.argvPrefix] }),
+    ...(input.parametersHash === undefined ? {} : { parametersHash: input.parametersHash }),
+    denySymlinkEscape: true,
+  };
+  const expiresAt = new Date(issuedAt.getTime() + ttl).toISOString();
+  const budget = { maxCalls: input.maxCalls ?? 1 };
 
   // Constructed through the schema: branded ids and the `issuedBy: "kernel"`
   // literal are enforced at the moment of issuance rather than trusted later.
@@ -191,25 +211,23 @@ export function issueLease(input: IssueLeaseInput): LeaseIssueResult {
       values,
       ...(mode === undefined ? {} : { mode }),
     },
-    constraints: {
-      ...(input.workingDirectory === undefined ? {} : { workingDirectory: input.workingDirectory }),
-      ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
-      ...(input.argvPrefix === undefined ? {} : { argvPrefix: [...input.argvPrefix] }),
-      denySymlinkEscape: true,
-    },
-    budget: { maxCalls: input.maxCalls ?? 1 },
+    constraints,
+    budget,
     scopeDigest: sha256Hex(
       contentHash({
         subject: input.subject,
         capability,
         values,
+        constraints,
+        budget,
+        expiresAt,
         contractId: contract.contractId,
         contractVersion: contract.version,
         envelopeUpdatedAt: envelope.updatedAt,
       }),
     ),
     issuedAt: issuedAt.toISOString(),
-    expiresAt: new Date(issuedAt.getTime() + ttl).toISOString(),
+    expiresAt,
     issuedBy: "kernel",
     ...(input.decision === undefined ? {} : { decisionRef: input.decision.decisionId as DecisionId }),
     status: "active",
@@ -345,6 +363,7 @@ function reachWithinContractScope(
 export interface LeaseUseRequest {
   readonly capability: Capability;
   readonly resourceValues: readonly string[];
+  readonly parametersHash?: string;
   readonly now?: Date;
 }
 
@@ -391,6 +410,13 @@ export function validateLease(lease: CapabilityLease, request: LeaseUseRequest):
         detail: `lease grants ${lease.capability}, not ${request.capability}`,
       },
     };
+  }
+  if (request.resourceValues.length === 0) {
+    return { ok: false, denial: { code: "empty_resource_list", detail: "execution must name its resources" } };
+  }
+  if (lease.constraints.parametersHash !== undefined &&
+      lease.constraints.parametersHash !== request.parametersHash) {
+    return { ok: false, denial: { code: "parameters_not_in_lease", detail: "execution parameters differ from the authorized proposal" } };
   }
 
   const outside = request.resourceValues.filter((value) => !resourceCovered(lease, value));

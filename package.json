@@ -11,7 +11,7 @@
   "packageManager": "pnpm@8.15.9",
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node --test \"packages/*/test/**/*.test.ts\" \"scripts/**/test/**/*.test.ts\"",
+    "test": "node --test --test-concurrency=4 \"packages/*/test/**/*.test.ts\" \"scripts/**/test/**/*.test.ts\"",
     "test:watch": "node --test --watch \"packages/*/test/**/*.test.ts\"",
     "bench": "node packages/runtime/bench/perf.ts",
     "keystone": "node packages/cli/src/bin.ts",

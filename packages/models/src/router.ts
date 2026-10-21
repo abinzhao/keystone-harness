@@ -10,6 +10,9 @@
 
 import {
   ModelCapabilityUnsatisfiedError,
+  ModelContentInvalidError,
+  ModelContentUnsupportedError,
+  ModelToolsUnsupportedError,
   ModelProtocolError,
   ModelUnavailableError,
   type ModelAdapter,
@@ -18,6 +21,7 @@ import {
   type ModelResponse,
   type ModelRole,
 } from "./types.ts";
+import { assertModelContent, requestHasImages } from "./content.ts";
 
 /** Roles exist so a cheap model can summarise while an expensive one plans. */
 export const MODEL_ROLES: readonly ModelRole[] = ["builder", "summarizer", "planner"];
@@ -35,6 +39,13 @@ export interface RouteOutcome {
   readonly attempts: readonly RouteAttempt[];
 }
 
+export interface ModelAttemptHooks {
+  readonly beforeAttempt?: (descriptor: ModelDescriptor) => Promise<void>;
+  readonly afterAttempt?: (
+    descriptor: ModelDescriptor, response: ModelResponse | undefined, error?: unknown,
+  ) => Promise<void>;
+}
+
 export interface EgressDescription {
   readonly role: ModelRole;
   readonly modelId: string;
@@ -45,6 +56,7 @@ export interface EgressDescription {
   readonly dataClasses: readonly string[];
   readonly nativeTools: boolean;
   readonly structuredOutput: boolean;
+  readonly multimodal: boolean;
   readonly credentialHandle?: string;
 }
 
@@ -92,6 +104,22 @@ export class ModelRouter {
       .filter((descriptor): descriptor is ModelDescriptor => descriptor !== undefined);
   }
 
+  /** Copy registration/routes; adapter closures and their credential handles remain task-local. */
+  snapshot(): ModelRouter {
+    const snapshot = new ModelRouter();
+    for (const id of this.order) {
+      const adapter = this.adapters.get(id)!;
+      const descriptor = structuredClone(adapter.descriptor);
+      Object.freeze(descriptor.capabilities);
+      Object.freeze(descriptor.dataEgress.classes);
+      Object.freeze(descriptor.dataEgress);
+      Object.freeze(descriptor);
+      snapshot.register({ descriptor, complete: adapter.complete.bind(adapter) });
+    }
+    for (const [role, ids] of this.routes) snapshot.setRoute(role, ids);
+    return snapshot;
+  }
+
   /**
    * Where a role's traffic currently goes. Shown to the user before work starts,
    * because "local-first" must not be used to hide real outbound traffic
@@ -110,6 +138,7 @@ export class ModelRouter {
         dataClasses: primary?.dataEgress.classes ?? [],
         nativeTools: primary?.capabilities.nativeTools ?? false,
         structuredOutput: primary?.capabilities.structuredOutput ?? false,
+        multimodal: primary?.capabilities.multimodal ?? false,
         ...(primary?.credentialHandle === undefined
           ? {}
           : { credentialHandle: primary.credentialHandle }),
@@ -125,13 +154,22 @@ export class ModelRouter {
    */
   private routeSatisfying(role: ModelRole, request: ModelRequest): readonly ModelAdapter[] {
     const needNativeTools = request.tools.length > 0;
-    if (!needNativeTools) return this.route(role);
-    return this.route(role).filter(
-      (adapter) => adapter.descriptor.capabilities.nativeTools,
-    );
+    const needImages = requestHasImages(request);
+    const route = this.route(role);
+    const primary = route[0]?.descriptor;
+    return route.filter(({ descriptor }) => {
+      if (needNativeTools && !descriptor.capabilities.nativeTools) return false;
+      if (needImages && !descriptor.capabilities.multimodal) return false;
+      if (primary === undefined) return false;
+      // Capability filtering must not silently turn a local request into egress.
+      if (primary.dataEgress.local) return descriptor.dataEgress.local;
+      return descriptor.dataEgress.local ||
+        (descriptor.endpointHost === primary.endpointHost &&
+          descriptor.dataEgress.classes.every((value) => primary.dataEgress.classes.includes(value)));
+    });
   }
 
-  async complete(role: ModelRole, request: ModelRequest): Promise<RouteOutcome> {
+  async complete(role: ModelRole, request: ModelRequest, hooks: ModelAttemptHooks = {}): Promise<RouteOutcome> {
     const all = this.route(role);
     const attempts: RouteAttempt[] = [];
 
@@ -144,12 +182,12 @@ export class ModelRouter {
     }
 
     const candidates = this.routeSatisfying(role, request);
-    if (request.tools.length > 0 && candidates.length === 0) {
+    if (candidates.length === 0) {
       // Loud refusal, before any network call: do not pick a text-envelope adapter
       // that would discard the tool descriptors.
       throw new ModelCapabilityUnsatisfiedError(
         role,
-        "native_tools",
+        requestHasImages(request) ? "multimodal" : "native_tools",
         `the request carries ${request.tools.length} tool descriptor(s), but every model on the ` +
           `"${role}" route is a text-envelope adapter. Add a native-tools model (openai-responses, ` +
           `anthropic-messages or gemini-generate) or describe the tools in the prompt instead.`,
@@ -158,11 +196,23 @@ export class ModelRouter {
 
     let lastError: Error | undefined;
     for (const adapter of candidates) {
+      assertModelContent(adapter.descriptor, request);
+      // Controller refusals must not enter the adapter-error fallback path.
+      await hooks.beforeAttempt?.(adapter.descriptor);
+      let response: ModelResponse | undefined;
+      let failure: unknown;
+      let failed = false;
       try {
-        const response = await adapter.complete({ ...request, role });
+        response = await adapter.complete({ ...request, role });
+      } catch (error) { failed = true; failure = error; }
+      await hooks.afterAttempt?.(adapter.descriptor, response, failed ? failure : undefined);
+      if (!failed) {
         attempts.push({ role, modelId: adapter.descriptor.id, outcome: "ok" });
-        return { response, modelId: adapter.descriptor.id, attempts };
-      } catch (error) {
+        return { response: response!, modelId: adapter.descriptor.id, attempts };
+      } else {
+        const error = failure;
+        if (error instanceof ModelContentUnsupportedError || error instanceof ModelContentInvalidError ||
+            error instanceof ModelToolsUnsupportedError || request.signal?.aborted) throw error;
         const detail = error instanceof Error ? error.message : String(error);
         if (error instanceof ModelProtocolError) {
           attempts.push({ role, modelId: adapter.descriptor.id, outcome: "protocol_error", detail });

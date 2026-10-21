@@ -123,6 +123,7 @@ async function gitLines(
     cwd: ctx.rootPath,
     timeoutMs: GIT_TIMEOUT_MS,
     maxBytes: GIT_MAX_BYTES,
+    ...(ctx.commandBoundary === undefined ? {} : { boundary: ctx.commandBoundary }),
     ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
   });
 

@@ -33,6 +33,7 @@ import { evidenceRecordSchema } from "./evidence.ts";
 import { experienceCandidateSchema, experienceEntrySchema, experienceEvaluationSchema } from "./experience.ts";
 import { extensionRegistrationSchema } from "./extension.ts";
 import { projectFactSchema } from "./project.ts";
+import { attachmentSchema, configurationSnapshotSchema } from "./attachment.ts";
 import {
   budgetUsageSchema,
   checkpointSchema,
@@ -55,7 +56,7 @@ import {
 
 export const taskCreatedPayloadSchema = defineSchema(
   "keystone.event.taskCreated",
-  "1.0.0",
+  "1.1.0",
   objectOf({
     projectId: nonEmptyStr(),
     /** The user's original phrasing, kept verbatim for contract re-derivation. */
@@ -69,6 +70,8 @@ export const taskCreatedPayloadSchema = defineSchema(
       }),
       { maxItems: 64 },
     ),
+    attachments: optional(arrayOf(attachmentSchema.validator, { maxItems: 10 })),
+    configurationSnapshot: optional(configurationSnapshotSchema.validator),
   }),
 );
 
@@ -222,7 +225,7 @@ const actionRejectedPayloadSchema = defineSchema(
 
 const actionExecutedPayloadSchema = defineSchema(
   "keystone.event.actionExecuted",
-  "1.0.0",
+  "1.1.0",
   objectOf({
     proposalId: proposalIdValidator,
     leaseId: optional(leaseIdValidator),
@@ -237,6 +240,7 @@ const actionExecutedPayloadSchema = defineSchema(
     /** Workspace snapshot taken after the effect, when one was taken. */
     workspaceSnapshotId: optional(nonEmptyStr()),
     errorCode: optional(nonEmptyStr()),
+    origin: optional(enumOf(["agent", "human", "verifier"] as const)),
   }),
 );
 

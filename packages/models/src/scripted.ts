@@ -12,6 +12,7 @@
  */
 
 import type { ModelDescriptor } from "@keystone/schemas";
+import { assertModelContent } from "./content.ts";
 
 import type { ModelAdapter, ModelRequest, ModelResponse } from "./types.ts";
 
@@ -38,6 +39,7 @@ export function createScriptedAdapter(options: ScriptedAdapterOptions): Scripted
     descriptor: options.descriptor,
 
     async complete(request: ModelRequest): Promise<ModelResponse> {
+      assertModelContent(options.descriptor, request);
       const callIndex = seen.length;
       seen.push(request);
       const text = options.respond(request, callIndex);

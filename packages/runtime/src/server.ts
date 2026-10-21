@@ -23,11 +23,11 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { catalogFor, DEFAULT_LANGUAGE, type Language } from "@keystone/i18n";
+import { catalogFor, DEFAULT_LANGUAGE, isLanguage, type Language } from "@keystone/i18n";
 import {
   defaultRegistryLocation,
   ExtensionRegistry,
@@ -43,10 +43,12 @@ import {
   type ContractPatch,
   type KeystonePaths,
 } from "@keystone/kernel";
-import type { ModelAdapter, ModelRole } from "@keystone/models";
+import { buildAdapter, createCredentialBroker, enabledModels, routeFor, type CredentialResolver, type ModelAdapter, type ModelRole } from "@keystone/models";
 import { compileContract, detectProjectProfile, listDirtyPaths } from "@keystone/pack-engineering";
 import {
   autonomyEnvelopeSchema,
+  contentHash,
+  artifactIdValidator,
   newId,
   nowIso,
   userDecisionSchema,
@@ -62,6 +64,7 @@ import {
 } from "@keystone/schemas";
 
 import { clearProjectExperience, DataError, deleteTaskHistory, storeInventory } from "./data.ts";
+import { migrateData, previewCleanup, readCredentialService } from "./data-management.ts";
 import { changedPathsForTask, taskWorktreeDiff } from "./diff.ts";
 import {
   KeystoneRuntime,
@@ -77,18 +80,26 @@ import {
   type StartRiskResult,
 } from "./start-risk.ts";
 import { WorkspaceBusyError } from "./workspace-lock.ts";
+import { ProjectRegistry, ProjectServiceError } from "./projects/registry.ts";
+import { FileWorkspaceService, FileServiceError } from "./files/service.ts";
+import { AttachmentError, AttachmentStore } from "./attachments.ts";
+import { SettingsError, SettingsStore } from "./settings.ts";
+import { observeWorkspace } from "./workspace-observation.ts";
+import { humanFileBoundary } from "./human-files.ts";
+import { runHumanCommand } from "./human-commands.ts";
 
 const SERVER_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 // 1.1.0 adds the read-only `POST /v1/contract/preview` draft endpoint (ADR-0008,
 // Decision E). 1.2.0 (ADR-0013) adds an additive `risk` object to that preview
 // response and a `startMode` request on `POST /v1/tasks`; both are additive, so
 // a 1.0.0/1.1.0 client keeps working, it just loses the low-risk auto-start.
-const PROTOCOL_VERSION = "keystone.run.protocol@1.2.0";
+const PROTOCOL_VERSION = "keystone.run.protocol@1.3.0";
 const DEFAULT_INTERVENTION_TIMEOUT_MS = 10 * 60_000;
 
 export interface ServeOptions {
   readonly paths?: KeystonePaths;
   readonly models?: readonly ModelAdapter[];
+  readonly credentials?: CredentialResolver;
   readonly routes?: Partial<Record<ModelRole, readonly string[]>>;
   readonly mode?: RunMode;
   readonly port?: number;
@@ -141,6 +152,7 @@ class ServeState {
    * chain (ADR-0003). The run applies them at its next step boundary.
    */
   readonly controls = new Map<string, RunControlRequest[]>();
+  readonly aborters = new Map<string, AbortController>();
 }
 
 /** Queue a control request for a running task to pick up at its next step. */
@@ -152,6 +164,14 @@ function queueControl(
   const queue = state.controls.get(taskId) ?? [];
   queue.push(request);
   state.controls.set(taskId, queue);
+  if (request.kind === "stop" || request.kind === "pause") {
+    state.aborters.get(taskId)?.abort();
+    for (const [id, intervention] of state.interventions) {
+      if (intervention.taskId !== taskId) continue;
+      const resolve = state.pending.get(id);
+      if (resolve !== undefined) { state.pending.delete(id); resolve(undefined); }
+    }
+  }
 }
 
 function json(response: ServerResponse, status: number, body: unknown): void {
@@ -172,7 +192,7 @@ async function readBody(request: IncomingMessage): Promise<unknown> {
   for await (const chunk of request) {
     const buffer = chunk as Buffer;
     size += buffer.byteLength;
-    if (size > 2_000_000) throw new Error("request body is too large");
+    if (size > 29_000_000) throw new HttpError(413, "request body is too large");
     chunks.push(buffer);
   }
   if (chunks.length === 0) return {};
@@ -219,6 +239,7 @@ async function listTaskSummaries(
         taskId: name as never,
       });
       const state = session.summary();
+      const created = session.events().find((event) => event.type === "task.created");
       const pending = new Set<string>(session.state().pendingInterventions);
       for (const intervention of inflight.get(state.taskId)?.interventions ?? []) {
         pending.add(intervention.interventionId);
@@ -232,6 +253,7 @@ async function listTaskSummaries(
         outstandingEvidence: state.outstandingEvidence,
         updatedAt: state.updatedAt,
         headline: state.headline,
+        title: String(created?.payload["request"] ?? state.headline).slice(0, 160),
       });
     } catch (error) {
       // A task whose ledger cannot be verified is reported as such, not hidden.
@@ -259,6 +281,7 @@ async function taskDetail(paths: KeystonePaths, taskId: string): Promise<unknown
   const checkpoint = await session.latestCheckpoint();
   const branches = await listBranches(paths, taskId);
   const ledger = await readLedger(paths.ledgerFile(taskId as never));
+  const created = ledger.events.find((event) => event.type === "task.created");
 
   return {
     taskId: state.taskId,
@@ -295,6 +318,8 @@ async function taskDetail(paths: KeystonePaths, taskId: string): Promise<unknown
     })),
     checkpoint: checkpoint === undefined ? null : { checkpointId: checkpoint.checkpointId, seq: checkpoint.seq },
     replay: session.replay(),
+    attachments: created?.payload["attachments"] ?? [],
+    configurationSnapshot: created?.payload["configurationSnapshot"] ?? null,
   };
 }
 
@@ -366,7 +391,10 @@ function projectContract(contract: OutcomeContract | undefined): Record<string, 
 function scopeWithWritePaths(current: Scope, writePaths: readonly string[]): Scope {
   const reads = current.include.filter((entry) => entry.intent === "read");
   const unique = [...new Set(writePaths.map((path) => path.trim()).filter((path) => path !== ""))];
-  const writes = unique.map((pattern) => ({
+  const writes = unique.map((pattern) => current.include.find((entry) =>
+    entry.intent === "write" && (entry.pattern === pattern ||
+      (entry.kind === "directory" && `${entry.pattern.replace(/\/+$/, "")}/**` === pattern)),
+  ) ?? ({
     kind: pattern.includes("*") ? ("glob" as const) : ("path" as const),
     pattern,
     intent: "write" as const,
@@ -417,26 +445,64 @@ function revisionReason(body: Record<string, unknown>): string {
 }
 
 export async function startServer(options: ServeOptions = {}): Promise<RunningServer> {
-  const paths = options.paths ?? resolveKeystonePaths();
+  let paths = options.paths ?? resolveKeystonePaths();
   const mode: RunMode = options.mode ?? "standard";
   const token = options.token ?? randomBytes(24).toString("base64url");
   const interventionTimeoutMs = options.interventionTimeoutMs ?? DEFAULT_INTERVENTION_TIMEOUT_MS;
   const state = new ServeState();
+  let projects = new ProjectRegistry(paths);
+  let attachments = new AttachmentStore(paths);
+  let settings = new SettingsStore(paths);
+  let managingData = false;
+  let storeRequests = 0;
+  const assets = new Map<string, string>();
+  const webRoot = join(SERVER_DIRECTORY, "..", "web");
+  const collectAssets = async (directory: string, prefix = ""): Promise<void> => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      if (!/^[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9]+)?$/.test(entry.name)) continue;
+      const name = prefix + entry.name;
+      if (entry.isDirectory()) await collectAssets(join(directory, entry.name), `${name}/`);
+      else if (entry.isFile() && /\.(?:js|css)$/.test(name)) assets.set(`/assets/${name}`, join(directory, entry.name));
+    }
+  };
+  await collectAssets(webRoot);
 
-  const runtime = await KeystoneRuntime.create({
+  const createRuntime = () => KeystoneRuntime.create({
     paths,
     models: options.models ?? [],
     ...(options.routes === undefined ? {} : { routes: options.routes }),
     ...(options.mode === undefined ? {} : { mode: options.mode }),
     actorId: "serve",
   });
+  let runtime = await createRuntime();
+  const applyConfiguredModels = async (): Promise<Awaited<ReturnType<SettingsStore["read"]>>> => {
+    const configuration = await settings.read();
+    if (configuration.config.models.length === 0) {
+      runtime.configureModels(options.models ?? [], options.routes ?? {});
+    } else {
+      const broker = options.credentials ?? createCredentialBroker({
+        credentialsDir: paths.credentialsDir, service: await readCredentialService(paths),
+      });
+      runtime.configureModels(enabledModels(configuration.config).map((entry) => buildAdapter(entry, broker)), {
+        builder: routeFor(configuration.config, "builder"),
+        planner: routeFor(configuration.config, "planner"),
+        summarizer: routeFor(configuration.config, "summarizer"),
+      });
+    }
+    return configuration;
+  };
+  await applyConfiguredModels();
 
   /** Start a run and answer immediately; decisions arrive over HTTP. */
   const startRun = async (body: Record<string, unknown>): Promise<{ taskId: string }> => {
-    const workspacePath = String(body["workspacePath"] ?? "");
+    let workspacePath = String(body["workspacePath"] ?? "");
     const request = String(body["request"] ?? "");
     if (workspacePath === "" || request === "") {
       throw new HttpError(400, "workspacePath and request are required");
+    }
+    try { workspacePath = (await projects.register({ rootPath: workspacePath })).rootPath; }
+    catch (error) {
+      throw new HttpError(400, `the task could not be created: ${error instanceof Error ? error.message : "workspace is unavailable"}`);
     }
     const writePaths = Array.isArray(body["writePaths"])
       ? (body["writePaths"] as readonly string[])
@@ -468,6 +534,7 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
               }[])
             : [],
           userConfirmAllWrites: body["confirmAllWrites"] === true,
+          defaults: (await settings.read()).config.defaults,
         });
       } catch (error) {
         throw new HttpError(
@@ -488,6 +555,14 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
     }
 
     const projectId = await projectIdForWorkspace(workspacePath);
+    const selected = await attachments.select(projectId, Array.isArray(body["attachmentIds"]) ? body["attachmentIds"].map(String) : []);
+    const configuration = await applyConfiguredModels();
+    const builder = runtime.describeEgress().find((entry) => entry.role === "builder");
+    if (selected.some((entry) => entry.kind === "image") && !builder?.multimodal) throw new HttpError(409, "the selected builder does not support image input");
+    if (selected.length > 0 && builder?.local === false && body["allowAttachmentEgress"] !== true) {
+      throw new HttpError(409, `confirm attachment egress to ${builder.endpointHost} before starting`);
+    }
+    const aborter = new AbortController();
 
     let taskId: string | undefined;
     // The id only exists once the runtime has attached the project and created
@@ -504,10 +579,18 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
       .runTask({
         workspacePath,
         request,
+        attachments: selected,
+        attachmentParts: await attachments.parts(selected, Math.min(24_000, (configuration.config.defaults?.maxTokens ?? 300_000) * 2)),
+        configurationSnapshot: {
+          revision: configuration.revision,
+          modelIds: runtime.describeEgress().map((entry) => entry.modelId),
+          ...(builder === undefined ? {} : { builderModelId: builder.modelId }),
+        },
+        signal: aborter.signal,
         ...(Array.isArray(body["references"])
           ? { references: body["references"] as RunTaskOptions["references"] }
           : {}),
-        autonomy: buildAutonomy(projectId, writePaths, allowedCommands),
+        autonomy: buildAutonomy(projectId, writePaths, allowedCommands, configuration.config.defaults),
         // A confirmed (or auto-started low-risk) run accepts the compiled
         // contract without an extra round trip; an unconfirmed write never
         // reaches here — it was refused above.
@@ -515,8 +598,10 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
         // The run applies queued pause/stop/revision itself, because it is the
         // session's only writer while it is in flight (ADR-0003).
         control: async () => state.controls.get(taskId ?? "")?.shift(),
-        onTaskCreated: (created_) => {
+        onTaskCreated: async (created_) => {
+          await attachments.bind(selected.map((entry) => entry.attachmentId), created_);
           taskId = created_;
+          state.aborters.set(created_, aborter);
           state.runs.set(created_, {
             taskId: created_,
             status: "running",
@@ -529,17 +614,20 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
           state.interventions.set(intervention.interventionId, intervention);
           state.runs.get(taskId ?? "")?.interventions.push(intervention);
           return await new Promise<UserDecision | undefined>((resolve) => {
-            state.pending.set(intervention.interventionId, resolve);
+            let timer: NodeJS.Timeout;
+            state.pending.set(intervention.interventionId, (decision) => { clearTimeout(timer); resolve(decision); });
             // An unanswered question must not hold the run open forever; giving
             // up is honest, blocking indefinitely is not.
-            setTimeout(() => {
+            timer = setTimeout(() => {
               if (state.pending.delete(intervention.interventionId)) resolve(undefined);
             }, interventionTimeoutMs);
+            timer.unref();
           });
         },
       })
       .then((result) => {
         if (taskId !== undefined) {
+          state.aborters.delete(taskId);
           state.runs.set(taskId, {
             taskId,
             status: "finished",
@@ -552,6 +640,7 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
       .catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
         if (taskId !== undefined) {
+          state.aborters.delete(taskId);
           state.runs.set(taskId, {
             taskId,
             status: "failed",
@@ -588,11 +677,15 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
   });
 
   const handle = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
+    let ownsManagement = false;
+    let countedRequest = false;
     try {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
 
       if (url.pathname === "/" || url.pathname === "/index.html") {
-        const language = options.language ?? DEFAULT_LANGUAGE;
+        const nonce = randomBytes(16).toString("base64");
+        const storedLanguage = (await settings.read()).config.language;
+        const language = isLanguage(storedLanguage) ? storedLanguage : options.language ?? DEFAULT_LANGUAGE;
         const html = await readFile(join(SERVER_DIRECTORY, "..", "web", "workbench.html"), "utf8");
         // The workbench ships with no build step, so the server injects the
         // resolved language and its catalog into the page directly. The page
@@ -605,13 +698,25 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
           "</head>",
           `<script>window.KEYSTONE_LANG=${JSON.stringify(language)};window.KEYSTONE_I18N=${catalogJson};</script></head>`,
         );
-        const localized = withCatalog.replace('<html lang="en">', `<html lang="${language}">`);
+        const localized = withCatalog.replace('<html lang="en">', `<html lang="${language}">`)
+          .replace(/<script(?=[ >])/g, `<script nonce="${nonce}"`);
         response.writeHead(200, {
           "content-type": "text/html; charset=utf-8",
           "x-content-type-options": "nosniff",
           "cache-control": "no-store",
+          "content-security-policy": `default-src 'self'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'`,
         });
         response.end(localized);
+        return;
+      }
+      const asset = assets.get(url.pathname);
+      if (request.method === "GET" && asset !== undefined) {
+        response.writeHead(200, {
+          "content-type": asset.endsWith(".css") ? "text/css; charset=utf-8" : "text/javascript; charset=utf-8",
+          "x-content-type-options": "nosniff", "cache-control": "no-store",
+          "content-security-policy": "default-src 'none'",
+        });
+        response.end(await readFile(asset));
         return;
       }
 
@@ -629,6 +734,123 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
       }
 
       const segments = url.pathname.slice("/v1/".length).split("/").filter((part) => part !== "");
+      if (managingData) throw new HttpError(409, "data management is in progress; retry after it finishes");
+      const isManagement = request.method === "POST" && segments[0] === "data" &&
+        ["cleanup", "migrate"].includes(segments[1] ?? "");
+      if (isManagement) {
+        if (storeRequests > 0 || [...state.runs.values()].some((run) => run.status === "running")) {
+          throw new HttpError(409, "finish active requests and tasks before managing data");
+        }
+        managingData = true;
+        ownsManagement = true;
+      } else {
+        storeRequests += 1;
+        countedRequest = true;
+      }
+
+      if (isManagement && segments[1] === "cleanup") {
+        json(response, 200, await previewCleanup(paths, await readBody(request) as Parameters<typeof previewCleanup>[1]));
+        return;
+      }
+      if (isManagement && segments[1] === "migrate") {
+        const result = await migrateData(paths, await readBody(request) as Parameters<typeof migrateData>[1]);
+        if (!result.preview && result.verified && result.newHome !== undefined) {
+          paths = resolveKeystonePaths(result.newHome);
+          projects = new ProjectRegistry(paths);
+          attachments = new AttachmentStore(paths);
+          settings = new SettingsStore(paths);
+          runtime = await createRuntime();
+          await applyConfiguredModels();
+          state.runs.clear(); state.interventions.clear(); state.controls.clear();
+        }
+        json(response, 200, result);
+        return;
+      }
+
+      if (segments[0] === "settings" && segments.length === 1) {
+        if (request.method === "GET") { json(response, 200, await applyConfiguredModels()); return; }
+        if (request.method === "POST") {
+          await settings.save(await readBody(request) as Parameters<SettingsStore["save"]>[0]);
+          json(response, 200, await applyConfiguredModels());
+          return;
+        }
+      }
+      if (segments[0] === "settings" && segments[1] === "catalog" && request.method === "GET") {
+        const language = url.searchParams.get("language");
+        if (!isLanguage(language)) throw new HttpError(400, "unsupported presentation language");
+        json(response, 200, { language, catalog: catalogFor(language) });
+        return;
+      }
+      if (segments[0] === "settings" && segments[1] === "probe" && request.method === "POST") {
+        json(response, 200, await settings.probe(await readBody(request) as { id: string; kind: string }, options.credentials));
+        return;
+      }
+      if (segments[0] === "attachments") {
+        if (segments.length === 1 && request.method === "POST") {
+          const input = await readBody(request) as Parameters<AttachmentStore["import"]>[0];
+          if (await projects.get(input.projectId) === undefined) throw new HttpError(404, "project not found");
+          json(response, 201, { attachment: await attachments.import(input) });
+          return;
+        }
+        if (segments.length === 1 && request.method === "GET") {
+          json(response, 200, { attachments: await attachments.list(url.searchParams.get("projectId") ?? "") });
+          return;
+        }
+        if (segments.length === 2 && request.method === "DELETE") {
+          await attachments.remove(segments[1]!); json(response, 200, { removed: true }); return;
+        }
+      }
+      if (segments[0] === "projects") {
+        if (segments.length === 1 && request.method === "GET") {
+          json(response, 200, { projects: await projects.list() }); return;
+        }
+        if (segments.length === 1 && request.method === "POST") {
+          json(response, 201, { project: await projects.register(await readBody(request) as Parameters<ProjectRegistry["register"]>[0]) }); return;
+        }
+        if (segments.length === 2 && request.method === "PATCH") {
+          json(response, 200, { project: await projects.update(segments[1]!, await readBody(request) as Parameters<ProjectRegistry["update"]>[1]) }); return;
+        }
+        if (segments.length === 2 && request.method === "DELETE") {
+          json(response, 200, await projects.remove(segments[1]!)); return;
+        }
+        if (segments.length === 3 && segments[2] === "commands" && request.method === "POST") {
+          const project = await projects.get(segments[1]!);
+          if (project?.status !== "available") throw new HttpError(409, "project workspace is unavailable");
+          try {
+            json(response, 200, await runHumanCommand(paths, runtime, project, await readBody(request) as Parameters<typeof runHumanCommand>[3]));
+          } catch (error) {
+            if (error instanceof WorkspaceBusyError) throw error;
+            throw new HttpError(400, error instanceof Error ? error.message : "command refused");
+          }
+          return;
+        }
+        if (segments.length === 3 && ["files", "file", "search"].includes(segments[2]!)) {
+          const project = await projects.get(segments[1]!);
+          if (project === undefined) throw new HttpError(404, "project not found");
+          if (project.status !== "available") throw new HttpError(409, "project workspace is unavailable");
+          const files = new FileWorkspaceService({
+            rootPath: project.rootPath, paths,
+            boundary: humanFileBoundary(paths, runtime, project),
+          });
+          if (request.method === "GET" && segments[2] === "files") {
+            json(response, 200, await files.tree({
+              path: url.searchParams.get("path") ?? ".",
+              offset: Number(url.searchParams.get("offset") ?? 0),
+              limit: Number(url.searchParams.get("limit") ?? 100),
+            })); return;
+          }
+          if (request.method === "GET" && segments[2] === "file") {
+            json(response, 200, await files.read({ path: url.searchParams.get("path") ?? "" })); return;
+          }
+          if (request.method === "GET" && segments[2] === "search") {
+            json(response, 200, await files.search({ q: url.searchParams.get("q") ?? "" })); return;
+          }
+          if (request.method === "POST" && segments[2] === "files") {
+            json(response, 200, await files.mutate(await readBody(request) as Parameters<FileWorkspaceService["mutate"]>[0]));
+            return;
+          }
+        }
+      }
 
       // GET /v1/capabilities — what this runtime can do, so a client can refuse
       // to pretend it understands more than it does (NFR-COMP-03).
@@ -686,6 +908,7 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
                 }[])
               : [],
             userConfirmAllWrites,
+            defaults: (await settings.read()).config.defaults,
           });
           json(response, 200, {
             contract: projectContract(graded.contract),
@@ -725,6 +948,17 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
 
       if (segments[0] === "tasks" && segments[1] !== undefined) {
         const taskId = segments[1];
+        if (request.method === "GET" && segments[2] === "artifacts" && segments[3] !== undefined) {
+          const artifactId = artifactIdValidator.parse(segments[3]);
+          const session = await KernelSession.open({ paths, taskId: taskId as never });
+          const references = JSON.stringify(session.events());
+          if (!references.includes(`"${artifactId}"`)) throw new HttpError(404, "artifact is not referenced by this task");
+          const { getArtifactBytes } = await import("@keystone/kernel");
+          const bytes = await getArtifactBytes(paths, artifactId);
+          if (bytes === undefined) throw new HttpError(404, "artifact is unavailable");
+          json(response, 200, { artifactId, content: new TextDecoder().decode(bytes.slice(0, 1_000_000)), truncated: bytes.length > 1_000_000 });
+          return;
+        }
 
         if (request.method === "GET" && segments.length === 2) {
           json(response, 200, await taskDetail(paths, taskId));
@@ -762,7 +996,11 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
             return;
           }
           const changedPaths = await changedPathsForTask(paths, taskId);
-          json(response, 200, await session.exportProof({ changedPaths }));
+          const diff = await taskWorktreeDiff(paths, taskId);
+          const current = diff.rootPath === null ? undefined : await observeWorkspace(diff.rootPath).catch(() => undefined);
+          json(response, 200, await session.exportProof({
+            changedPaths, workspaceFingerprint: current?.fingerprint ?? contentHash({ workspace: "unavailable", taskId }),
+          }));
           return;
         }
 
@@ -1023,9 +1261,20 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
         json(response, error.status, { error: error.message });
         return;
       }
+      if (error instanceof SettingsError || error instanceof AttachmentError || error instanceof ProjectServiceError || error instanceof FileServiceError) {
+        json(response, error.status, { error: error.message }); return;
+      }
+      if (error instanceof WorkspaceBusyError) { json(response, 409, { error: error.message }); return; }
+      if (error instanceof DataError) {
+        json(response, error.status, { error: error.message, code: error.code, ...(error.impact === undefined ? {} : { impact: error.impact }) });
+        return;
+      }
       json(response, 500, {
         error: error instanceof Error ? error.message : String(error),
       });
+    } finally {
+      if (countedRequest) storeRequests -= 1;
+      if (ownsManagement) managingData = false;
     }
   };
 
@@ -1044,6 +1293,7 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
     token,
     protocolVersion: PROTOCOL_VERSION,
     async close(): Promise<void> {
+      for (const [taskId] of state.aborters) queueControl(state, taskId, { kind: "stop", reason: "server closed" });
       for (const resolve of state.pending.values()) resolve(undefined);
       state.pending.clear();
       await new Promise<void>((resolve) => {
@@ -1104,6 +1354,7 @@ function buildAutonomy(
   projectId: string,
   writePaths: readonly string[],
   allowedCommands: readonly string[],
+  defaults?: Partial<Budget>,
 ): AutonomyEnvelope {
   // Built from the real project id and nothing else. An omitted `writePaths`
   // therefore produces an envelope with no writable path, so a caller that
@@ -1119,7 +1370,7 @@ function buildAutonomy(
     externalSystems: "none",
     maxReversibility: "reversible",
     untrustedContentEgress: "deny_all",
-    budget: { maxTokens: 300_000, maxWallClockMs: 7_200_000, maxRetries: 3 },
+    budget: { maxTokens: 300_000, maxWallClockMs: 7_200_000, maxRetries: 3, ...defaults },
     updatedAt: nowIso(),
     updatedBy: "user",
     widenedBy: [],
@@ -1145,6 +1396,7 @@ async function gradeSubmission(input: {
     readonly value: string;
   }[];
   readonly userConfirmAllWrites: boolean;
+  readonly defaults?: Partial<Budget>;
 }): Promise<{
   readonly projectId: string;
   readonly autonomy: AutonomyEnvelope;
@@ -1159,7 +1411,7 @@ async function gradeSubmission(input: {
 }> {
   const projectId = await projectIdForWorkspace(input.workspacePath);
   const profile = await detectProjectProfile(input.workspacePath, projectId);
-  const autonomy = buildAutonomy(projectId, input.writePaths, input.allowedCommands);
+  const autonomy = buildAutonomy(projectId, input.writePaths, input.allowedCommands, input.defaults);
   const proposal = compileContract({
     taskId: newId("task"),
     projectId,

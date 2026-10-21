@@ -12,7 +12,8 @@
     "keystone-desktop": "./src/bin.ts"
   },
   "scripts": {
-    "desktop:build-window": "swiftc src-native/KeystoneWindow.swift -o bin/keystone-window -framework Cocoa -framework WebKit -O"
+    "desktop:build-window": "node scripts/build-native.ts",
+    "desktop:build-native": "node scripts/build-native.ts"
   },
   "dependencies": {
     "@keystone/kernel": "workspace:*",

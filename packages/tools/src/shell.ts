@@ -76,9 +76,8 @@ export const runCommandTool: Tool<RunCommandArgs> = {
       );
     }
 
-    // The lease is scoped to the command *name*, not the arguments, so a granted
-    // "node" cannot be turned into a different program by argument injection.
-    assertLeaseCovers(ctx.lease, { capability: "cmd.exec", resourceValues: [args.command] });
+    // New grants bind the complete arguments/cwd/timeout, not only argv[0].
+    assertLeaseCovers(ctx.lease, { capability: "cmd.exec", resourceValues: [args.command] }, args);
 
     const cwd = assertWithinRoot(
       ctx.rootPath,

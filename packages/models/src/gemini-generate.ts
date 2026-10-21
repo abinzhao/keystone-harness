@@ -9,6 +9,7 @@
  */
 
 import type { ModelDescriptor } from "@keystone/schemas";
+import { assertModelContent, contentText, mapContent } from "./content.ts";
 
 import type {
   CredentialResolver,
@@ -38,6 +39,7 @@ export function createGeminiGenerateAdapter(options: GeminiGenerateOptions): Mod
     descriptor,
 
     async complete(request: ModelRequest): Promise<ModelResponse> {
+      assertModelContent(descriptor, request);
       const secret = await resolveCallSecret(descriptor, credentials);
       const { system, contents } = splitGemini(request.messages);
       const json = await callProvider({
@@ -79,18 +81,18 @@ export function createGeminiGenerateAdapter(options: GeminiGenerateOptions): Mod
 
 function splitGemini(messages: readonly ModelMessage[]): {
   readonly system: string;
-  readonly contents: readonly { readonly role: string; readonly parts: readonly { text: string }[] }[];
+  readonly contents: readonly { readonly role: string; readonly parts: readonly Record<string, unknown>[] }[];
 } {
   const system: string[] = [];
-  const contents: { readonly role: string; readonly parts: readonly { text: string }[] }[] = [];
+  const contents: { readonly role: string; readonly parts: readonly Record<string, unknown>[] }[] = [];
   for (const message of messages) {
     if (message.role === "system") {
-      system.push(message.content);
+      system.push(contentText(message.content));
       continue;
     }
     contents.push({
       role: message.role === "assistant" ? "model" : "user",
-      parts: [{ text: message.content }],
+      parts: mapContent(message.content, "gemini-generate"),
     });
   }
   return { system: system.join("\n\n"), contents };

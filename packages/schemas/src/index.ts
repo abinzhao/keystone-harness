@@ -30,3 +30,5 @@ export * from "./schemas/experience.ts";
 export * from "./schemas/extension.ts";
 export * from "./schemas/agent.ts";
 export * from "./schemas/events.ts";
+export * from "./schemas/attachment.ts";
+export * from "./schemas/workbench.ts";

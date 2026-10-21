@@ -18,7 +18,7 @@ import {
   type KeystonePaths,
 } from "@keystone/kernel";
 import type { Budget, ProjectId, RunEvent, TaskId } from "@keystone/schemas";
-import type { KeystoneConfig } from "@keystone/models";
+import { createCredentialBroker, type CredentialBroker, type KeystoneConfig } from "@keystone/models";
 
 import { UsageError } from "../args.ts";
 
@@ -40,6 +40,7 @@ export interface CliContext {
   /** True only when the caller has an interactive terminal. */
   readonly isTTY: boolean;
   readonly stdin?: AsyncIterable<string | Uint8Array>;
+  readonly credentials?: CredentialBroker;
   /**
    * The presentation language, resolved once by `runCli` from `--lang`,
    * `KEYSTONE_LANG` and `config.json`. Optional so tests and embedders can omit
@@ -71,6 +72,10 @@ export interface CommandModule {
 export function pathsFor(context: CliContext): KeystonePaths {
   const override = context.env[KEYSTONE_HOME_ENV];
   return resolveKeystonePaths(override === undefined || override === "" ? undefined : override);
+}
+
+export function credentialsFor(context: CliContext): CredentialBroker {
+  return context.credentials ?? createCredentialBroker({ credentialsDir: pathsFor(context).credentialsDir });
 }
 
 /**

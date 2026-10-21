@@ -15,7 +15,6 @@
 
 import { DEFAULT_LANGUAGE } from "@keystone/i18n";
 import {
-  FileCredentialStore,
   buildAdapter,
   enabledModels,
   loadConfig,
@@ -29,7 +28,7 @@ import { createSequenceAdapter, scriptedModelDescriptor } from "@keystone/models
 import { getBoolean, getString, parseArgs } from "../args.ts";
 import { createOutput } from "../output.ts";
 import { loadScriptedFixture } from "./task.ts";
-import { pathsFor, translatorForContext, type CliContext, type CommandModule } from "./shared.ts";
+import { credentialsFor, pathsFor, translatorForContext, type CliContext, type CommandModule } from "./shared.ts";
 
 const MODES = ["minimal", "standard", "isolated", "replay"] as const;
 
@@ -103,7 +102,7 @@ export const command: CommandModule = {
 
     const paths = pathsFor(context);
     const config = await loadConfig({ configFile: paths.configFile });
-    const credentials = new FileCredentialStore({ credentialsDir: paths.credentialsDir });
+    const credentials = credentialsFor(context);
 
     const requested = getString(args, "model");
     const fixture = getString(args, "scripted-fixture");
@@ -154,6 +153,7 @@ export const command: CommandModule = {
 
     const server = await startServer({
       paths,
+      credentials,
       models: adapters,
       routes,
       mode,

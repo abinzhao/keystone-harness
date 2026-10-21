@@ -7,29 +7,38 @@
  *
  *  - read the manifest the package ships,
  *  - verify its declared digest against the bytes that would actually run,
- *  - load the declared entry and run the Conformance Kit against it,
+ *  - review without execution, then probe a copy only after explicit consent,
  *  - hand the result to the registry, which is the only writer.
  *
  * There is no remote fetch here: installation is local-path first by design, so
  * the user can see exactly which directory they are trusting (PRD PL-01, PL-02).
  */
 
-import { readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
+import { resolveSpawnTarget } from "@keystone/spawn";
+import { sanitizeEnv } from "@keystone/tools";
 
 import {
   extensionManifestSchema,
+  canonicalJson,
   sha256Bytes,
+  sha256Hex,
+  userDecisionSchema,
   type ConformanceReport,
   type ExtensionManifest,
   type ExtensionRegistration,
+  type UserDecision,
 } from "@keystone/schemas";
 
 import { canActivate, reachesOutside, type ActivationGateResult } from "./activation.ts";
-import { runConformance } from "./conformance.ts";
+import { runConformance, type ConformanceProbe } from "./conformance.ts";
 import { describeInstallReview, type InstallReview } from "./manifest.ts";
-import { mcpHandshakeProbe } from "./mcp/conformance-probe.ts";
+import { isolatedVerifierEntryShapeProbe, probeEnvironment, probeLimits, type IsolatedProbeLimits } from "./verifier-entry-probe.ts";
+import { decodeLine, encodeFrame } from "./mcp/protocol.ts";
 
 /** The manifest file every local package must ship at its root. */
 export const EXTENSION_MANIFEST_FILE = "keystone-extension.json";
@@ -50,29 +59,68 @@ export class LocalPackageError extends Error {
 
 export interface ReadLocalPackage {
   readonly manifest: ExtensionManifest;
-  /** True when the manifest's digest matches the actual entry bytes. */
+  readonly integrityBasis: "entry_digest" | "local_path_trust";
+  /** Digest match, or explicitly approved local-path trust after consent. */
   readonly integrityVerified: boolean;
   /** Absolute path of the in-process entry module, when the package has one. */
   readonly entryPath?: string;
   readonly review: InstallReview;
 }
 
-/**
- * Read a local extension package without changing any state.
- *
- * Fails loudly when the manifest is missing, unparseable, or describes bytes
- * that do not match the entry on disk — a digest that does not match is exactly
- * the "package was altered after the manifest was written" case PL-02 exists
- * for, and it is refused before anything is registered.
- */
-export async function readLocalPackage(packageRoot: string): Promise<ReadLocalPackage> {
-  const root = resolve(packageRoot);
-  const manifestPath = join(root, EXTENSION_MANIFEST_FILE);
+interface PackageFile {
+  readonly path: string;
+  readonly bytes: Uint8Array;
+  readonly mode: number;
+}
 
-  let raw: string;
-  try {
-    raw = await readFile(manifestPath, "utf8");
-  } catch {
+interface PackageSnapshot {
+  readonly root: string;
+  readonly files: readonly PackageFile[];
+}
+
+function confinedPath(root: string, path: string): string {
+  const target = resolve(root, path);
+  const rel = relative(root, target);
+  if (isAbsolute(path) || rel === ".." || rel.startsWith(`..${sep}`)) {
+    throw new LocalPackageError(`package path escapes the local package: ${path}`);
+  }
+  return target;
+}
+
+/** Bounded source inventory. No symlinks, device files, hidden data or dependencies. */
+async function snapshotPackage(packageRoot: string): Promise<PackageSnapshot> {
+  const root = await realpath(resolve(packageRoot));
+  const files: PackageFile[] = [];
+  let bytes = 0;
+  let visited = 0;
+  async function visit(dir: string): Promise<void> {
+    for (const name of (await readdir(dir)).sort()) {
+      if (name === "node_modules" || name.startsWith(".")) continue;
+      if (++visited > 512) throw new LocalPackageError("package exceeds the 512-entry static review limit");
+      const path = join(dir, name);
+      const stat = await lstat(path);
+      if (stat.isSymbolicLink()) throw new LocalPackageError(`package symlinks are not reviewable: ${relative(root, path)}`);
+      if (stat.isDirectory()) {
+        await visit(path);
+      } else {
+        if (!stat.isFile()) throw new LocalPackageError("package contains a non-regular file");
+        if (bytes + stat.size > 16 * 1024 * 1024) throw new LocalPackageError("package exceeds the 16MiB static review limit");
+        const content = new Uint8Array(await readFile(path));
+        bytes += content.byteLength;
+        if (bytes > 16 * 1024 * 1024) throw new LocalPackageError("package exceeds the 16MiB static review limit");
+        files.push({ path: relative(root, path), bytes: content, mode: stat.mode });
+      }
+    }
+  }
+  await visit(root);
+  return { root, files };
+}
+
+function readSnapshot(snapshot: PackageSnapshot): ReadLocalPackage {
+  const { root } = snapshot;
+  const manifestPath = join(root, EXTENSION_MANIFEST_FILE);
+  const manifestFile = snapshot.files.find((file) => file.path === EXTENSION_MANIFEST_FILE);
+  if (manifestFile === undefined) {
     throw new LocalPackageError(
       `no ${EXTENSION_MANIFEST_FILE} found in ${root}; a local extension must ship its manifest`,
     );
@@ -80,7 +128,7 @@ export async function readLocalPackage(packageRoot: string): Promise<ReadLocalPa
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(new TextDecoder().decode(manifestFile.bytes));
   } catch (error) {
     throw new LocalPackageError(
       `${manifestPath} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
@@ -103,9 +151,11 @@ export async function readLocalPackage(packageRoot: string): Promise<ReadLocalPa
   // not by hashing. This is a stated, weaker boundary than digesting bundled
   // entry bytes — it is not papered over.
   if (manifest.transport !== undefined) {
+    confinedPath(root, manifest.transport.cwd ?? ".");
     return {
       manifest,
-      integrityVerified: true,
+      integrityVerified: false,
+      integrityBasis: "local_path_trust",
       review: describeInstallReview(manifest),
     };
   }
@@ -116,75 +166,300 @@ export async function readLocalPackage(packageRoot: string): Promise<ReadLocalPa
     );
   }
 
-  const entryPath = resolve(root, manifest.entry.module);
-  let entryBytes: Uint8Array;
-  try {
-    entryBytes = new Uint8Array(await readFile(entryPath));
-  } catch {
+  const entryPath = confinedPath(root, manifest.entry.module);
+  const entryFile = snapshot.files.find((file) => file.path === relative(root, entryPath));
+  if (entryFile === undefined) {
     throw new LocalPackageError(
       `the manifest declares entry "${manifest.entry.module}", which cannot be read from ${root}`,
     );
   }
 
-  const integrityVerified = sha256Bytes(entryBytes) === manifest.integrity.digest;
+  const integrityVerified = sha256Bytes(entryFile.bytes) === manifest.integrity.digest;
 
   return {
     manifest,
     integrityVerified,
+    integrityBasis: "entry_digest",
     entryPath,
     review: describeInstallReview(manifest),
   };
 }
 
+/** Static only. An entry digest does not cover dependencies or prove publisher trust. */
+export async function readLocalPackage(packageRoot: string): Promise<ReadLocalPackage> {
+  return readSnapshot(await snapshotPackage(packageRoot));
+}
+
 /**
- * Build the entry loader the Conformance Kit uses to prove a declared verifier
- * actually looks like one. The loader resolves the module the manifest names,
- * relative to the package root, and returns the named export.
+ * Kept as a fail-closed compatibility hook. Local package imports must use the
+ * approved child probe, not return executable objects to the trusted host.
  */
 export function localEntryLoader(
   packageRoot: string,
 ): (modulePath: string, exportName: string) => Promise<unknown> {
-  const root = resolve(packageRoot);
-  return async (modulePath, exportName) => {
-    const mod = (await import(pathToFileURL(resolve(root, modulePath)).href)) as Record<
-      string,
-      unknown
-    >;
-    return mod[exportName];
+  return async () => {
+    throw new LocalPackageError(`host entry loading is disabled for ${resolve(packageRoot)}; use probeLocalInstall`);
   };
 }
 
 export interface PreparedLocalInstall {
+  readonly phase: "static" | "probed";
+  readonly reviewHash: string;
+  readonly staticChecksPassed: boolean;
+  readonly files: readonly { readonly path: string; readonly digest: string; readonly bytes: number; readonly mode: number }[];
   readonly read: ReadLocalPackage;
   readonly conformance: ConformanceReport;
   readonly gate: ActivationGateResult;
 }
 
 /**
- * Everything needed to decide whether to install: the manifest, the integrity
- * check, a recorded conformance run, and the activation gate. Writes nothing.
+ * Static review only: no import, process launch, or behavioral probe. The
+ * pending consent check prevents this report from being used for activation.
  */
 export async function prepareLocalInstall(packageRoot: string): Promise<PreparedLocalInstall> {
-  const read = await readLocalPackage(packageRoot);
-  // A stdio protocol extension gets a live behavioral probe: actually launch
-  // the declared command and handshake, so a server that does not speak MCP
-  // fails conformance here rather than at first use (ADR-0009).
-  const probes =
-    read.manifest.transport === undefined
-      ? []
-      : [mcpHandshakeProbe({ manifest: read.manifest, packageRoot })];
+  return prepareSnapshot(await snapshotPackage(packageRoot));
+}
+
+async function prepareSnapshot(snapshot: PackageSnapshot): Promise<PreparedLocalInstall> {
+  const read = readSnapshot(snapshot);
   const conformance = await runConformance({
     manifest: read.manifest,
     integrityVerified: read.integrityVerified,
-    entryLoader: localEntryLoader(packageRoot),
-    probes,
+    integrityBasis: read.integrityBasis,
+    staticOnly: true,
   });
   const gate = canActivate({
     manifest: read.manifest,
     integrityVerified: read.integrityVerified,
     conformance,
   });
-  return { read, conformance, gate };
+  const files = snapshot.files.map((file) => ({
+    path: file.path, digest: sha256Bytes(file.bytes), bytes: file.bytes.byteLength, mode: file.mode & 0o777,
+  }));
+  const reviewHash = sha256Hex(canonicalJson({ root: snapshot.root, manifest: read.manifest, files }));
+  const staticChecksPassed = conformance.checks.every((c) =>
+    c.checkId === "execution.consent" ||
+    (c.checkId === "manifest.integrity" && read.integrityBasis === "local_path_trust") ||
+    c.passed || !c.blocking);
+  return { read, conformance, gate, phase: "static", reviewHash, staticChecksPassed, files };
+}
+
+export interface LocalProbeApproval extends IsolatedProbeLimits {
+  readonly decision: UserDecision;
+  /** Binds consent to the package and declaration that were actually reviewed. */
+  readonly reviewHash: string;
+}
+
+function requireLiveApproval(decision: UserDecision): void {
+  if (decision.recordedBy !== "user" || decision.decision !== "allow" ||
+      (decision.appliesTo.expiresAt !== undefined &&
+       Date.parse(decision.appliesTo.expiresAt) <= Date.now())) {
+    throw new LocalPackageError("bounded probes require a live explicit user approval");
+  }
+}
+
+/** No registration, capability grant, runtime activation, or host import. */
+export async function probeLocalInstall(
+  packageRoot: string,
+  approval: LocalProbeApproval,
+): Promise<PreparedLocalInstall> {
+  const decision = userDecisionSchema.parse(approval.decision) as UserDecision;
+  requireLiveApproval(decision);
+  const limits = probeLimits(approval);
+  const snapshot = await snapshotPackage(packageRoot);
+  const prepared = await prepareSnapshot(snapshot);
+  if (prepared.reviewHash !== approval.reviewHash) {
+    throw new LocalPackageError("package changed since static review; review and approve it again");
+  }
+  if (!prepared.staticChecksPassed) {
+    throw new LocalPackageError("static checks failed; no behavioral probe was launched");
+  }
+  const workspace = await realpath(await mkdtemp(join(tmpdir(), "keystone-extension-probe-")));
+  try {
+    // Write the reviewed bytes, not a second live filesystem read after consent.
+    for (const file of snapshot.files) {
+      const target = join(workspace, file.path);
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(target, file.bytes, { mode: file.mode & 0o777 });
+    }
+    // Only host-owned lower-layer packages are linked, never package-supplied
+    // node_modules or install scripts. Workspace symlinks retain native TS.
+    const dependencies = join(workspace, "node_modules", "@keystone");
+    await mkdir(dependencies, { recursive: true });
+    const packages = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+    for (const name of ["schemas", "kernel", "verifiers", "spawn"]) {
+      await symlink(join(packages, name), join(dependencies, name), "dir");
+    }
+    const entry = prepared.read.manifest.entry;
+    const read = prepared.read.integrityBasis === "local_path_trust"
+      ? { ...prepared.read, integrityVerified: true } : prepared.read;
+    const probes: ConformanceProbe[] = [];
+    if (read.manifest.transport !== undefined) {
+      probes.push(isolatedMcpProbe(read.manifest, [snapshot.root, resolve(packageRoot)], workspace, limits));
+    } else if (read.manifest.kind === "verifier" && entry !== undefined) {
+      probes.push(isolatedVerifierEntryShapeProbe({ workspace, entry, ...limits }));
+    }
+    // Snapshotting/copying contains awaits; expired consent cannot launch code.
+    requireLiveApproval(decision);
+    const conformance = await runConformance({
+      manifest: read.manifest,
+      integrityVerified: read.integrityVerified,
+      integrityBasis: read.integrityBasis,
+      probes,
+    });
+    return {
+      ...prepared,
+      read,
+      phase: "probed",
+      conformance,
+      gate: canActivate({
+        manifest: read.manifest,
+        integrityVerified: read.integrityVerified,
+        conformance,
+        decision,
+      }),
+    };
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+}
+
+/** The two-request probe never calls an advertised tool or launches a host loader. */
+function isolatedMcpProbe(
+  manifest: ExtensionManifest,
+  packageRoots: readonly string[],
+  workspace: string,
+  limits: { readonly timeoutMs: number; readonly maxOutputBytes: number },
+): ConformanceProbe {
+  return {
+    checkId: "mcp.handshake",
+    blocking: true,
+    detail: "bounded initialize/tools-list in a copied temporary workspace",
+    async run() {
+      const transport = manifest.transport!;
+      const cwd = confinedPath(workspace, transport.cwd ?? ".");
+      const relocate = (arg: string) => {
+        if (!isAbsolute(arg)) return arg;
+        for (const root of packageRoots) {
+          const rel = relative(root, arg);
+          if (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) {
+            return resolve(workspace, rel);
+          }
+        }
+        throw new LocalPackageError("probe arguments may not reference paths outside the reviewed package");
+      };
+      let args: string[];
+      try { args = transport.args.map(relocate); }
+      catch { return { passed: false, detail: "MCP probe arguments escape the reviewed package" }; }
+      let command = transport.command;
+      if (isAbsolute(command)) {
+        // Package-owned executables run from the same reviewed copy as scripts.
+        // External system commands retain the explicitly approved path trust.
+        for (const root of packageRoots) {
+          const rel = relative(root, command);
+          if (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) {
+            command = resolve(workspace, rel);
+            break;
+          }
+        }
+      } else if (command.startsWith(".") || command.includes(sep)) {
+        command = confinedPath(workspace, command);
+      }
+      const target = resolveSpawnTarget(command, args);
+      const nodeCommand = target.command === process.execPath || target.command === "node";
+      if (nodeCommand) {
+        if (args.some((arg) => /^--(?:allow-|no-.*permission|experimental-loader|import|require)/.test(arg) || arg === "-r")) {
+          return { passed: false, detail: "MCP probe cannot widen Node permissions or preload host code" };
+        }
+        args = [
+          "--experimental-permission",
+          `--allow-fs-read=${workspace}`,
+          `--allow-fs-write=${workspace}`,
+          ...args,
+        ];
+      }
+      const declaredEnv = sanitizeEnv({}, transport.env);
+      for (const key of Object.keys(declaredEnv)) {
+        if (/^(?:NODE_|LD_|DYLD_|PYTHON|PERL|RUBY|BASH_FUNC_)/i.test(key) ||
+            /^(?:PATH|HOME|PWD|TMPDIR|TEMP|TMP|USERPROFILE|SYSTEMROOT|COMSPEC|PATHEXT|SHELL|BASH_ENV|ENV|CDPATH)$/i.test(key)) {
+          delete declaredEnv[key];
+        }
+      }
+      return await new Promise<{ passed: boolean; detail: string }>((complete) => {
+        const child = spawn(target.command, nodeCommand ? args : [...target.args], {
+          cwd, env: { ...declaredEnv, ...probeEnvironment(workspace) }, shell: false,
+          detached: process.platform !== "win32",
+          windowsVerbatimArguments: target.windowsVerbatimArguments,
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        let bytes = 0;
+        let buffer = "";
+        let initialized = false;
+        let serverName = "";
+        let outcome: { passed: boolean; detail: string } | undefined;
+        const kill = () => {
+          if (child.pid === undefined) return;
+          try {
+            if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
+            else child.kill("SIGKILL");
+          } catch { child.kill("SIGKILL"); }
+        };
+        const finish = (passed: boolean, detail: string) => {
+          outcome ??= { passed, detail };
+          kill();
+        };
+        const timer = setTimeout(() => finish(false, "MCP probe timed out"), limits.timeoutMs);
+        const account = (chunk: string) => {
+          bytes += Buffer.byteLength(chunk);
+          if (bytes > limits.maxOutputBytes) finish(false, "MCP probe exceeded its output limit");
+        };
+        child.stderr.setEncoding("utf8").on("data", account);
+        child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+          account(chunk);
+          if (outcome !== undefined) return;
+          buffer += chunk;
+          let newline: number;
+          while ((newline = buffer.indexOf("\n")) !== -1 && outcome === undefined) {
+            const frame = decodeLine(buffer.slice(0, newline)).value;
+            buffer = buffer.slice(newline + 1);
+            if (frame === undefined || frame.id !== (initialized ? 2 : 1)) continue;
+            if (frame.error !== undefined || typeof frame.result !== "object" || frame.result === null) {
+              finish(false, "MCP probe received an invalid or rejected response");
+              break;
+            }
+            const result = frame.result as Record<string, unknown>;
+            if (!initialized) {
+              const info = result.serverInfo as Record<string, unknown> | undefined;
+              if (result.protocolVersion !== "2024-11-05" || typeof info?.name !== "string" ||
+                  typeof info.version !== "string") {
+                finish(false, "MCP initialize response is malformed or incompatible");
+                break;
+              }
+              serverName = info.name.slice(0, 256);
+              initialized = true;
+              child.stdin.write(encodeFrame({ jsonrpc: "2.0", method: "notifications/initialized" }));
+              child.stdin.write(encodeFrame({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }));
+            } else if (Array.isArray(result.tools) &&
+                       result.tools.every((tool) => typeof tool === "object" && tool !== null && typeof tool.name === "string")) {
+              const names = result.tools.map((tool: { name: string }) => tool.name.slice(0, 80)).slice(0, 10);
+              finish(true, `handshake ok with ${serverName}; discovered ${result.tools.length} tool(s): ${names.join(", ") || "(none)"}`);
+            } else finish(false, "MCP tools/list response is malformed");
+          }
+        });
+        child.stdin.on("error", () => finish(false, "MCP probe input closed"));
+        child.on("error", () => finish(false, "could not launch MCP probe"));
+        child.once("close", () => {
+          clearTimeout(timer);
+          kill();
+          complete(outcome ?? { passed: false, detail: "MCP probe exited before conformance completed" });
+        });
+        child.stdin.write(encodeFrame({
+          jsonrpc: "2.0", id: 1, method: "initialize",
+          params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "keystone-probe", version: "1.0" } },
+        }));
+      });
+    },
+  };
 }
 
 export interface LowRiskExtensionView {
@@ -193,7 +468,10 @@ export interface LowRiskExtensionView {
   readonly publisher: string;
   readonly kind: string;
   readonly capabilities: readonly string[];
+  /** Compatibility alias for registryStatus, not a running-runtime observation. */
   readonly status: string;
+  readonly registryStatus: string;
+  readonly runtimeActivation: "not_observed";
 }
 
 /**
@@ -219,5 +497,7 @@ export function lowRiskActiveExtensions(
       kind: entry.manifest.kind,
       capabilities: [...entry.manifest.capabilities],
       status: entry.status,
+      registryStatus: entry.status,
+      runtimeActivation: "not_observed",
     }));
 }

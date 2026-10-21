@@ -49,6 +49,7 @@ export const typecheckVerifier: Verifier = {
       cwd: ctx.rootPath,
       timeoutMs: ctx.timeoutMs ?? typecheckVerifier.descriptor.timeoutMs,
       maxBytes: MAX_OUTPUT_BYTES,
+      ...(ctx.commandBoundary === undefined ? {} : { boundary: ctx.commandBoundary }),
       ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
     });
 

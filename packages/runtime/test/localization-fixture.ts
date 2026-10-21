@@ -97,7 +97,7 @@ export interface LocalizationFixture {
 
 export async function makeLocalizationFixture(): Promise<LocalizationFixture> {
   const root = await mkdtemp(join(tmpdir(), "keystone-locfixture-"));
-  const home = join(root, ".keystone-home");
+  const home = await mkdtemp(join(tmpdir(), "keystone-locfixture-store-"));
 
   await mkdir(join(root, "locales"), { recursive: true });
   await mkdir(join(root, "test"), { recursive: true });
@@ -126,6 +126,7 @@ export async function makeLocalizationFixture(): Promise<LocalizationFixture> {
 
 export async function removeLocalizationFixture(fixture: LocalizationFixture): Promise<void> {
   await rm(fixture.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  await rm(fixture.home, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
 /** Run the fixture's own test suite, stripping NODE_TEST_CONTEXT like the acceptance helper. */

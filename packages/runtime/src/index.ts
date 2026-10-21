@@ -16,3 +16,5 @@ export * from "./isolation.ts";
 export * from "./workspace-lock.ts";
 export * from "./start-risk.ts";
 export * from "./server.ts";
+export * from "./diff.ts";
+export * from "./workspace-observation.ts";

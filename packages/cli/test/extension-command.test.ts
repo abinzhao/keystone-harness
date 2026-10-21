@@ -8,7 +8,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -54,7 +54,7 @@ const referenceExtensionRoot = resolve(testDir, "../../extension-no-debug-statem
 
 async function makeHome(): Promise<{ home: string; env: Env }> {
   const home = await mkdtemp(join(tmpdir(), "keystone-ext-home-"));
-  return { home, env: { KEYSTONE_HOME: home } };
+  return { home, env: { KEYSTONE_HOME: home, KEYSTONE_LANG: "en" } };
 }
 
 /** A minimal local egress tool, digest computed over its real entry bytes. */
@@ -112,9 +112,10 @@ test("installs and activates the local reference extension through the public en
     const inspect = await run(["extension", "inspect", referenceExtensionRoot], env);
     assert.equal(inspect.code, 0, inspect.stderr);
     assert.match(inspect.stdout, /digest matches the entry on disk/);
-    assert.match(inspect.stdout, /conformance : passed/i);
+    assert.match(inspect.stdout, /static checks\s*: passed/i);
+    assert.match(inspect.stdout, /probes\s*: pending consent/i);
 
-    const install = await run(["extension", "install", referenceExtensionRoot], env);
+    const install = await run(["extension", "install", referenceExtensionRoot, "--yes"], env);
     assert.equal(install.code, 0, install.stderr);
     assert.match(install.stdout, /installed "keystone-extension-no-debug-statements"/);
 
@@ -126,7 +127,8 @@ test("installs and activates the local reference extension through the public en
       env,
     );
     assert.equal(activate.code, 0, activate.stderr);
-    assert.match(activate.stdout, /activated "keystone-extension-no-debug-statements" \(active\)/);
+    assert.match(activate.stdout, /registry.*active/i);
+    assert.match(activate.stdout, /runtime activation.*not observed/i);
   } finally {
     await rm(env.KEYSTONE_HOME ?? "", { recursive: true, force: true });
   }
@@ -168,7 +170,7 @@ test("refuses egress activation until the user explicitly confirms", async () =>
     // Installing an egress extension without confirmation is refused.
     const refusedInstall = await run(["extension", "install", egress], env);
     assert.equal(refusedInstall.code, 1);
-    assert.match(refusedInstall.stderr, /did not confirm the egress risk/);
+    assert.match(refusedInstall.stderr, /did not approve.*probe/i);
 
     // With --yes it is admitted, but stays inert until activated.
     const confirmedInstall = await run(["extension", "install", egress, "--yes"], env);
@@ -188,7 +190,8 @@ test("refuses egress activation until the user explicitly confirms", async () =>
       env,
     );
     assert.equal(activate.code, 0, activate.stderr);
-    assert.match(activate.stdout, /activated "keystone-egress-telemetry" \(active\)/);
+    assert.match(activate.stdout, /registry.*active/i);
+    assert.match(activate.stdout, /runtime activation.*not observed/i);
   } finally {
     await rm(env.KEYSTONE_HOME ?? "", { recursive: true, force: true });
     await rm(egress, { recursive: true, force: true });
@@ -201,7 +204,7 @@ test("the registry persists across reloads and never widens a capability", async
   try {
     await makeEgressExtension(egress);
     // Install + activate the low-risk reference extension.
-    await run(["extension", "install", referenceExtensionRoot], env);
+    await run(["extension", "install", referenceExtensionRoot, "--yes"], env);
     await run(["extension", "activate", "keystone-extension-no-debug-statements"], env);
     // Install + activate the egress extension too.
     await run(["extension", "install", egress, "--yes"], env);
@@ -224,8 +227,120 @@ test("the registry persists across reloads and never widens a capability", async
     const names = views.map((view) => view.name);
     assert.ok(names.includes("keystone-extension-no-debug-statements"));
     assert.ok(!names.includes("keystone-egress-telemetry"));
+    assert.equal(views[0]?.registryStatus, "active");
+    assert.equal(views[0]?.runtimeActivation, "not_observed");
   } finally {
     await rm(home, { recursive: true, force: true });
     await rm(egress, { recursive: true, force: true });
+  }
+});
+
+test("inspection and declined installs never execute third-party verifier or MCP entries", async () => {
+  const { home, env } = await makeHome();
+  const root = await mkdtemp(join(tmpdir(), "keystone-cli-consent-"));
+  const marker = join(root, "executed-before-consent");
+  const source = `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'executed');\nexport const verifier = {};`;
+  try {
+    await writeFile(join(root, "entry.mjs"), source);
+    const manifest = JSON.parse(await readFile(join(referenceExtensionRoot, "keystone-extension.json"), "utf8"));
+    manifest.entry = { module: "entry.mjs", export: "verifier" };
+    manifest.integrity.digest = sha256Bytes(new TextEncoder().encode(source));
+    for (const kind of ["verifier", "protocol"]) {
+      const current = kind === "verifier" ? manifest : {
+        ...manifest, kind, entry: undefined,
+        capabilities: ["cmd.exec"], sideEffects: [{ kind: "process_spawn" }],
+        transport: { type: "stdio", command: process.execPath, args: ["entry.mjs"] },
+      };
+      await writeFile(join(root, "keystone-extension.json"), JSON.stringify(current));
+      const inspected = await run(["extension", "inspect", root, "--json"], env);
+      assert.equal(inspected.code, 0, inspected.stderr);
+      const review = JSON.parse(inspected.stdout);
+      assert.equal(review.phase, "static");
+      assert.equal(review.probes, "pending_consent");
+      assert.equal(review.staticChecksPassed, true);
+      assert.match(review.reviewHash, /^[a-f0-9]{64}$/);
+      assert.ok(review.files.length > 0);
+
+      const piped = await run(["extension", "install", root], env);
+      assert.equal(piped.code, 1, "a noninteractive low-risk install still needs consent");
+      const declined = await run(["extension", "install", root], env, {
+        isTTY: true, stdin: (async function* () { yield "no\n"; })(),
+      });
+      assert.equal(declined.code, 1);
+      await assert.rejects(access(marker), { code: "ENOENT" });
+    }
+    const registry = new ExtensionRegistry(defaultRegistryLocation(home));
+    await registry.load();
+    assert.deepEqual(registry.list(), []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a TTY approval follows static review and JSON distinguishes registry from runtime", async () => {
+  const { home, env } = await makeHome();
+  const installed = await run(["extension", "install", referenceExtensionRoot, "--json"], env, {
+    isTTY: true,
+    stdin: (async function* () { yield "yes\n"; })(),
+  });
+  try {
+    assert.equal(installed.code, 0, installed.stderr);
+    const registration = JSON.parse(installed.stdout);
+    assert.equal(registration.registryStatus, "registered");
+    assert.equal(registration.runtimeActivation, "not_observed");
+    const activated = await run(
+      ["extension", "activate", "keystone-extension-no-debug-statements", "--json"], env,
+    );
+    const activation = JSON.parse(activated.stdout);
+    assert.equal(activation.registryStatus, "active");
+    assert.equal(activation.runtimeActivation, "not_observed");
+    const listed = await run(["extension", "list", "--json"], env);
+    assert.equal(JSON.parse(listed.stdout)[0].registryStatus, "active");
+    assert.equal(JSON.parse(listed.stdout)[0].runtimeActivation, "not_observed");
+    const registry = new ExtensionRegistry(defaultRegistryLocation(home));
+    await registry.load();
+    assert.equal(registry.list()[0]?.approvedBy.length, 1);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("CLI discloses before consent and refuses a package changed during the prompt", async () => {
+  const { home, env } = await makeHome();
+  const root = await mkdtemp(join(tmpdir(), "keystone-cli-review-race-"));
+  const marker = join(root, "host-marker");
+  let stdout = "";
+  let stderr = "";
+  try {
+    const source = `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'executed');\nexport const verifier = {};`;
+    const manifest = JSON.parse(await readFile(join(referenceExtensionRoot, "keystone-extension.json"), "utf8"));
+    manifest.entry = { module: "entry.mjs", export: "verifier" };
+    manifest.integrity.digest = sha256Bytes(new TextEncoder().encode(source));
+    await writeFile(join(root, "entry.mjs"), source);
+    await writeFile(join(root, "helper.mjs"), "export const n = 1;");
+    await writeFile(join(root, "keystone-extension.json"), JSON.stringify(manifest));
+    const code = await runCli(["extension", "install", root], {
+      env, isTTY: true,
+      stdout: { write: (text: string) => { stdout += text; } },
+      stderr: { write: (text: string) => { stderr += text; } },
+      stdin: (async function* () {
+        assert.match(stdout, /About to install/);
+        assert.match(stdout, /not a network or OS sandbox/);
+        assert.match(stderr, /Approve the bounded probes/);
+        await assert.rejects(access(marker), { code: "ENOENT" });
+        await writeFile(join(root, "helper.mjs"), "export const n = 2;");
+        yield "yes\n";
+      })(),
+    });
+    assert.equal(code, 1);
+    assert.match(stderr, /changed since static review/);
+    await assert.rejects(access(marker), { code: "ENOENT" });
+    const registry = new ExtensionRegistry(defaultRegistryLocation(home));
+    await registry.load();
+    assert.deepEqual(registry.list(), []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true });
   }
 });

@@ -48,7 +48,8 @@ test("the shell proxies same-origin and injects the bearer token upstream", asyn
   });
   await shell.start();
   try {
-    const res = await fetch(`${shell.origin()}v1/capabilities`);
+    assert.equal((await fetch(`${shell.origin()}v1/capabilities`)).status, 403);
+    const res = await fetch(`${shell.origin()}v1/capabilities`, { headers: { "x-keystone-shell-nonce": shell.shellNonce() } });
     const body = (await res.json()) as { sawAuthorization: string; url: string };
     // The shell authenticated upstream on the page's behalf.
     assert.equal(body.sawAuthorization, "Bearer child-token-xyz");

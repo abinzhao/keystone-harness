@@ -20,11 +20,14 @@ import {
 } from "@keystone/kernel";
 import {
   nowIso,
+  contentHash,
+  newId,
   type CompletionCondition,
   type EvidenceRecord,
   type OutcomeContract,
 } from "@keystone/schemas";
 import { builtinVerifiers, planVerification, type Verifier } from "@keystone/verifiers";
+import { changedObservedPaths, observeWorkspace, type WorkspaceObservation } from "./workspace-observation.ts";
 
 export interface VerificationRunInput {
   readonly rootPath: string;
@@ -44,6 +47,7 @@ export interface VerificationRunInput {
   /** Content digest of the workspace, recorded in the independence block. */
   readonly workspaceFingerprint?: string;
   readonly environmentFingerprint?: string;
+  readonly signal?: AbortSignal;
 }
 
 export interface VerificationOutcome {
@@ -73,6 +77,11 @@ export async function runVerification(input: VerificationRunInput): Promise<Veri
   for (const group of planned) {
     const conditions: readonly CompletionCondition[] = group.conditions;
     if (conditions.length === 0) continue;
+    if (!["executing", "auto_repairing", "verifying"].includes(input.session.state().status)) {
+      for (const condition of conditions) blocked.push({ conditionId: condition.conditionId, detail: "the task is no longer active" });
+      continue;
+    }
+    const commandObservations = new Map<string, WorkspaceObservation>();
 
     const outcome = await group.verifier.run({
       rootPath: input.rootPath,
@@ -82,6 +91,39 @@ export async function runVerification(input: VerificationRunInput): Promise<Veri
       contract: input.contract,
       conditions,
       changedPaths: [...input.changedPaths],
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+      commandBoundary: {
+        async authorize(command, args, options) {
+          const grant = await input.session.authorizeOperation({
+            subject: { kind: "verifier", id: group.verifier.descriptor.id },
+            capability: command === "git" ? "git.read" : "cmd.exec",
+            resourceValues: [command === "git" ? "." : command],
+            workingDirectory: options.cwd,
+            timeoutMs: options.timeoutMs,
+            parametersHash: contentHash({ command, args, cwd: options.cwd, timeoutMs: options.timeoutMs }),
+          });
+          if (!grant.ok) return undefined;
+          commandObservations.set(grant.lease.leaseId, await observeWorkspace(input.rootPath));
+          return grant.lease.leaseId;
+        },
+        async complete(leaseId, result) {
+          const before = commandObservations.get(leaseId);
+          const after = await observeWorkspace(input.rootPath);
+          const changed = before === undefined ? [] : changedObservedPaths(before, after);
+          await input.session.recordExecution({
+            proposalId: newId("prop"), leaseId,
+            status: result.status === "passed" ? "succeeded" : result.status === "timeout" ? "timeout" : "failed",
+            durationMs: result.durationMs,
+            outputBytes: result.outputBytes,
+            ...(result.artifactId === undefined ? {} : { artifactId: result.artifactId }),
+            changedPaths: changed,
+            origin: "verifier",
+          });
+          if (before !== undefined && changed.length > 0) await input.session.invalidateStaleEvidence({
+            previousFingerprint: before.fingerprint, currentFingerprint: after.fingerprint, changedPaths: changed,
+          });
+        },
+      },
       ...(input.workspaceFingerprint === undefined
         ? {}
         : { workspaceFingerprint: input.workspaceFingerprint }),
@@ -104,7 +146,7 @@ export async function runVerification(input: VerificationRunInput): Promise<Veri
 
     // `inconclusive` is treated as a failure to prove, not as a pass: completion
     // requires positive evidence, and a check that did not conclude is not that.
-    const succeeded = outcome.status === "passed";
+    const succeeded = outcome.status === "passed" && (outcome.incomplete?.length ?? 0) === 0;
     const record = await input.session.recordEvidence({
       conditionIds,
       level: group.verifier.descriptor.evidenceLevel,
@@ -120,9 +162,9 @@ export async function runVerification(input: VerificationRunInput): Promise<Veri
       independence: {
         mode: group.verifier.descriptor.independence.mode,
         independentOf: [...group.verifier.descriptor.independence.independentOf],
-        ...(input.environmentFingerprint === undefined
+        ...((input.workspaceFingerprint ?? input.environmentFingerprint) === undefined
           ? {}
-          : { environmentFingerprint: input.environmentFingerprint as never }),
+          : { environmentFingerprint: (input.workspaceFingerprint ?? input.environmentFingerprint) as never }),
       },
       provenance: createProvenance({
         sourceKind: "verifier",

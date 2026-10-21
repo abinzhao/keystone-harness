@@ -17,7 +17,7 @@
  * the Node shell passes on its command line.
  *
  * Build:
- *   swiftc -parse-as-library src-native/KeystoneWindow.swift -o bin/keystone-window \
+ *   swiftc src-native/KeystoneWindow.swift -o bin/keystone-window \
  *     -framework Cocoa -framework WebKit -O
  */
 
@@ -57,6 +57,19 @@ final class KeystoneWebView: WKWebView {
  * object would be deallocated immediately and windowWillClose would never fire.
  */
 final class WindowDelegate: NSObject, NSWindowDelegate, WKNavigationDelegate {
+  let shellURL: URL
+  init(shellURL: URL) { self.shellURL = shellURL }
+
+  func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+               decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+    guard let destination = navigationAction.request.url,
+          sameOrigin(destination, shellURL) else {
+      decisionHandler(.cancel)
+      return
+    }
+    decisionHandler(.allow)
+  }
+
   func windowWillClose(_ notification: Notification) {
     // The user closed the only window: the shell treats this process exiting
     // as "the user closed Keystone" and tears the runtime child down.
@@ -73,7 +86,7 @@ final class WindowDelegate: NSObject, NSWindowDelegate, WKNavigationDelegate {
  *  selectors route through the responder chain into the focused web view so
  *  Cmd-Z/X/C/V/A work in onboarding inputs (a bare window with no Edit menu
  *  silently breaks paste in WKWebView). */
-func buildMainMenu(app: NSApplication) {
+func buildMainMenu(app: NSApplication, bridge: NativeControls) {
   let mainMenu = NSMenu()
   app.mainMenu = mainMenu
 
@@ -83,6 +96,9 @@ func buildMainMenu(app: NSApplication) {
   let appMenu = NSMenu()
   appMenuItem.submenu = appMenu
   appMenu.addItem(NSMenuItem(title: "About Keystone", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: ""))
+  let settings = NSMenuItem(title: "Settings...", action: #selector(NativeControls.showSettings(_:)), keyEquivalent: ",")
+  settings.target = bridge
+  appMenu.addItem(settings)
   appMenu.addItem(.separator())
   appMenu.addItem(NSMenuItem(title: "Hide Keystone", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
   appMenu.addItem(NSMenuItem(title: "Quit Keystone", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -110,6 +126,110 @@ func buildMainMenu(app: NSApplication) {
   windowMenu.addItem(NSMenuItem(title: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: ""))
 }
 
+func sameOrigin(_ left: URL, _ right: URL) -> Bool {
+  left.scheme == right.scheme && left.host == right.host && left.port == right.port
+}
+
+func isShellURL(_ url: URL) -> Bool {
+  url.scheme == "http" && url.host == "127.0.0.1" && url.port != nil &&
+    url.user == nil && url.password == nil
+}
+
+func folderPanel(prompt: String) -> NSOpenPanel {
+  let panel = NSOpenPanel()
+  panel.message = prompt
+  panel.canChooseDirectories = true
+  panel.canChooseFiles = false
+  panel.allowsMultipleSelection = false
+  panel.canCreateDirectories = false
+  return panel
+}
+
+func folderResult(_ response: NSApplication.ModalResponse, url: URL?) -> [String: Any] {
+  guard response == .OK, let url else { return ["supported": true, "cancelled": true] }
+  return ["supported": true, "path": url.path]
+}
+
+let nativeScript = """
+Object.defineProperty(window, 'keystoneNative', {value: Object.freeze({
+  pickFolder: () => window.webkit.messageHandlers.keystone.postMessage({operation: 'pickFolder'})
+}), writable: false, configurable: false});
+"""
+
+final class NativeControls: NSObject, WKScriptMessageHandlerWithReply {
+  let shellURL: URL
+  weak var webView: WKWebView?
+  weak var window: NSWindow?
+  var activePanel: NSOpenPanel?
+
+  init(shellURL: URL) { self.shellURL = shellURL }
+
+  @objc func showSettings(_ sender: Any?) {
+    guard let webView, let current = webView.url, sameOrigin(current, shellURL) else { return }
+    webView.evaluateJavaScript("window.dispatchEvent(new CustomEvent('keystone:settings'))", completionHandler: nil)
+  }
+
+  func userContentController(_ userContentController: WKUserContentController,
+                             didReceive message: WKScriptMessage,
+                             replyHandler: @escaping (Any?, String?) -> Void) {
+    let origin = message.frameInfo.securityOrigin
+    guard message.frameInfo.isMainFrame, origin.protocol == shellURL.scheme,
+          origin.host == shellURL.host, origin.port == shellURL.port,
+          let body = message.body as? [String: String], body["operation"] == "pickFolder",
+          let window else {
+      replyHandler(nil, "native request refused")
+      return
+    }
+    guard activePanel == nil else {
+      replyHandler(["supported": true, "error": "folder selection already active"], nil)
+      return
+    }
+    let panel = folderPanel(prompt: "Choose a project folder")
+    activePanel = panel
+    panel.beginSheetModal(for: window) { [weak self] response in
+      self?.activePanel = nil
+      replyHandler(folderResult(response, url: panel.url), nil)
+    }
+  }
+}
+
+func output(_ value: [String: Any]) {
+  if let data = try? JSONSerialization.data(withJSONObject: value) {
+    FileHandle.standardOutput.write(data)
+  } else { exit(1) }
+}
+
+if CommandLine.arguments.contains("--self-test") {
+  let app = NSApplication.shared
+  app.setActivationPolicy(.prohibited)
+  let url = URL(string: "http://127.0.0.1:9000/")!
+  let bridge = NativeControls(shellURL: url)
+  buildMainMenu(app: app, bridge: bridge)
+  let settings = app.mainMenu?.items.first?.submenu?.items.first { $0.keyEquivalent == "," }
+  let panel = folderPanel(prompt: "Fixture")
+  guard settings?.target === bridge, settings?.action == #selector(NativeControls.showSettings(_:)),
+        panel.canChooseDirectories, !panel.canChooseFiles, !panel.allowsMultipleSelection,
+        !panel.canCreateDirectories, isShellURL(url), !isShellURL(URL(string: "https://remote.test")!),
+        !sameOrigin(url, URL(string: "http://127.0.0.1:9001/")!),
+        folderResult(.cancel, url: nil)["cancelled"] as? Bool == true,
+        folderResult(.OK, url: URL(fileURLWithPath: "/fixture"))["path"] as? String == "/fixture",
+        nativeScript.contains("pickFolder") else { exit(1) }
+  output(["ok": true, "checks": 6, "backend": "AppKit", "gui": false])
+  exit(0)
+}
+
+if CommandLine.arguments.contains("--pick-folder") {
+  let app = NSApplication.shared
+  app.setActivationPolicy(.regular)
+  let args = CommandLine.arguments
+  let promptIndex = args.firstIndex(of: "--prompt")
+  let prompt = promptIndex.flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } ?? "Choose a project folder"
+  let panel = folderPanel(prompt: prompt)
+  app.activate(ignoringOtherApps: true)
+  output(folderResult(panel.runModal(), url: panel.url))
+  exit(0)
+}
+
 var args = CommandLine.arguments
 var urlString: String?
 var title = "Keystone"
@@ -134,14 +254,15 @@ while i < args.count {
   i += 1
 }
 
-guard let urlString, let url = URL(string: urlString) else {
+guard let urlString, let url = URL(string: urlString), isShellURL(url) else {
   FileHandle.standardError.write("usage: KeystoneWindow <url> [--title t] [--width w] [--height h]\n".data(using: .utf8)!)
   exit(64)
 }
 
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
-buildMainMenu(app: app)
+let bridge = NativeControls(shellURL: url)
+buildMainMenu(app: app, bridge: bridge)
 
 let rect = NSRect(x: 0, y: 0, width: width, height: height)
 let window = NSWindow(
@@ -156,9 +277,13 @@ window.minSize = NSSize(width: 360, height: 480)
 window.title = title
 window.center()
 
-let delegate = WindowDelegate()
+let delegate = WindowDelegate(shellURL: url)
 let config = WKWebViewConfiguration()
+config.userContentController.addScriptMessageHandler(bridge, contentWorld: .page, name: "keystone")
+config.userContentController.addUserScript(WKUserScript(source: nativeScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
 let webView = KeystoneWebView(frame: window.contentView!.bounds, configuration: config)
+bridge.webView = webView
+bridge.window = window
 webView.autoresizingMask = [.width, .height]
 webView.allowsBackForwardNavigationGestures = true
 // Tab reaches links/form controls when Full Keyboard Access is on; the Edit

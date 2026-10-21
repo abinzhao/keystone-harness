@@ -326,7 +326,7 @@ export async function detectProjectProfile(
   const languages = [...languageCounts.keys()].sort();
 
   const scripts = readScripts(pkg);
-  const commands = COMMAND_KINDS.map((kind) => buildCommand(kind, scripts));
+  const commands = COMMAND_KINDS.map((kind) => buildCommand(kind, scripts, packageManager));
 
   const instructionFiles: string[] = [];
   for (const file of INSTRUCTION_FILES) {
@@ -396,12 +396,13 @@ function readScripts(pkg: Record<string, unknown> | undefined): Record<string, s
 function buildCommand(
   kind: CommandKind,
   scripts: Record<string, string>,
+  packageManager: string | undefined,
 ): ProjectProfile["commands"][number] {
   for (const alias of SCRIPT_ALIASES[kind]) {
-    if (Object.prototype.hasOwnProperty.call(scripts, alias)) {
+    if (packageManager !== undefined && Object.prototype.hasOwnProperty.call(scripts, alias)) {
       return {
         kind,
-        command: `pnpm ${alias}`,
+        command: packageManager === "pnpm" ? `pnpm ${alias}` : `${packageManager} run ${alias}`,
         status: "identified",
         source: `package.json#scripts.${alias}`,
       };

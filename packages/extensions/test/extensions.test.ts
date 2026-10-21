@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, chmod, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
+import * as localManager from "../src/manager.ts";
+import { buildManifest as localizationManifest } from "../../extension-localization-placeholders/src/manifest.ts";
 
-import { newId, sha256Bytes, type ExtensionManifest, type UserDecision } from "@keystone/schemas";
+import { newId, sha256Bytes, toIso, type ExtensionManifest, type UserDecision } from "@keystone/schemas";
 
 import {
   ActivationRefusedError,
@@ -19,6 +23,7 @@ import {
   isolationTriggerFor,
   parseManifest,
   reachesOutside,
+  prepareLocalInstall,
   runConformance,
   summarizeConformance,
   ExtensionManifestViolationError,
@@ -414,4 +419,443 @@ test("an extension that cannot be uninstalled is flagged, not blocked", async ()
   const gate = canActivate({ manifest, integrityVerified: true, conformance });
   assert.equal(gate.allowed, true);
   assert.ok(gate.notes.some((note) => note.includes("cannot be uninstalled")));
+});
+
+test("static preparation never executes a verifier entry with a visible side effect", async () => {
+  const root = await mkdtemp(join(tmpdir(), "keystone-static-entry-"));
+  const marker = join(root, "entry-executed");
+  const source = [
+    "import { writeFileSync } from 'node:fs';",
+    `writeFileSync(${JSON.stringify(marker)}, 'executed');`,
+    "export const verifier = {",
+    "  descriptor: { id: 'malicious', version: '1.0.0', kind: 'project_rule',",
+    "    evidenceLevel: 'E1', canSatisfyRequiredCondition: false,",
+    "    independence: { mode: 'same_process', independentOf: [] } },",
+    "  run: async () => ({ status: 'passed' }),",
+    "};",
+  ].join("\n");
+  try {
+    await writeFile(join(root, "entry.mjs"), source);
+    await writeFile(
+      join(root, "keystone-extension.json"),
+      JSON.stringify(manifestFor({
+        entry: { module: "entry.mjs", export: "verifier" },
+        integrity: { algorithm: "sha256", digest: sha256Bytes(new TextEncoder().encode(source)) },
+      })),
+    );
+    const prepared = await prepareLocalInstall(root);
+    await assert.rejects(access(marker), { code: "ENOENT" });
+    assert.equal(prepared.read.integrityVerified, true);
+    assert.equal(prepared.gate.allowed, false, "static review is not behavioral conformance");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("approved verifier probes load a copied entry in a child temporary workspace", async () => {
+  const root = await mkdtemp(join(tmpdir(), "keystone-approved-entry-"));
+  const source = [
+    "import { writeFileSync } from 'node:fs';",
+    "writeFileSync('probe-output', 'child-only');",
+    "globalThis.keystoneProbeWasImported = true;",
+    "export const verifier = {",
+    "  descriptor: { id: `child.${process.pid}`, version: '1.0.0', kind: 'project_rule',",
+    "    evidenceLevel: 'E1', canSatisfyRequiredCondition: false,",
+    "    independence: { mode: 'same_process', independentOf: [] } },",
+    "  run: async () => { throw new Error('shape probes must not run the verifier'); },",
+    "};",
+  ].join("\n");
+  try {
+    await writeFile(join(root, "entry.mjs"), source);
+    await writeFile(join(root, "keystone-extension.json"), JSON.stringify(manifestFor({
+      entry: { module: "entry.mjs", export: "verifier" },
+      integrity: { algorithm: "sha256", digest: sha256Bytes(new TextEncoder().encode(source)) },
+    })));
+    const prepared = await prepareLocalInstall(root);
+    assert.equal(typeof localManager.probeLocalInstall, "function", "an explicit approved probe hook is required");
+    const probed = await localManager.probeLocalInstall(root, {
+      decision: decisionFor(),
+      reviewHash: prepared.reviewHash,
+    });
+    assert.equal(probed.phase, "probed");
+    assert.equal(probed.conformance.passed, true, summarizeConformance(probed.conformance));
+    const detail = probed.conformance.checks.find((c) => c.checkId === "entry.verifier_shape")?.detail ?? "";
+    assert.match(detail, /child\.\d+/);
+    assert.ok(!detail.includes(`child.${process.pid}@`), "entry must not run in the trusted process");
+    assert.equal((globalThis as Record<string, unknown>).keystoneProbeWasImported, undefined);
+    await assert.rejects(readFile(join(root, "probe-output")), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("static stdio review neither launches the command nor claims content integrity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "keystone-static-mcp-"));
+  const marker = join(root, "mcp-executed");
+  try {
+    await writeFile(join(root, "keystone-extension.json"), JSON.stringify(manifestFor({
+      kind: "protocol",
+      entry: undefined,
+      transport: {
+        type: "stdio", command: process.execPath,
+        args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'executed')`],
+      },
+    })));
+    const prepared = await prepareLocalInstall(root);
+    await assert.rejects(access(marker), { code: "ENOENT" });
+    assert.equal(prepared.read.integrityVerified, false, "local path trust is not a verified digest");
+    assert.equal(prepared.read.integrityBasis, "local_path_trust");
+    assert.equal(prepared.staticChecksPassed, true);
+    assert.equal(prepared.gate.allowed, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("approval is invalidated when a sibling package file changes after static review", async () => {
+  const root = await mkdtemp(join(tmpdir(), "keystone-review-binding-"));
+  const source = "export const verifier = {};";
+  try {
+    await writeFile(join(root, "entry.mjs"), source);
+    await writeFile(join(root, "helper.mjs"), "export const helper = 1;");
+    await writeFile(join(root, "keystone-extension.json"), JSON.stringify(manifestFor({
+      entry: { module: "entry.mjs", export: "verifier" },
+      integrity: { algorithm: "sha256", digest: sha256Bytes(new TextEncoder().encode(source)) },
+    })));
+    const prepared = await prepareLocalInstall(root);
+    await writeFile(join(root, "helper.mjs"), "export const helper = 2;");
+    await assert.rejects(
+      localManager.probeLocalInstall(root, { decision: decisionFor(), reviewHash: prepared.reviewHash }),
+      /changed since static review/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("approved stdio probes handshake in a temporary workspace and stop the child", async () => {
+  const root = await mkdtemp(join(tmpdir(), "keystone-approved-mcp-"));
+  try {
+    await writeFile(join(root, "server.mjs"), [
+      "import { writeFileSync } from 'node:fs';",
+      "import { createInterface } from 'node:readline';",
+      "writeFileSync('server-ran', 'child-only');",
+      "createInterface({ input: process.stdin }).on('line', (line) => {",
+      "  const request = JSON.parse(line);",
+      "  if (request.id === undefined) return;",
+      "  const result = request.method === 'initialize'",
+      "    ? { protocolVersion: '2024-11-05', serverInfo: { name: `child.${process.pid}`, version: '1.0.0' } }",
+      "    : { tools: [{ name: 'echo' }] };",
+      "  console.log(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }));",
+      "});",
+    ].join("\n"));
+    await writeFile(join(root, "keystone-extension.json"), JSON.stringify(manifestFor({
+      kind: "protocol", entry: undefined,
+      transport: { type: "stdio", command: process.execPath, args: ["server.mjs"] },
+    })));
+    const prepared = await prepareLocalInstall(root);
+    const probed = await localManager.probeLocalInstall(root, {
+      decision: decisionFor(), reviewHash: prepared.reviewHash,
+    });
+    const handshake = probed.conformance.checks.find((c) => c.checkId === "mcp.handshake");
+    assert.equal(handshake?.passed, true, handshake?.detail);
+    assert.equal(probed.conformance.passed, true, summarizeConformance(probed.conformance));
+    assert.match(handshake?.detail ?? "", /echo/);
+    assert.equal(probed.read.integrityBasis, "local_path_trust");
+    assert.match(probed.conformance.checks.find((c) => c.checkId === "manifest.integrity")?.detail ?? "", /not.*digest/);
+    await assert.rejects(access(join(root, "server-ran")), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function writeVerifierFixture(root: string, source: string, overrides: Record<string, unknown> = {}): Promise<void> {
+  await writeFile(join(root, "entry.mjs"), source);
+  await writeFile(join(root, "keystone-extension.json"), JSON.stringify(manifestFor({
+    entry: { module: "entry.mjs", export: "verifier" },
+    integrity: { algorithm: "sha256", digest: sha256Bytes(new TextEncoder().encode(source)) },
+    ...overrides,
+  })));
+}
+
+const validProbeVerifier = [
+  "export const verifier = {",
+  "  descriptor: { id: 'fixture', version: '1.0.0', kind: 'project_rule',",
+  "    evidenceLevel: 'E1', canSatisfyRequiredCondition: false,",
+  "    independence: { mode: 'same_process', independentOf: [] } },",
+  "  run: async () => { throw new Error('must not run'); },",
+  "};",
+].join("\n");
+
+test("static conformance never invokes supplied probes or loaders", async () => {
+  let invoked = 0;
+  const report = await runConformance({
+    manifest: manifestFor(), integrityVerified: true, staticOnly: true,
+    entryLoader: async () => { invoked++; return {}; },
+    probes: [{
+      checkId: "malicious.callback", blocking: true, detail: "untrusted",
+      run: async () => { invoked++; return { passed: true, detail: "executed" }; },
+    }],
+  });
+  assert.equal(invoked, 0);
+  assert.equal(report.passed, false);
+  assert.equal(report.checks.find((check) => check.checkId === "execution.consent")?.passed, false);
+});
+
+test("approved probes reject missing, expired, non-user and denied consent before execution", async () => {
+  const root = await mkdtemp(join(tmpdir(), "keystone-invalid-consent-"));
+  try {
+    await writeVerifierFixture(root, validProbeVerifier);
+    const prepared = await prepareLocalInstall(root);
+    const decisions = [
+      undefined,
+      decisionFor({ appliesTo: { resources: [], expiresAt: toIso(new Date("2000-01-01T00:00:00.000Z")) } }),
+      { ...decisionFor(), recordedBy: "model" },
+      decisionFor({ decision: "deny" }),
+    ];
+    for (const decision of decisions) {
+      await assert.rejects(localManager.probeLocalInstall(root, {
+        decision: decision as UserDecision, reviewHash: prepared.reviewHash,
+      }));
+    }
+    await assert.rejects(
+      localManager.localEntryLoader(root)("entry.mjs", "verifier"), /host entry loading is disabled/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("approval binds executable file modes as well as bytes", { skip: process.platform === "win32" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "keystone-mode-consent-"));
+  try {
+    await writeVerifierFixture(root, validProbeVerifier);
+    await chmod(join(root, "entry.mjs"), 0o644);
+    const prepared = await prepareLocalInstall(root);
+    await chmod(join(root, "entry.mjs"), 0o755);
+    await assert.rejects(
+      localManager.probeLocalInstall(root, { decision: decisionFor(), reviewHash: prepared.reviewHash }),
+      /changed since static review/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("approval must still be live immediately before the child launch", async () => {
+  const root = await mkdtemp(join(tmpdir(), "keystone-expiring-consent-"));
+  const originalNow = Date.now;
+  try {
+    await writeVerifierFixture(root, validProbeVerifier);
+    const prepared = await prepareLocalInstall(root);
+    const now = originalNow();
+    const decision = decisionFor({
+      appliesTo: { resources: [], expiresAt: toIso(new Date(now + 60_000)) },
+    });
+    let checks = 0;
+    Date.now = () => ++checks === 1 ? now : now + 120_000;
+    await assert.rejects(
+      localManager.probeLocalInstall(root, { decision, reviewHash: prepared.reviewHash }),
+      /live explicit user approval/,
+    );
+  } finally {
+    Date.now = originalNow;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("static review refuses escaping entries and symlinks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "keystone-static-path-"));
+  try {
+    for (const module of ["../entry.mjs", "/entry.mjs"]) {
+      await writeVerifierFixture(root, validProbeVerifier, { entry: { module, export: "verifier" } });
+      await assert.rejects(prepareLocalInstall(root), /escapes/);
+    }
+    await writeVerifierFixture(root, validProbeVerifier);
+    await mkdir(join(root, "outside"));
+    await symlink(join(root, "outside"), join(root, "linked"), "dir");
+    await assert.rejects(prepareLocalInstall(root), /symlinks/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("static review refuses a FIFO without trying to read it", { skip: process.platform === "win32" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "keystone-static-fifo-"));
+  try {
+    await writeVerifierFixture(root, validProbeVerifier);
+    const fixture = spawnSync("mkfifo", [join(root, "pipe")], { shell: false });
+    assert.equal(fixture.status, 0, fixture.stderr?.toString());
+    await assert.rejects(prepareLocalInstall(root), /non-regular file/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("approved verifier probes deny host writes and subprocesses, and bound hangs and floods", async (t) => {
+  for (const [name, prelude, expected] of [
+    ["host write", "import { writeFileSync } from 'node:fs';\nwriteFileSync(HOST_MARKER, 'denied');", /could not load/],
+    ["subprocess", "import { spawnSync } from 'node:child_process';\nspawnSync(process.execPath, ['-e', 'process.exit()']);", /could not load/],
+    ["hang", "while (true) {}", /timed out/],
+    ["flood", "process.stdout.write('x'.repeat(100_000));", /output limit/],
+  ] as const) {
+    await t.test(name, async () => {
+      const root = await mkdtemp(join(tmpdir(), "keystone-probe-limit-"));
+      const marker = join(root, "host-was-written");
+      try {
+        await writeVerifierFixture(root, `${prelude.replace("HOST_MARKER", JSON.stringify(marker))}\n${validProbeVerifier}`);
+        const prepared = await prepareLocalInstall(root);
+        const probed = await localManager.probeLocalInstall(root, {
+          decision: decisionFor(), reviewHash: prepared.reviewHash, timeoutMs: 1_000, maxOutputBytes: 4_096,
+        });
+        const shape = probed.conformance.checks.find((check) => check.checkId === "entry.verifier_shape");
+        assert.equal(shape?.passed, false, shape?.detail);
+        assert.match(shape?.detail ?? "", expected);
+        assert.equal(probed.gate.allowed, false);
+        await assert.rejects(access(marker), { code: "ENOENT" });
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("approved reference extensions retain conformance without a host import", async () => {
+  const packages = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+  const localized = await mkdtemp(join(tmpdir(), "keystone-localized-package-"));
+  try {
+    // This trusted reference ships a manifest builder rather than a disk manifest.
+    await cp(join(packages, "extension-localization-placeholders/src"), join(localized, "src"), { recursive: true });
+    await cp(join(packages, "extension-localization-placeholders/package.json"), join(localized, "package.json"));
+    await writeFile(join(localized, "keystone-extension.json"), JSON.stringify(
+      localizationManifest(new Uint8Array(await readFile(join(localized, "src/index.ts")))),
+    ));
+    for (const root of [join(packages, "extension-no-debug-statements"), localized]) {
+      const prepared = await prepareLocalInstall(root);
+      assert.equal(prepared.phase, "static");
+      assert.equal(prepared.staticChecksPassed, true);
+      const probed = await localManager.probeLocalInstall(root, {
+        decision: decisionFor(), reviewHash: prepared.reviewHash,
+      });
+      assert.equal(probed.conformance.passed, true, summarizeConformance(probed.conformance));
+      assert.equal(probed.gate.allowed, true);
+    }
+  } finally {
+    await rm(localized, { recursive: true, force: true });
+  }
+});
+
+test("approved MCP probes preserve declared non-secret env but reject inherited credentials and loader overrides", async () => {
+  const root = await mkdtemp(join(tmpdir(), "keystone-mcp-environment-"));
+  const key = "KEYSTONE_TEST_TOKEN";
+  assert.equal(process.env[key], undefined);
+  try {
+    process.env[key] = "synthetic-test-value";
+    const source = [
+      "import { createInterface } from 'node:readline';",
+      "if (process.env.KEYSTONE_TEST_TOKEN || process.env.OPENAI_API_KEY || process.env.NODE_OPTIONS)",
+      "  process.exit(4);",
+      "if (process.env.PROBE_LABEL !== 'declared' || process.env.HOME !== process.cwd()) process.exit(5);",
+      "createInterface({ input: process.stdin }).on('line', (line) => {",
+      "  const request = JSON.parse(line);",
+      "  if (request.id === undefined) return;",
+      "  const result = request.method === 'initialize'",
+      "    ? { protocolVersion: '2024-11-05', serverInfo: { name: 'env-checked', version: '1' } }",
+      "    : { tools: [] };",
+      "  console.log(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }));",
+      "});",
+    ].join("\n");
+    await writeVerifierFixture(root, source, {
+      kind: "protocol", entry: undefined,
+      transport: {
+        type: "stdio", command: process.execPath, args: ["entry.mjs"],
+        env: {
+          PROBE_LABEL: "declared", OPENAI_API_KEY: "synthetic-declared-value",
+          NODE_OPTIONS: "--require=unreviewed.cjs", HOME: "/unreviewed-home", PATH: "/unreviewed-bin",
+        },
+      },
+    });
+    const prepared = await prepareLocalInstall(root);
+    const probed = await localManager.probeLocalInstall(root, {
+      decision: decisionFor(), reviewHash: prepared.reviewHash,
+    });
+    const handshake = probed.conformance.checks.find((check) => check.checkId === "mcp.handshake");
+    assert.equal(handshake?.passed, true, handshake?.detail);
+  } finally {
+    delete process.env[key];
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("approved MCP probes reject malformed responses and bound nonresponse and output floods", async (t) => {
+  for (const [name, source, expected] of [
+    ["malformed", "console.log(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }));\nsetInterval(() => {}, 100);", /malformed/],
+    ["nonresponse", "setInterval(() => {}, 100);", /timed out/],
+    ["flood", "process.stdout.write('x'.repeat(100_000));\nsetInterval(() => {}, 100);", /output limit/],
+  ] as const) {
+    await t.test(name, async () => {
+      const root = await mkdtemp(join(tmpdir(), "keystone-mcp-limit-"));
+      try {
+        await writeVerifierFixture(root, source, {
+          kind: "protocol", entry: undefined,
+          transport: { type: "stdio", command: process.execPath, args: ["entry.mjs"] },
+        });
+        const prepared = await prepareLocalInstall(root);
+        const probed = await localManager.probeLocalInstall(root, {
+          decision: decisionFor(), reviewHash: prepared.reviewHash, timeoutMs: 1_000, maxOutputBytes: 4_096,
+        });
+        const handshake = probed.conformance.checks.find((check) => check.checkId === "mcp.handshake");
+        assert.equal(handshake?.passed, false, handshake?.detail);
+        assert.match(handshake?.detail ?? "", expected);
+        assert.equal(probed.gate.allowed, false);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("approved MCP absolute package paths are relocated to the temporary copy", { skip: process.platform === "win32" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "keystone-mcp-absolute-"));
+  try {
+    const server = [
+      "import { writeFileSync } from 'node:fs';",
+      "import { createInterface } from 'node:readline';",
+      "writeFileSync(new URL('./local-marker', import.meta.url), 'copied-entry');",
+      "createInterface({ input: process.stdin }).on('line', (line) => {",
+      "  const request = JSON.parse(line);",
+      "  if (request.id === undefined) return;",
+      "  const result = request.method === 'initialize'",
+      "    ? { protocolVersion: '2024-11-05', serverInfo: { name: 'copied-absolute', version: '1' } }",
+      "    : { tools: [] };",
+      "  console.log(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }));",
+      "});",
+    ].join("\n");
+    await writeVerifierFixture(root, server, {
+      kind: "protocol", entry: undefined,
+      transport: { type: "stdio", command: process.execPath, args: [join(root, "entry.mjs")] },
+    });
+    let prepared = await prepareLocalInstall(root);
+    let probed = await localManager.probeLocalInstall(root, { decision: decisionFor(), reviewHash: prepared.reviewHash });
+    assert.equal(probed.conformance.passed, true, summarizeConformance(probed.conformance));
+    await assert.rejects(access(join(root, "local-marker")), { code: "ENOENT" });
+
+    // Executables contained in the package must also launch the reviewed copy.
+    await writeFile(join(root, "launcher"), [
+      "#!/bin/sh",
+      'printf "executed" > "${0%/*}/launcher-marker"',
+      `exec ${JSON.stringify(process.execPath)} "\${0%/*}/entry.mjs"`,
+    ].join("\n"), { mode: 0o755 });
+    await writeVerifierFixture(root, server, {
+      kind: "protocol", entry: undefined,
+      transport: { type: "stdio", command: join(root, "launcher"), args: [] },
+    });
+    prepared = await prepareLocalInstall(root);
+    probed = await localManager.probeLocalInstall(root, { decision: decisionFor(), reviewHash: prepared.reviewHash });
+    assert.equal(probed.conformance.passed, true, summarizeConformance(probed.conformance));
+    await assert.rejects(access(join(root, "launcher-marker")), { code: "ENOENT" });
+    await assert.rejects(access(join(root, "local-marker")), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

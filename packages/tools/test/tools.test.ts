@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { getArtifactText, resolveKeystonePaths, resourceKindFor, type KeystonePaths } from "@keystone/kernel";
 import {
   capabilityLeaseSchema,
+  contentHash,
   getSchema,
   newId,
   type Capability,
@@ -153,6 +154,25 @@ test("run_command executes an allowed bare command and captures stdout", async (
     assert.equal(result.status, "succeeded");
     assert.equal(result.exitCode, 0);
     assert.equal((result.stdout ?? "").trim(), "1");
+  });
+});
+
+test("command argument, cwd and environment substitution cannot reuse a bound lease", async () => {
+  await withRepo(async (fixture) => {
+    const parameters = { command: "node", args: ["-e", "console.log(1)"], cwd: "." };
+    const base = makeLease("cmd.exec", ["node"]);
+    const lease = capabilityLeaseSchema.parse({
+      ...base, constraints: { ...base.constraints, parametersHash: contentHash(parameters) },
+    }) as CapabilityLease;
+    for (const altered of [
+      { ...parameters, args: ["-e", "require('fs').writeFileSync('escape.txt','no')"] },
+      { ...parameters, cwd: "src" },
+      { ...parameters, env: { NODE_OPTIONS: "--inspect" } },
+    ]) {
+      await assert.rejects(() => runCommandTool.run(altered, makeContext(fixture, lease)), /parameters differ/);
+    }
+    await assert.rejects(() => access(join(fixture.repo, "escape.txt")));
+    assert.equal((await runCommandTool.run(parameters, makeContext(fixture, lease))).status, "succeeded");
   });
 });
 

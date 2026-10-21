@@ -14,9 +14,20 @@ import type { ModelDescriptor, ToolDescriptor } from "@keystone/schemas";
 // depending on the schema package directly.
 export type { ModelDescriptor, ToolDescriptor };
 
+export type ModelContentPart =
+  | { readonly type: "text"; readonly text: string }
+  | {
+      readonly type: "image";
+      readonly mimeType: "image/png" | "image/jpeg" | "image/webp";
+      /** Raw base64, never a path or remote URL. */
+      readonly data: string;
+      readonly artifactId?: string;
+      readonly sourceId?: string;
+    };
+
 export interface ModelMessage {
   readonly role: "system" | "user" | "assistant";
-  readonly content: string;
+  readonly content: string | readonly ModelContentPart[];
 }
 
 export interface ModelRequest {
@@ -99,6 +110,23 @@ export class ModelProtocolError extends Error {
     super(message);
     this.name = "ModelProtocolError";
     this.modelId = modelId;
+  }
+}
+
+export class ModelContentUnsupportedError extends Error {
+  readonly modelId: string;
+  constructor(modelId: string, detail: string) {
+    super(`model "${modelId}" cannot accept this content: ${detail}`);
+    this.name = "ModelContentUnsupportedError";
+    this.modelId = modelId;
+  }
+}
+
+export class ModelContentInvalidError extends Error {
+  constructor() {
+    // Do not echo rejected content: it can contain bytes, paths or secrets.
+    super("model content must contain text or PNG/JPEG/WebP with canonical raw base64");
+    this.name = "ModelContentInvalidError";
   }
 }
 

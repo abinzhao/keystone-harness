@@ -71,7 +71,7 @@ export interface Fixture {
 
 export async function makeFixture(): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "keystone-acceptance-"));
-  const home = join(root, ".keystone-home");
+  const home = await mkdtemp(join(tmpdir(), "keystone-acceptance-store-"));
 
   await mkdir(join(root, "src", "auth"), { recursive: true });
   await mkdir(join(root, "test"), { recursive: true });
@@ -99,6 +99,7 @@ export async function removeFixture(fixture: Fixture): Promise<void> {
   // races with a create fails with ENOTEMPTY on POSIX, so the removal retries
   // instead of failing a test that already passed its assertions.
   await rm(fixture.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  await rm(fixture.home, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
 export function autonomyFor(writePaths: readonly string[]): AutonomyEnvelope {

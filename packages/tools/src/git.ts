@@ -53,7 +53,7 @@ export const gitStatusTool: Tool<GitStatusArgs> = {
   }) as ToolDescriptor,
   input: gitStatusInput.validator,
   async run(_args, ctx): Promise<ToolResult> {
-    return runGit(ctx, ["status", "--porcelain=v1"], gitStatusTool.descriptor);
+    return runGit(ctx, ["status", "--porcelain=v1"], gitStatusTool.descriptor, _args);
   },
 };
 
@@ -87,7 +87,7 @@ export const gitDiffTool: Tool<GitDiffArgs> = {
     const argv = ["diff"];
     if (args.staged === true) argv.push("--cached");
     if (args.path !== undefined) argv.push("--", args.path);
-    return runGit(ctx, argv, gitDiffTool.descriptor);
+    return runGit(ctx, argv, gitDiffTool.descriptor, args);
   },
 };
 
@@ -116,7 +116,7 @@ export const gitShowHeadTool: Tool<GitShowHeadArgs> = {
   input: gitShowHeadInput.validator,
   async run(args, ctx): Promise<ToolResult> {
     const revision = args.path === undefined ? "HEAD" : `HEAD:${args.path}`;
-    return runGit(ctx, ["show", revision], gitShowHeadTool.descriptor);
+    return runGit(ctx, ["show", revision], gitShowHeadTool.descriptor, args);
   },
 };
 
@@ -167,7 +167,7 @@ export const gitCommitTool: Tool<GitCommitArgs> = {
     const start = Date.now();
     const rels = args.paths.map((path) => toRelative(ctx.rootPath, assertWithinRoot(ctx.rootPath, path)));
     // Out-of-scope denial before any index write.
-    assertLeaseCovers(ctx.lease, { capability: "git.write", resourceValues: rels });
+    assertLeaseCovers(ctx.lease, { capability: "git.write", resourceValues: rels }, args);
 
     // Dirty-overlap refusal: never sweep a pre-existing user change into this commit.
     const baseline = ctx.baselineDirtyPaths;
@@ -247,7 +247,7 @@ export const gitRollbackTool: Tool<GitRollbackArgs> = {
   async run(args, ctx): Promise<ToolResult> {
     const start = Date.now();
     // A branch-pointer operation spans the whole worktree.
-    assertLeaseCovers(ctx.lease, { capability: "git.write", resourceValues: [WORKTREE_RESOURCE] });
+    assertLeaseCovers(ctx.lease, { capability: "git.write", resourceValues: [WORKTREE_RESOURCE] }, args);
 
     const oldHead = (await gitWrite(ctx, ["rev-parse", "HEAD"])).stdout.trim();
     const verify = await gitWrite(ctx, ["rev-parse", "--verify", `${args.target}^{commit}`]);
@@ -313,10 +313,11 @@ async function runGit(
   ctx: ToolContext,
   argv: readonly string[],
   descriptor: ToolDescriptor,
+  parameters: unknown,
 ): Promise<ToolResult> {
   const start = Date.now();
   // A git read observes the whole worktree, so the lease resource is the root.
-  assertLeaseCovers(ctx.lease, { capability: "git.read", resourceValues: [WORKTREE_RESOURCE] });
+  assertLeaseCovers(ctx.lease, { capability: "git.read", resourceValues: [WORKTREE_RESOURCE] }, parameters);
 
   const maxBytes = ctx.lease.constraints.maxOutputBytes ?? descriptor.maxOutputBytes;
   const captured = await spawnCapture("git", argv, {

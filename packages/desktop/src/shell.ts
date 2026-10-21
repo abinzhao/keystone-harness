@@ -33,9 +33,10 @@ import type { AddressInfo } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { KeystonePaths } from "@keystone/kernel";
+import { resolveKeystonePaths, type KeystonePaths } from "@keystone/kernel";
+import { ConfigConflictError, type CredentialBroker } from "@keystone/models";
 
-import { DesktopConfigBridge } from "./config-bridge.ts";
+import { DesktopConfigBridge, type ConnectionInput, type SaveModelInput } from "./config-bridge.ts";
 import { chooseFolder } from "./folder-picker.ts";
 import { acquireInstanceLock, type InstanceLock } from "./single-instance.ts";
 import { launchNativeWindow, nativeWindowSupported } from "./window.ts";
@@ -57,6 +58,8 @@ interface StartupRecord {
 
 export interface DesktopShellOptions {
   readonly paths: KeystonePaths;
+  /** Explicit broker injection for tests or a preserved migration service identity. */
+  readonly credentials?: CredentialBroker;
   /** Override the CLI entry (tests / packaged layouts). */
   readonly cliBin?: string;
   readonly nodePath?: string;
@@ -75,14 +78,15 @@ export interface DesktopShellOptions {
 }
 
 export class DesktopShell {
-  private readonly paths: KeystonePaths;
+  private paths: KeystonePaths;
   private readonly cliBin: string;
   private readonly nodePath: string;
   private readonly runtimeArgs: readonly string[];
   private readonly onBrowserOpen?: (url: string) => void;
   private readonly onRuntimeReady?: (target: RuntimeTarget) => void;
   private readonly nativeWindowOption: boolean | undefined;
-  private readonly bridge: DesktopConfigBridge;
+  private bridge: DesktopConfigBridge;
+  private readonly credentials?: CredentialBroker;
 
   private server: Server | null = null;
   private lock: InstanceLock | null = null;
@@ -103,7 +107,8 @@ export class DesktopShell {
     this.onBrowserOpen = options.onBrowserOpen;
     this.onRuntimeReady = options.onRuntimeReady;
     this.nativeWindowOption = options.nativeWindow;
-    this.bridge = new DesktopConfigBridge({ paths: options.paths });
+    this.credentials = options.credentials;
+    this.bridge = new DesktopConfigBridge({ paths: options.paths, credentials: options.credentials });
   }
 
   /** The shell origin the window should load. Only valid after {@link start}. */
@@ -155,7 +160,7 @@ export class DesktopShell {
   }
 
   /**
-   * Restart the supervised runtime, e.g. after the wizard saved a new model.
+   * Explicit diagnostic restart only. Settings saves must never call this.
    * The webview keeps talking to the same shell origin; only the injected token
    * and upstream port change.
    */
@@ -173,7 +178,7 @@ export class DesktopShell {
     const child = spawn(
       this.nodePath,
       [this.cliBin, "serve", "--json", "--port", "0", ...this.runtimeArgs],
-      { stdio: ["ignore", "pipe", "pipe"] },
+      { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, KEYSTONE_HOME: this.paths.home } },
     );
     this.child = child;
 
@@ -243,13 +248,40 @@ export class DesktopShell {
       }
 
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      if (url.pathname.startsWith("/v1/") && !this.passesNonce(req)) {
+        json(res, 403, { error: "shell nonce required" });
+        return;
+      }
+      if (url.pathname === "/v1/data/migrate" && req.method === "POST") {
+        if (this.target === null) { json(res, 503, { error: "runtime unavailable" }); return; }
+        const body = await readJson(req);
+        const response = await fetch(`http://127.0.0.1:${this.target.port}/v1/data/migrate`, {
+          method: "POST", headers: { authorization: `Bearer ${this.target.token}`, "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const result = await response.json() as { verified?: boolean; preview?: boolean; newHome?: string };
+        if (response.ok && result.verified === true && result.preview === false && result.newHome) {
+          const newPaths = resolveKeystonePaths(result.newHome);
+          const newLock = await acquireInstanceLock(newPaths.home);
+          await this.lock?.release();
+          this.lock = newLock; this.paths = newPaths;
+          this.bridge = new DesktopConfigBridge({ paths: newPaths, credentials: this.credentials });
+        }
+        json(res, response.status, result);
+        return;
+      }
       if (url.pathname.startsWith("/desktop/")) {
         await this.handleDesktop(url.pathname, req, res);
         return;
       }
       this.forwardToRuntime(req, res);
     } catch (error) {
-      json(res, 500, { error: error instanceof Error ? error.message : String(error) });
+      if (error instanceof ConfigConflictError) {
+        json(res, 409, { error: error.message, revision: error.revision });
+      } else {
+        // Bodies, provider errors and validation issues can contain submitted keys.
+        json(res, 400, { error: "desktop request failed; check input and native credential availability" });
+      }
     }
   }
 
@@ -281,30 +313,46 @@ export class DesktopShell {
       return;
     }
     if (pathname === "/desktop/config/test" && req.method === "POST") {
-      const body = (await readJson(req)) as { baseUrl?: string; apiKey?: string };
-      json(res, 200, await this.bridge.testConnection({ baseUrl: body.baseUrl ?? "", apiKey: body.apiKey ?? "" }));
+      const body = (await readJson(req)) as unknown as ConnectionInput;
+      json(res, 200, await this.bridge.testConnection(body));
+      return;
+    }
+    if (pathname === "/desktop/config/generate" && req.method === "POST") {
+      const body = (await readJson(req)) as unknown as SaveModelInput;
+      json(res, 200, await this.bridge.testGeneration(body));
+      return;
+    }
+    if (pathname === "/desktop/credential/migrate" && req.method === "POST") {
+      const body = await readJson(req);
+      if (typeof body["handle"] !== "string" || body["confirmed"] !== true ||
+          (body["removeSource"] !== undefined && typeof body["removeSource"] !== "boolean")) {
+        throw new Error("explicit migration confirmation required");
+      }
+      json(res, 200, await this.bridge.migrateCredential({
+        handle: body["handle"], confirmed: true, removeSource: body["removeSource"] as boolean | undefined,
+      }));
       return;
     }
     if (pathname === "/desktop/config/save" && req.method === "POST") {
-      const body = (await readJson(req)) as {
-        baseUrl?: string;
-        apiKey?: string;
-        modelName?: string;
-        provider?: string;
-      };
-      const result = await this.bridge.saveModel({
-        baseUrl: body.baseUrl ?? "",
-        apiKey: body.apiKey ?? "",
-        modelName: body.modelName ?? "",
-        ...(body.provider === undefined ? {} : { provider: body.provider }),
-      });
-      // The running child read config.json at start; restart it so the new model
-      // is actually registered, then report readiness.
-      await this.restartRuntime();
-      json(res, 200, result);
+      const body = (await readJson(req)) as unknown as SaveModelInput;
+      const result = await this.bridge.saveModel(body);
+      const runtimeNotified = await this.refreshRuntimeSettings();
+      json(res, 200, { ...result, runtimeNotified,
+        ...(runtimeNotified ? {} : { warning: "saved; runtime settings refresh unavailable, subsequent tasks reload from disk" }) });
       return;
     }
     json(res, 404, { error: "unknown desktop route" });
+  }
+
+  private async refreshRuntimeSettings(): Promise<boolean> {
+    if (this.target === null) return false;
+    try {
+      const response = await fetch(`http://127.0.0.1:${this.target.port}/v1/settings`, {
+        headers: { authorization: `Bearer ${this.target.token}` }, signal: AbortSignal.timeout(5_000),
+      });
+      await response.body?.cancel();
+      return response.ok;
+    } catch { return false; }
   }
 
   /** Reverse-proxy to the supervised runtime, injecting the bearer token. */
@@ -362,6 +410,8 @@ export class DesktopShell {
    * A probe that only knows the ephemeral loopback port has neither.
    */
   private passesNonce(req: import("node:http").IncomingMessage): boolean {
+    const origin = req.headers.origin;
+    if (origin !== undefined && origin !== new URL(this.origin()).origin) return false;
     const headerProbe = req.headers["x-keystone-shell-nonce"];
     if (typeof headerProbe === "string" && headerProbe === this.nonce) return true;
     const cookies = req.headers.cookie;
@@ -410,9 +460,16 @@ function json(res: import("node:http").ServerResponse, status: number, body: unk
 
 async function readJson(req: import("node:http").IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk as Buffer);
+  let length = 0;
+  for await (const chunk of req) {
+    length += Buffer.byteLength(chunk);
+    if (length > 65_536) throw new Error("desktop request body exceeds limit");
+    chunks.push(chunk as Buffer);
+  }
   const text = Buffer.concat(chunks).toString("utf8").trim();
-  return text === "" ? {} : (JSON.parse(text) as Record<string, unknown>);
+  const body: unknown = text === "" ? {} : JSON.parse(text);
+  if (typeof body !== "object" || body === null || Array.isArray(body)) throw new Error("object body required");
+  return body as Record<string, unknown>;
 }
 
 function openBrowser(url: string): void {

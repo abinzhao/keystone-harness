@@ -61,7 +61,7 @@ function gatedModel(responses: readonly string[]): GatedModel {
       return {
         text: responses[Math.min(calls - 1, responses.length - 1)] ?? "",
         toolCalls: [],
-        usage: { inputTokens: 0, outputTokens: 0 },
+        usage: { inputTokens: 17, outputTokens: 5 },
         modelName: "scripted-1",
         finishReason: "stop" as const,
       };
@@ -234,7 +234,7 @@ test("pause and stop sent while the task is working end the run with that status
     const fixture = await makeFixture();
     const model = gatedModel([
       envelopeFor([writeAction("src/auth/session.js", FIXED_SESSION)]),
-      envelopeFor([FINISH_ACTION]),
+      envelopeFor([writeAction("src/late.js", "export const late = true;")]),
     ]);
     const server = await startServer({
       paths: fixture.paths,
@@ -265,8 +265,19 @@ test("pause and stop sent while the task is working end the run with that status
 
       const detail = (await (await fetch(`${base}/v1/tasks/${taskId}`, { headers: auth })).json()) as {
         status: string;
+        budgetUsed: { tokens: number; wallClockMs: number };
       };
       assert.equal(detail.status, expected, JSON.stringify(detail));
+      const { access } = await import("node:fs/promises");
+      const { join } = await import("node:path");
+      await assert.rejects(() => access(join(fixture.root, "src/late.js")));
+      assert.equal(detail.budgetUsed.tokens, 44, "actual usage includes the response discarded after stop");
+      assert.ok(detail.budgetUsed.wallClockMs > 0);
+      const events = (await (await fetch(`${base}/v1/tasks/${taskId}/events`, { headers: auth })).json()) as {
+        events: { type: string; payload: Record<string, unknown> }[];
+      };
+      assert.equal(events.events.filter((event) => event.type === "action.executed").length, 1,
+        "the stopped response cannot execute another tool");
     } finally {
       await server.close();
       await removeFixture(fixture);

@@ -17,6 +17,7 @@
  */
 
 import type { ModelDescriptor } from "@keystone/schemas";
+import { assertModelContent, mapContent } from "./content.ts";
 
 import {
   CredentialMissingError,
@@ -67,6 +68,7 @@ export function createOpenAiCompatibleAdapter(options: OpenAiCompatibleOptions):
     descriptor,
 
     async complete(request: ModelRequest): Promise<ModelResponse> {
+      assertModelContent(descriptor, request);
       // No native tool calling: this adapter sends a text envelope and nothing
       // else. A non-empty `tools` array means the caller expects structured tool
       // negotiation, which we must refuse *before* spending a credential lookup
@@ -92,6 +94,7 @@ export function createOpenAiCompatibleAdapter(options: OpenAiCompatibleOptions):
         controller.abort();
       };
       request.signal?.addEventListener("abort", abortExternal, { once: true });
+      if (request.signal?.aborted) controller.abort();
 
       try {
         const response = await fetchImpl(endpoint, {
@@ -104,7 +107,7 @@ export function createOpenAiCompatibleAdapter(options: OpenAiCompatibleOptions):
             model: descriptor.modelName,
             messages: request.messages.map((message) => ({
               role: message.role,
-              content: message.content,
+              content: typeof message.content === "string" ? message.content : mapContent(message.content, "openai-chat"),
             })),
             stream: false,
             ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
@@ -112,6 +115,7 @@ export function createOpenAiCompatibleAdapter(options: OpenAiCompatibleOptions):
             ...(request.jsonMode ? { response_format: { type: "json_object" } } : {}),
           }),
           signal: controller.signal,
+          redirect: "error",
         });
 
         if (!response.ok) {

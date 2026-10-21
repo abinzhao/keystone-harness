@@ -16,11 +16,11 @@
  *    effect with no account of itself (PRD 9.1, NFR-REL-01).
  */
 
-import { readFile, readdir, rm, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { lstat, readFile, readdir, realpath, rm } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { foldTaskState, readJsonLines, readLedger, type KeystonePaths } from "@keystone/kernel";
-import { isActive, projectProfileSchema } from "@keystone/schemas";
+import { isTerminal, projectProfileSchema, type TaskState } from "@keystone/schemas";
 
 /** Ids come from a URL; they must be validated before they become a file path. */
 const TASK_ID = /^task_[0-9A-Za-z]+$/;
@@ -55,6 +55,13 @@ export interface StoreInventory {
   readonly projects: readonly ProjectInventory[];
   readonly tasks: readonly TaskInventory[];
   readonly artifacts: DataSize;
+  /** Only filenames/configuration handles are read, never credential material. */
+  readonly credentials: DataSize & { readonly handles: readonly string[] };
+  /** Input metadata plus its original artifact bytes; overlaps `artifacts`. */
+  readonly attachments: DataSize;
+  readonly settings: DataSize;
+  /** Task ledgers, checkpoints and branch metadata; overlaps `tasks`. */
+  readonly history: DataSize;
   /** Directories the storage layout documents as derived and rebuildable. */
   readonly derived: {
     readonly index: DataSize;
@@ -65,33 +72,118 @@ export interface StoreInventory {
 }
 
 export class DataError extends Error {
-  readonly code: "invalid_id" | "task_active" | "not_found";
-  constructor(code: DataError["code"], message: string) {
+  readonly code: "invalid_id" | "invalid_options" | "task_active" | "not_found" |
+    "unsafe_path" | "protected_data" | "referenced_data" | "invalid_store" |
+    "overlap" | "destination_exists" | "credentials_require_migration" |
+    "verification_failed" | "source_changed" | "io_error";
+  readonly status: number;
+  readonly impact?: DataSize & { readonly category?: string; readonly preview?: boolean; readonly destination?: string };
+  constructor(code: DataError["code"], message: string, impact?: DataError["impact"]) {
     super(message);
     this.name = "DataError";
     this.code = code;
+    this.status = code === "not_found" ? 404 :
+      ["invalid_id", "invalid_options", "unsafe_path"].includes(code) ? 400 :
+      code === "io_error" ? 500 : 409;
+    this.impact = impact;
   }
 }
 
-/** Recursive size of a directory; unreadable entries are skipped, not fatal. */
-async function dirSize(dir: string): Promise<DataSize> {
-  let files = 0;
-  let bytes = 0;
-  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
-  for (const entry of entries) {
-    const absolute = join(dir, entry.name);
-    if (entry.isDirectory()) {
-      const nested = await dirSize(absolute);
-      files += nested.files;
-      bytes += nested.bytes;
-      continue;
-    }
-    const info = await stat(absolute).catch(() => undefined);
-    if (info === undefined) continue;
-    files += 1;
-    bytes += info.size;
+export function pathWithin(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
+}
+
+async function optionalStat(path: string) {
+  try { return await lstat(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new DataError("io_error", "stored data is inaccessible");
   }
-  return { files, bytes };
+}
+
+/** Refuse symlinks (even internal ones) rather than implicitly following them. */
+export async function assertStorePath(paths: KeystonePaths, path: string): Promise<void> {
+  const home = resolve(paths.home);
+  const absolute = resolve(path);
+  if (!pathWithin(home, absolute)) throw new DataError("unsafe_path", "path is outside the data store");
+  const parts = relative(home, absolute).split(sep).filter(Boolean);
+  let current = home;
+  for (let index = -1; index < parts.length; index += 1) {
+    if (index >= 0) current = join(current, parts[index]!);
+    const info = await optionalStat(current);
+    if (info === undefined) return;
+    if (info.isSymbolicLink() || (!info.isDirectory() && !info.isFile()) ||
+        (index < parts.length - 1 && !info.isDirectory())) {
+      throw new DataError("unsafe_path", "data operations require ordinary files and directories without symlinks");
+    }
+    const canonical = await realpath(current);
+    if (!pathWithin(await realpath(home), canonical)) throw new DataError("unsafe_path", "stored path escapes the data home");
+  }
+}
+
+export interface StoreFile {
+  readonly path: string;
+  readonly bytes: number;
+}
+
+/** Inventory never opens files; missing stores are empty, access errors are not. */
+export async function listStoreFiles(paths: KeystonePaths, dir = paths.home): Promise<StoreFile[]> {
+  await assertStorePath(paths, dir);
+  const info = await optionalStat(dir);
+  if (info === undefined) return [];
+  if (info.isFile()) return [{ path: dir, bytes: info.size }];
+  const files: StoreFile[] = [];
+  for (const name of (await readdir(dir)).sort()) {
+    files.push(...await listStoreFiles(paths, join(dir, name)));
+  }
+  return files;
+}
+
+export function sizeOf(files: readonly StoreFile[]): DataSize {
+  return files.reduce<DataSize>((sum, file) => ({ files: sum.files + 1, bytes: sum.bytes + file.bytes }), { files: 0, bytes: 0 });
+}
+
+async function dirSize(paths: KeystonePaths, dir: string): Promise<DataSize> {
+  return sizeOf(await listStoreFiles(paths, dir));
+}
+
+async function directoryNames(paths: KeystonePaths, dir: string): Promise<string[]> {
+  await assertStorePath(paths, dir);
+  if (await optionalStat(dir) === undefined) return [];
+  return (await readdir(dir)).sort();
+}
+
+async function taskState(paths: KeystonePaths, taskId: string): Promise<TaskState | undefined> {
+  await assertStorePath(paths, paths.ledgerFile(taskId as never));
+  try {
+    const ledger = await readLedger(paths.ledgerFile(taskId as never));
+    if (!ledger.integrity.ok || ledger.tornTail || ledger.events.some((event) => event.taskId !== taskId)) return undefined;
+    return foldTaskState(ledger.events);
+  } catch { return undefined; }
+}
+
+/** Unknown/torn/future task records cannot establish that deletion is safe. */
+export async function assertInactiveTasks(
+  paths: KeystonePaths,
+  options: { readonly projectId?: string; readonly impact?: DataError["impact"] } = {},
+): Promise<void> {
+  for (const taskId of await directoryNames(paths, paths.tasksDir)) {
+    const state = TASK_ID.test(taskId) ? await taskState(paths, taskId) : undefined;
+    if (state !== undefined && options.projectId !== undefined && state.projectId !== options.projectId) continue;
+    if (state === undefined || !isTerminal(state.status) || state.activeLeaseIds.length > 0) {
+      throw new DataError("task_active", "a task is nonterminal or cannot be verified inactive; stop and recover it first", options.impact);
+    }
+  }
+}
+
+export function containsProtectedRule(value: unknown): boolean {
+  if (value === null || typeof value !== "object") return false;
+  if (Array.isArray(value)) return value.some(containsProtectedRule);
+  const record = value as Record<string, unknown>;
+  return record.frozen === true || record.status === "frozen" ||
+    record.promotedBy === "user_confirmation" || record.userConfirmed === true ||
+    record.confirmedBy === "user" || Object.values(record).some(containsProtectedRule);
 }
 
 async function countLines(filePath: string): Promise<number> {
@@ -132,16 +224,14 @@ async function inventoryProject(
       entries: await countLines(paths.experienceEntriesFile(projectId as never)),
       evaluations: await countLines(paths.experienceEvaluationsFile(projectId as never)),
     },
-    ...(await dirSize(dir)),
+    ...(await dirSize(paths, dir)),
   };
 }
 
 async function inventoryTask(paths: KeystonePaths, taskId: string): Promise<TaskInventory> {
   const ledger = await readLedger(paths.ledgerFile(taskId as never)).catch(() => undefined);
   let status: string | null = null;
-  if (ledger !== undefined && ledger.events.length > 0) {
-    status = foldTaskState(ledger.events).status;
-  }
+  status = (await taskState(paths, taskId))?.status ?? null;
   const checkpoints = (await readdir(paths.checkpointsDir(taskId as never)).catch(() => [])).filter(
     (name) => name.endsWith(".json"),
   ).length;
@@ -151,16 +241,17 @@ async function inventoryTask(paths: KeystonePaths, taskId: string): Promise<Task
     status,
     events: ledger?.events.length ?? 0,
     checkpoints,
-    ...(await dirSize(paths.taskDir(taskId as never))),
+    ...(await dirSize(paths, paths.taskDir(taskId as never))),
   };
 }
 
 /** Read-only inventory of everything under the Keystone home. */
 export async function storeInventory(paths: KeystonePaths): Promise<StoreInventory> {
-  const projectIds = (await readdir(paths.projectsDir).catch(() => [])).filter((name) =>
+  const allFiles = await listStoreFiles(paths);
+  const projectIds = (await directoryNames(paths, paths.projectsDir)).filter((name) =>
     PROJECT_ID.test(name),
   );
-  const taskIds = (await readdir(paths.tasksDir).catch(() => [])).filter((name) =>
+  const taskIds = (await directoryNames(paths, paths.tasksDir)).filter((name) =>
     TASK_ID.test(name),
   );
 
@@ -170,24 +261,41 @@ export async function storeInventory(paths: KeystonePaths): Promise<StoreInvento
   const tasks: TaskInventory[] = [];
   for (const taskId of taskIds) tasks.push(await inventoryTask(paths, taskId));
 
-  const artifacts = await dirSize(paths.artifactsDir);
-  const index = await dirSize(paths.indexDir);
-  const cache = await dirSize(paths.cacheDir);
-  const proofs = await dirSize(paths.proofsDir);
-
-  const totals = [
-    ...projects,
-    ...tasks,
-    artifacts,
-    index,
-    cache,
-    proofs,
-  ].reduce<DataSize>(
-    (sum, entry) => ({ files: sum.files + entry.files, bytes: sum.bytes + entry.bytes }),
-    { files: 0, bytes: 0 },
-  );
-
-  return { home: paths.home, projects, tasks, artifacts, derived: { index, cache, proofs }, totals };
+  const under = (dir: string) => allFiles.filter((file) => pathWithin(dir, file.path));
+  const credentialFiles = under(paths.credentialsDir);
+  const handles = new Set(credentialFiles.flatMap((file) => {
+    const name = relative(paths.credentialsDir, file.path);
+    return /^[a-z0-9][a-z0-9._-]{1,63}\.json$/.test(name) ? [name.slice(0, -5)] : [];
+  }));
+  const configText = await readFile(paths.configFile, "utf8").catch(() => undefined);
+  if (configText !== undefined) {
+    try {
+      const config = JSON.parse(configText) as { models?: { credentialHandle?: unknown }[] };
+      for (const model of config.models ?? []) {
+        if (typeof model.credentialHandle === "string" && /^[a-z0-9][a-z0-9._-]{1,63}$/.test(model.credentialHandle)) handles.add(model.credentialHandle);
+      }
+    } catch { /* Invalid configuration does not hide its on-disk size. */ }
+  }
+  const inputFiles = under(join(paths.home, "inputs"));
+  const attachmentPaths = new Set(inputFiles.map((file) => file.path));
+  for (const file of inputFiles.filter((entry) => entry.path.endsWith(".json"))) {
+    try {
+      const metadata = JSON.parse(await readFile(file.path, "utf8")) as { artifactId?: unknown };
+      if (typeof metadata.artifactId !== "string" || !/^art_[a-f0-9]{64}$/.test(metadata.artifactId)) continue;
+      const digest = metadata.artifactId.slice(4);
+      attachmentPaths.add(join(paths.artifactsDir, digest.slice(0, 2), digest));
+    } catch { /* Unreadable input metadata is still counted, not guessed. */ }
+  }
+  return {
+    home: paths.home, projects, tasks,
+    artifacts: sizeOf(under(paths.artifactsDir)),
+    credentials: { ...sizeOf(credentialFiles), handles: [...handles].sort() },
+    attachments: sizeOf(allFiles.filter((file) => attachmentPaths.has(file.path))),
+    settings: sizeOf(allFiles.filter((file) => ["config.json", "presentation.json", "settings.json", "credential-service.json"].includes(relative(paths.home, file.path)))),
+    history: sizeOf(under(paths.tasksDir)),
+    derived: { index: sizeOf(under(paths.indexDir)), cache: sizeOf(under(paths.cacheDir)), proofs: sizeOf(under(paths.proofsDir)) },
+    totals: sizeOf(allFiles),
+  };
 }
 
 export interface DeletedTask {
@@ -213,18 +321,16 @@ export async function deleteTaskHistory(
     throw new DataError("invalid_id", `"${taskId}" is not a task id`);
   }
   const dir = paths.taskDir(taskId as never);
-  const exists = await stat(dir).catch(() => undefined);
+  await assertStorePath(paths, dir);
+  await assertStorePath(paths, paths.proofsDirFor(taskId as never));
+  const exists = await optionalStat(dir);
   if (exists === undefined) {
     throw new DataError("not_found", `no stored history exists for task ${taskId}`);
   }
 
+  await assertInactiveTasks(paths);
   const inventory = await inventoryTask(paths, taskId);
-  if (inventory.status !== null && (isActive(inventory.status as never) || inventory.status === "resuming")) {
-    throw new DataError(
-      "task_active",
-      `task ${taskId} is still "${inventory.status}"; stop it before deleting its history`,
-    );
-  }
+  await listStoreFiles(paths, paths.proofsDirFor(taskId as never));
 
   await rm(dir, { recursive: true, force: true });
   await rm(paths.proofsDirFor(taskId as never), { recursive: true, force: true });
@@ -248,10 +354,9 @@ export interface ClearedExperience {
  * Clear a project's experience cache: candidates, promoted entries and their
  * evaluations.
  *
- * This is the one cognition store that is safe to drop wholesale — the next
- * task simply stops being told about past lessons (PRD LE-04, CX-02). Project
- * facts are deliberately *not* cleared here: they carry user-confirmed rules
- * and repository observations that a cache reset has no business discarding.
+ * Only idle, unprotected experience can be dropped wholesale. Frozen and
+ * user-confirmed entries require explicit kernel revocation, not a cache reset.
+ * Facts are never cleared here.
  */
 export async function clearProjectExperience(
   paths: KeystonePaths,
@@ -259,6 +364,15 @@ export async function clearProjectExperience(
 ): Promise<ClearedExperience> {
   if (!PROJECT_ID.test(projectId)) {
     throw new DataError("invalid_id", `"${projectId}" is not a project id`);
+  }
+  await listStoreFiles(paths, paths.projectDir(projectId as never));
+  await assertInactiveTasks(paths, { projectId });
+  for (const file of [paths.experienceCandidatesFile(projectId as never), paths.experienceEntriesFile(projectId as never), paths.experienceEvaluationsFile(projectId as never)]) {
+    let records;
+    try { records = await readJsonLines<unknown>(file); }
+    catch { throw new DataError("protected_data", "experience is unreadable; recover it before clearing"); }
+    if (records.tornTail) throw new DataError("protected_data", "experience is incomplete; recover it before clearing");
+    if (records.items.some(containsProtectedRule)) throw new DataError("protected_data", "frozen or user-confirmed experience cannot be cleared as cache");
   }
   const cleared: ClearedExperience = {
     projectId,

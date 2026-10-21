@@ -31,7 +31,6 @@ import {
   buildAdapter,
   createSequenceAdapter,
   enabledModels,
-  FileCredentialStore,
   loadConfig,
   routeFor,
   scriptedModelDescriptor,
@@ -67,6 +66,7 @@ import { createOutput, type Output } from "../output.ts";
 import {
   budgetFrom,
   collectChangedPaths,
+  credentialsFor,
   parsePositiveInt,
   pathsFor,
   readWorkspaceRoot,
@@ -267,7 +267,7 @@ async function runTask(argv: readonly string[], context: CliContext): Promise<nu
   const paths = pathsFor(context);
   const projectId = await projectIdForWorkspace(projectPath);
   const config = await loadConfig({ configFile: paths.configFile });
-  const credentials = new FileCredentialStore({ credentialsDir: paths.credentialsDir });
+  const credentials = credentialsFor(context);
 
   const adapters: ModelAdapter[] = [];
   let routes: Partial<Record<ModelRole, readonly string[]>>;

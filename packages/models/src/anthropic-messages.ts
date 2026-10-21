@@ -12,6 +12,7 @@
  */
 
 import type { ModelDescriptor } from "@keystone/schemas";
+import { assertModelContent, contentText, mapContent } from "./content.ts";
 
 import type {
   CredentialResolver,
@@ -43,6 +44,7 @@ export function createAnthropicMessagesAdapter(
     descriptor,
 
     async complete(request: ModelRequest): Promise<ModelResponse> {
+      assertModelContent(descriptor, request);
       const secret = await resolveCallSecret(descriptor, credentials);
       const { system, messages } = splitSystem(request.messages);
       const json = await callProvider({
@@ -82,13 +84,14 @@ export function createAnthropicMessagesAdapter(
 
 function splitSystem(messages: readonly ModelMessage[]): {
   readonly system: string;
-  readonly messages: readonly { readonly role: string; readonly content: string }[];
+  readonly messages: readonly { readonly role: string; readonly content: string | readonly Record<string, unknown>[] }[];
 } {
   const system: string[] = [];
-  const rest: { readonly role: string; readonly content: string }[] = [];
+  const rest: { readonly role: string; readonly content: string | readonly Record<string, unknown>[] }[] = [];
   for (const message of messages) {
-    if (message.role === "system") system.push(message.content);
-    else rest.push({ role: message.role, content: message.content });
+    if (message.role === "system") system.push(contentText(message.content));
+    else rest.push({ role: message.role, content: typeof message.content === "string"
+      ? message.content : mapContent(message.content, "anthropic-messages") });
   }
   return { system: system.join("\n\n"), messages: rest };
 }

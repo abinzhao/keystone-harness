@@ -18,6 +18,24 @@ import { createSequenceAdapter, scriptedModelDescriptor } from "@keystone/models
 import { startServer } from "../src/index.ts";
 import { FINISH_ACTION, FIXED_SESSION, autonomyFor, envelopeFor, makeFixture, removeFixture, writeAction } from "./fixture.ts";
 
+test("workbench assets are confined, MIME typed and protected by nonce CSP", async () => {
+  const fixture = await makeFixture();
+  const server = await startServer({ paths: fixture.paths });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    const page = await fetch(base);
+    assert.match(page.headers.get("content-security-policy") ?? "", /script-src 'self' 'nonce-/);
+    assert.match(page.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
+    const module = await fetch(`${base}/assets/client/main.js`);
+    assert.equal(module.status, 200); assert.match(module.headers.get("content-type") ?? "", /text\/javascript/);
+    const css = await fetch(`${base}/assets/styles/workbench.css`);
+    assert.equal(css.status, 200); assert.match(css.headers.get("content-type") ?? "", /text\/css/);
+    for (const path of ["/assets/package.json", "/assets/client/%2e%2e/%2e%2e/src/server.ts", "/assets/client/%2e%2e%2f%2e%2e%2fsrc/server.ts"]) {
+      assert.equal((await fetch(`${base}${path}`)).status, 404);
+    }
+  } finally { await server.close(); await removeFixture(fixture); }
+});
+
 async function waitForRun(
   base: string,
   token: string,
@@ -54,7 +72,7 @@ test("the server refuses unauthenticated callers and serves the protocol with a 
 
   try {
     const base = `http://127.0.0.1:${server.port}`;
-    assert.equal(server.protocolVersion, "keystone.run.protocol@1.2.0");
+    assert.equal(server.protocolVersion, "keystone.run.protocol@1.3.0");
 
     // No token, and a wrong token, are both refused.
     const anonymous = await fetch(`${base}/v1/tasks`);

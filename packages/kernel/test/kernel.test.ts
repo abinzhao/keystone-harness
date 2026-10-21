@@ -19,6 +19,8 @@ import {
   newId,
   outcomeContractSchema,
   projectProfileSchema,
+  userDecisionSchema,
+  contentHash,
   type ActionProposal,
   type AutonomyEnvelope,
   type OutcomeContract,
@@ -529,4 +531,59 @@ test("the action resolver never changes folded or replayed state (resumed sessio
   } finally {
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test("paused/stopped tasks and foreign proposals cannot obtain another lease", async () => {
+  for (const kind of ["pause", "stop"] as const) {
+    const { session, home } = await startTask();
+    try {
+      const foreign = proposalFor(session, { taskId: newId("task") });
+      assert.equal((await session.authorize(foreign)).ok, false);
+      const otherBranch = proposalFor(session, { branchId: newId("branch") });
+      assert.equal((await session.authorize(otherBranch)).ok, false);
+      await session[kind]("user control");
+      assert.equal((await session.authorize(proposalFor(session))).ok, false);
+      assert.equal(session.events().filter((event) => event.type === "lease.issued").length, 0);
+      assert.equal(session.replay().consistent, true);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a stale session cannot append over a newer committed chain tip", async () => {
+  const { session, home } = await startTask();
+  try {
+    const second = await KernelSession.open({ paths: resolveKeystonePaths(home), taskId: session.taskId });
+    await session.pause("first writer");
+    await assert.rejects(() => second.stop("stale second writer"), /stale|tip|concurrent/i);
+    const fresh = await KernelSession.open({ paths: resolveKeystonePaths(home), taskId: session.taskId });
+    assert.equal(fresh.state().status, "paused");
+    assert.equal(fresh.replay().consistent, true);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("confirmed irreversible operations need a recorded decision bound to exact task and parameters", async () => {
+  const { session, home } = await startTask();
+  try {
+    const parametersHash = contentHash({ command: "pnpm", args: ["test"] });
+    const decision = userDecisionSchema.parse({
+      decisionId: newId("dec"), taskId: session.taskId, branchId: session.branchId, at: new Date().toISOString(),
+      decision: "allow", rationale: "explicit human command", recordedBy: "user",
+      appliesTo: { capability: "cmd.exec", resources: ["pnpm"], expiresAt: new Date(Date.now() + 60_000).toISOString() },
+      modifications: { parametersHash },
+    });
+    const input = {
+      subject: { kind: "orchestrator" as const, id: "user.command" }, capability: "cmd.exec" as const,
+      resourceValues: ["pnpm"], parametersHash, reversibility: "irreversible" as const, decision,
+    };
+    assert.equal((await session.authorizeOperation(input)).ok, false, "unrecorded decision cannot authorize");
+    await session.recordUserDecision(decision);
+    assert.equal((await session.authorizeOperation({ ...input, parametersHash: contentHash({ args: ["deploy"] }) })).ok, false);
+    assert.equal((await session.authorizeOperation({ ...input, decision: userDecisionSchema.parse({ ...decision, taskId: newId("task") }) })).ok, false);
+    assert.equal((await session.authorizeOperation(input)).ok, true);
+    assert.equal(session.replay().consistent, true);
+  } finally { await rm(home, { recursive: true, force: true }); }
 });

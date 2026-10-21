@@ -21,6 +21,7 @@ import { promisify } from "node:util";
 import test from "node:test";
 
 import { listSchemas } from "@keystone/schemas";
+import { FileCredentialStore } from "@keystone/models";
 import { runCli, type CliContext } from "../src/index.ts";
 
 const exec = promisify(execFile);
@@ -45,6 +46,7 @@ async function run(
     stderr: { write: (chunk: string) => ((err.text += chunk), true) },
     env,
     isTTY: options.isTTY ?? false,
+    credentials: new FileCredentialStore({ credentialsDir: join(env["KEYSTONE_HOME"]!, "credentials") }),
     ...(options.stdin === undefined ? {} : { stdin: options.stdin }),
   };
   const code = await runCli(argv, context);
@@ -347,6 +349,9 @@ test("end to end: a scripted run is proven, the proof shows no E0 evidence, and 
     assert.equal(replayResult.code, 0, replayResult.stderr);
     const replay = JSON.parse(replayResult.stdout) as { consistent: boolean };
     assert.equal(replay.consistent, true);
+    await writeFile(join(fixture.root, "src/auth/session.js"), `${FIXED_SESSION}// later user change\n`);
+    const changed = await run(["proof", "show", taskId, "--json"], fixture.env);
+    assert.equal((JSON.parse(changed.stdout) as { outcome: string }).outcome, "not_proven");
   } finally {
     await rm(fixture.base, { recursive: true, force: true });
   }

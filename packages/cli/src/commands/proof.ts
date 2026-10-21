@@ -12,7 +12,8 @@ import { dirname } from "node:path";
 
 import type { Translator } from "@keystone/i18n";
 import { KernelSession } from "@keystone/kernel";
-import type { ProofPackage } from "@keystone/schemas";
+import { contentHash, type ProofPackage } from "@keystone/schemas";
+import { changedPathsForTask, observeWorkspace } from "@keystone/runtime";
 
 import { getBoolean, parseArgs, requireString, UsageError } from "../args.ts";
 import { createOutput, type Output } from "../output.ts";
@@ -49,7 +50,14 @@ async function detectChangedPaths(
     return [];
   }
   if (detected.length === 0) output.line(t("No changes detected in the workspace."));
-  return detected;
+  return [...await changedPathsForTask(pathsFor(context), session.taskId)];
+}
+
+async function currentFingerprint(context: CliContext, session: KernelSession): Promise<string> {
+  const root = await readWorkspaceRoot(pathsFor(context), session.projectId);
+  return root === undefined ? contentHash({ workspace: "unavailable", taskId: session.taskId }) :
+    await observeWorkspace(root).then((value) => value.fingerprint,
+      () => contentHash({ workspace: "unavailable", taskId: session.taskId }));
 }
 
 async function openSession(context: CliContext, taskIdValue: string): Promise<KernelSession> {
@@ -128,7 +136,7 @@ async function runShow(argv: readonly string[], context: CliContext): Promise<nu
 
   const session = await openSession(context, taskIdValue);
   const changedPaths = await detectChangedPaths(context, session, output, t);
-  const proof = await session.exportProof({ changedPaths });
+  const proof = await session.exportProof({ changedPaths, workspaceFingerprint: await currentFingerprint(context, session) });
 
   printProof(proof, output, t);
   output.json(proof);
@@ -156,6 +164,7 @@ async function runExport(argv: readonly string[], context: CliContext): Promise<
   const changedPaths = await detectChangedPaths(context, session, output, t);
   const proof = await session.exportProof({
     changedPaths,
+    workspaceFingerprint: await currentFingerprint(context, session),
     redaction: redacted ? "metadata_only" : "none",
   });
 

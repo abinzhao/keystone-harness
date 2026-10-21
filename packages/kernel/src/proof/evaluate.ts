@@ -16,6 +16,7 @@ import {
   evidenceRank,
   levelCanStandAlone,
   levelSatisfies,
+  trustRank,
   type CompletionCondition,
   type CompletionDecision,
   type ConditionReasonCode,
@@ -37,6 +38,93 @@ export interface EvaluateInput {
   readonly workspaceFingerprint?: string;
   readonly evidence: readonly EvidenceRecord[];
   readonly verifierFailures?: readonly { conditionId: string; detail: string }[];
+}
+
+export interface EvidenceAdmission {
+  readonly admitted: boolean;
+  readonly reasonCode: "satisfied" | "evidence_invalid" | "pending" | "workspace_changed";
+  readonly reason: string;
+}
+
+/**
+ * Applicability is checked before level or independence. A persisted `valid`
+ * record is historical input, not permission to reuse it for another proof.
+ * Shared with the graph so rejected support stays visible without rewriting it.
+ */
+export function evaluateEvidenceAdmission(
+  input: Pick<EvaluateInput, "contract" | "branchId" | "workspaceFingerprint"> & {
+    readonly evidence?: readonly EvidenceRecord[];
+  },
+  condition: CompletionCondition,
+  record: EvidenceRecord,
+): EvidenceAdmission {
+  const reject = (
+    reasonCode: Exclude<EvidenceAdmission["reasonCode"], "satisfied">,
+    reason: string,
+  ): EvidenceAdmission => ({ admitted: false, reasonCode, reason: `evidence ${record.evidenceId}: ${reason}` });
+
+  if (record.taskId !== input.contract.taskId) return reject("evidence_invalid", "foreign task");
+  if (record.branchId !== input.branchId) return reject("evidence_invalid", "foreign branch");
+  if (record.contractId !== input.contract.contractId) return reject("evidence_invalid", "foreign contract");
+  if (record.contractVersion !== input.contract.version) {
+    return reject("evidence_invalid", `contract revision ${record.contractVersion} does not match ${input.contract.version}`);
+  }
+  if (record.producer.id !== condition.verifier.id || record.producer.version !== condition.verifier.version) {
+    return reject("evidence_invalid", `producer ID/version does not match ${condition.verifier.id}@${condition.verifier.version}`);
+  }
+  const external = record.producer.kind === "external" && condition.verifier.kind === "external_ci";
+  if (record.producer.kind !== "verifier" && !external) {
+    return reject("evidence_invalid", `producer kind ${record.producer.kind} cannot perform ${condition.verifier.kind} verification`);
+  }
+
+  if (record.status !== "valid") {
+    return reject(
+      record.status === "partially_invalid" ? "pending" : "evidence_invalid",
+      `record is ${record.status}; re-verification is required`,
+    );
+  }
+  if (record.invalidatedBy.length > 0 || record.invalidatedAt !== undefined) {
+    return reject("evidence_invalid", "record carries an actual invalidation; re-verification is required");
+  }
+
+  // Provenance invalidatedBy names potential triggers, not actual invalidation.
+  // The latter belongs to EvidenceRecord and was checked above.
+  const source = external ? "system" : "verifier";
+  if (record.provenance.sourceKind !== source) {
+    return reject("evidence_invalid", `provenance source ${record.provenance.sourceKind} is not ${source} output`);
+  }
+  const minimumTrust = condition.required || evidenceRank(record.level) >= evidenceRank("E2") ? "verified" : "observed";
+  if (trustRank(record.provenance.trustLevel) < trustRank(minimumTrust)) {
+    return reject("evidence_invalid", `provenance trust ${record.provenance.trustLevel} is below ${minimumTrust}`);
+  }
+  if (record.provenance.applicableSnapshot !== undefined &&
+      record.provenance.applicableSnapshot !== record.workspaceSnapshotId) {
+    return reject("evidence_invalid", "provenance applies to a different workspace snapshot");
+  }
+  if (condition.required && (record.observation.incomplete?.length ?? 0) > 0) {
+    return reject("pending", `required observation is incomplete: ${record.observation.incomplete!.join("; ")}`);
+  }
+  if (input.workspaceFingerprint !== undefined &&
+      record.independence.environmentFingerprint !== input.workspaceFingerprint) {
+    return reject("workspace_changed", "workspace fingerprint is unknown or differs from the current workspace");
+  }
+  const supersedingFailure = input.evidence?.find((candidate) =>
+    candidate.taskId === record.taskId && candidate.branchId === record.branchId &&
+    candidate.contractId === record.contractId && candidate.contractVersion === record.contractVersion &&
+    candidate.conditionIds.includes(condition.conditionId) &&
+    candidate.producer.kind === record.producer.kind && candidate.producer.id === record.producer.id &&
+    candidate.producer.version === record.producer.version &&
+    candidate.provenance.sourceKind === record.provenance.sourceKind &&
+    trustRank(candidate.provenance.trustLevel) >= trustRank("verified") &&
+    candidate.independence.environmentFingerprint === record.independence.environmentFingerprint &&
+    candidate.status === "invalid" && candidate.invalidatedBy.includes("verifier.reported_failure") &&
+    (candidate.createdAt > record.createdAt ||
+      (candidate.createdAt === record.createdAt && candidate.evidenceId > record.evidenceId)),
+  );
+  if (supersedingFailure !== undefined) {
+    return reject("evidence_invalid", `superseded by verifier failure ${supersedingFailure.evidenceId}`);
+  }
+  return { admitted: true, reasonCode: "satisfied", reason: "evidence applies to the current proof" };
 }
 
 interface EvaluationContext {
@@ -150,40 +238,22 @@ function evaluateEvidence(context: EvaluationContext, condition: CompletionCondi
     };
   }
 
-  const valid = candidates.filter((record) => record.status === "valid");
-  if (valid.length === 0) {
-    // A record that is only partially invalid may be re-verified, so it is
-    // reported as pending rather than as a hard invalidation (PRD VF-06).
-    const partial = candidates.some((record) => record.status === "partially_invalid");
+  const admissions = candidates.map((record) => ({
+    record,
+    admission: evaluateEvidenceAdmission(context.input, condition, record),
+  }));
+  const usable = admissions.filter((entry) => entry.admission.admitted).map((entry) => entry.record);
+  if (usable.length === 0) {
+    const rejection = admissions
+      .map((entry) => entry.admission)
+      .sort((a, b) => REASON_PRIORITY[a.reasonCode] - REASON_PRIORITY[b.reasonCode])[0]!;
     return {
       satisfied: false,
-      reasonCode: partial ? "pending" : "evidence_invalid",
-      reason: partial
-        ? `every record for ${id} is only partially valid; re-verification is still pending`
-        : `every record for ${id} is invalid`,
+      reasonCode: rejection.reasonCode,
+      reason: rejection.reason,
       independenceSatisfied: vacuousIndependence,
       evidenceIds,
     };
-  }
-
-  const fingerprint = context.input.workspaceFingerprint;
-  let usable = valid;
-  if (fingerprint !== undefined) {
-    usable = valid.filter((record) => {
-      const observed = record.independence.environmentFingerprint;
-      // An unknown fingerprint cannot disqualify the record, so it is kept.
-      return observed === undefined || observed === fingerprint;
-    });
-    if (usable.length === 0) {
-      return {
-        satisfied: false,
-        reasonCode: "workspace_changed",
-        reason: `evidence for ${id} was observed in a workspace other than the one being proved`,
-        achievedLevel: highestLevel(valid.map((record) => record.level)),
-        independenceSatisfied: vacuousIndependence,
-        evidenceIds,
-      };
-    }
   }
 
   const achievedLevel = highestLevel(usable.map((record) => record.level));
@@ -202,7 +272,8 @@ function evaluateEvidence(context: EvaluationContext, condition: CompletionCondi
     };
   }
 
-  if (condition.requiresIndependence && !qualifying.some(satisfiesIndependence)) {
+  const supporting = condition.requiresIndependence ? qualifying.filter(satisfiesIndependence) : qualifying;
+  if (supporting.length === 0) {
     return {
       satisfied: false,
       reasonCode: "not_independent",
@@ -218,10 +289,10 @@ function evaluateEvidence(context: EvaluationContext, condition: CompletionCondi
   return {
     satisfied: true,
     reasonCode: "satisfied",
-    reason: `${id} is satisfied by ${qualifying.length} record(s), highest level ${achievedLevel}`,
-    achievedLevel,
+    reason: `${id} is satisfied by ${supporting.length} record(s), highest level ${highestLevel(supporting.map((record) => record.level))}`,
+    achievedLevel: highestLevel(supporting.map((record) => record.level)),
     independenceSatisfied: true,
-    evidenceIds,
+    evidenceIds: supporting.map((record) => record.evidenceId).slice(0, 128),
   };
 }
 

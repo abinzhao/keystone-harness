@@ -10,6 +10,7 @@ import {
   type EvidenceRecord,
   type IndependenceTarget,
   type OutcomeContract,
+  type VerifierRef,
 } from "@keystone/schemas";
 
 import { detectCycles, evaluateCompletion } from "../src/proof/evaluate.ts";
@@ -18,6 +19,7 @@ import { renderProofPackage } from "../src/proof/package.ts";
 
 const ISO = "2026-10-19T06:00:00.000Z";
 const FP = "a".repeat(64);
+const BRANCH = newId("branch");
 
 interface ConditionSpec {
   readonly conditionId: string;
@@ -25,6 +27,7 @@ interface ConditionSpec {
   readonly requiresIndependence?: boolean;
   readonly required?: boolean;
   readonly dependsOn?: string[];
+  readonly verifier?: VerifierRef;
 }
 
 /**
@@ -35,12 +38,13 @@ function makeContract(options: {
   readonly conditions: readonly ConditionSpec[];
   readonly scopeInclude?: readonly string[];
   readonly scopeUnknown?: readonly string[];
+  readonly version?: number;
 }): OutcomeContract {
   const taskId = newId("task");
   const projectId = newId("proj");
   return outcomeContractSchema.parse({
     contractId: newId("contract"),
-    version: 1,
+    version: options.version ?? 1,
     taskId,
     projectId,
     createdAt: ISO,
@@ -59,7 +63,7 @@ function makeContract(options: {
     completionConditions: options.conditions.map((spec) => ({
       conditionId: spec.conditionId,
       description: `check ${spec.conditionId}`,
-      verifier: { kind: "test" as const, id: "verifier.test", version: "1.0.0" },
+      verifier: spec.verifier ?? { kind: "test" as const, id: "verifier.test", version: "1.0.0" },
       minEvidenceLevel: spec.minEvidenceLevel ?? "E2",
       requiresIndependence: spec.requiresIndependence ?? false,
       required: spec.required ?? true,
@@ -104,12 +108,11 @@ function makeEvidence(
     readonly incomplete?: readonly string[];
   },
 ): EvidenceRecord {
-  const branchId = newId("branch");
   const evidenceId = newId("evd");
   return evidenceRecordSchema.parse({
     evidenceId,
     taskId: contract.taskId,
-    branchId,
+    branchId: BRANCH,
     conditionIds: [...options.conditionIds],
     level: options.level ?? "E2",
     producer: { kind: "verifier", id: "verifier.test", version: "1.0.0" },
@@ -153,7 +156,7 @@ test("all required conditions proven by E2 evidence within scope", () => {
 
   const decision = evaluateCompletion({
     contract,
-    branchId: newId("branch"),
+    branchId: BRANCH,
     changedPaths: ["src/auth/session.ts"],
     workspaceFingerprint: FP,
     evidence,
@@ -172,7 +175,7 @@ test("E0 evidence can never satisfy a condition", () => {
   });
   const decision = evaluateCompletion({
     contract,
-    branchId: newId("branch"),
+    branchId: BRANCH,
     changedPaths: ["src/a.ts"],
     evidence: [makeEvidence(contract, { conditionIds: ["cond.a"], level: "E0" })],
   });
@@ -187,7 +190,7 @@ test("E0 evidence can never satisfy a condition", () => {
   });
   const e0Decision = evaluateCompletion({
     contract: e0Contract,
-    branchId: newId("branch"),
+    branchId: BRANCH,
     changedPaths: ["src/a.ts"],
     evidence: [makeEvidence(e0Contract, { conditionIds: ["cond.b"], level: "E0" })],
   });
@@ -200,7 +203,7 @@ test("an invalid evidence record yields evidence_invalid", () => {
   const contract = makeContract({ conditions: [{ conditionId: "cond.tests" }] });
   const decision = evaluateCompletion({
     contract,
-    branchId: newId("branch"),
+    branchId: BRANCH,
     changedPaths: ["src/a.ts"],
     evidence: [makeEvidence(contract, { conditionIds: ["cond.tests"], status: "invalid" })],
   });
@@ -215,7 +218,7 @@ test("independence requirement rejects same-process and unenumerated verifiers",
   });
   const first = evaluateCompletion({
     contract: sameProcess,
-    branchId: newId("branch"),
+    branchId: BRANCH,
     changedPaths: ["src/a.ts"],
     evidence: [
       makeEvidence(sameProcess, {
@@ -231,7 +234,7 @@ test("independence requirement rejects same-process and unenumerated verifiers",
 
   const second = evaluateCompletion({
     contract: sameProcess,
-    branchId: newId("branch"),
+    branchId: BRANCH,
     changedPaths: ["src/a.ts"],
     evidence: [
       makeEvidence(sameProcess, {
@@ -251,7 +254,7 @@ test("changed paths outside the contract scope force scope_exceeded", () => {
   });
   const decision = evaluateCompletion({
     contract,
-    branchId: newId("branch"),
+    branchId: BRANCH,
     changedPaths: ["src/a.ts", "lib/other.ts"],
     evidence: [makeEvidence(contract, { conditionIds: ["cond.tests"] })],
   });
@@ -264,7 +267,7 @@ test("an explicit verifier failure overrides passing evidence", () => {
   const contract = makeContract({ conditions: [{ conditionId: "cond.tests" }] });
   const decision = evaluateCompletion({
     contract,
-    branchId: newId("branch"),
+    branchId: BRANCH,
     changedPaths: ["src/a.ts"],
     evidence: [makeEvidence(contract, { conditionIds: ["cond.tests"] })],
     verifierFailures: [{ conditionId: "cond.tests", detail: "assertion failed in session.test.ts" }],
@@ -292,7 +295,7 @@ test("a dependsOn cycle is not provable and is reported", () => {
 
   const decision = evaluateCompletion({
     contract,
-    branchId: newId("branch"),
+    branchId: BRANCH,
     changedPaths: ["src/a.ts"],
     evidence,
   });
@@ -320,7 +323,7 @@ test("buildProofGraph structures nodes, edges and a stable content hash", () => 
   ];
   const input = {
     contract,
-    branchId: newId("branch"),
+    branchId: BRANCH,
     changedPaths: ["src/a.ts"],
     workspaceFingerprint: FP,
     evidence,
@@ -362,7 +365,7 @@ test("renderProofPackage produces deterministic, redactable packages", () => {
   ];
   const graph = buildProofGraph({
     contract,
-    branchId: newId("branch"),
+    branchId: BRANCH,
     changedPaths: ["src/a.ts"],
     workspaceFingerprint: FP,
     evidence,
@@ -386,7 +389,7 @@ test("renderProofPackage produces deterministic, redactable packages", () => {
   // A not-proven graph still renders a human-readable summary.
   const notProvenGraph = buildProofGraph({
     contract: makeContract({ conditions: [{ conditionId: "cond.tests" }] }),
-    branchId: newId("branch"),
+    branchId: BRANCH,
     changedPaths: ["src/a.ts"],
     workspaceFingerprint: FP,
     evidence: [],
@@ -412,4 +415,264 @@ test("renderProofPackage produces deterministic, redactable packages", () => {
   assert.equal(redacted.projectRules[0]?.statement, "<redacted>");
   assert.equal(redacted.contextDecisions[0]?.note, "<redacted>");
   assert.ok(redacted.residualRisks.some((risk) => risk.includes("metadata-only")));
+});
+
+const identityMismatches: {
+  name: string;
+  change: (record: EvidenceRecord) => Record<string, unknown>;
+  reason: RegExp;
+}[] = [
+  { name: "foreign task", change: () => ({ taskId: newId("task") }), reason: /task/ },
+  { name: "foreign branch", change: () => ({ branchId: newId("branch") }), reason: /branch/ },
+  { name: "foreign contract", change: () => ({ contractId: newId("contract") }), reason: /contract/ },
+  { name: "earlier revision", change: () => ({ contractVersion: 1 }), reason: /revision/ },
+  { name: "future revision", change: () => ({ contractVersion: 3 }), reason: /revision/ },
+  {
+    name: "foreign producer ID",
+    change: (record) => ({ producer: { ...record.producer, id: "verifier.foreign" } }),
+    reason: /producer/,
+  },
+  {
+    name: "foreign producer version",
+    change: (record) => ({ producer: { ...record.producer, version: "2.0.0" } }),
+    reason: /producer/,
+  },
+  ...(["tool", "model", "external", "user"] as const).map((kind) => ({
+    name: `${kind} masquerading as a local verifier`,
+    change: (record: EvidenceRecord) => ({ producer: { ...record.producer, kind } }),
+    reason: /producer/,
+  })),
+];
+
+for (const { name, change, reason } of identityMismatches) {
+  test(`proof admission rejects schema-valid ${name} without rewriting history`, () => {
+    const contract = makeContract({ conditions: [{ conditionId: "cond.tests" }], version: 2 });
+    const original = makeEvidence(contract, { conditionIds: ["cond.tests"], environmentFingerprint: FP });
+    const record = evidenceRecordSchema.parse({ ...original, ...change(original) }) as EvidenceRecord;
+    const before = structuredClone(record);
+    const input = {
+      contract, branchId: BRANCH, changedPaths: ["src/a.ts"], workspaceFingerprint: FP, evidence: [record],
+    };
+    const decision = evaluateCompletion(input);
+    assert.equal(decision.outcome, "not_proven");
+    assert.equal(decision.conditionResults[0]?.reasonCode, "evidence_invalid");
+    assert.match(decision.conditionResults[0]?.reason ?? "", reason);
+
+    const graph = buildProofGraph(input);
+    assert.deepEqual(graph.decision, decision);
+    const evidenceNode = graph.nodes.find((node) => node.kind === "evidence");
+    assert.equal(evidenceNode?.status, "invalid");
+    assert.match(evidenceNode?.reason ?? "", reason);
+    assert.ok(!graph.edges.some((edge) => edge.from === evidenceNode?.nodeId && edge.relation === "supports"));
+    const pkg = renderProofPackage({ ...input, graph });
+    assert.equal(pkg.outcome, "not_proven");
+    assert.equal(pkg.evidenceIndex[0]?.status, "invalid");
+    assert.ok(pkg.unverified.some((item) => item.includes(record.evidenceId)));
+    assert.deepEqual(record, before);
+  });
+}
+
+const provenanceMismatches: {
+  name: string;
+  change: (record: EvidenceRecord) => Record<string, unknown>;
+}[] = [
+  {
+    name: "actual evidence invalidation despite a valid status",
+    change: () => ({ invalidatedBy: ["workspace_changed"] }),
+  },
+  {
+    name: "actual evidence invalidation timestamp despite a valid status",
+    change: () => ({ invalidatedAt: ISO }),
+  },
+  ...(["untrusted", "observed"] as const).map((trustLevel) => ({
+    name: `${trustLevel} required evidence`,
+    change: (record: EvidenceRecord) => ({ provenance: { ...record.provenance, trustLevel } }),
+  })),
+  ...(["model", "tool", "web", "issue", "extension", "experience", "repository", "user", "imported_contract", "system"] as const)
+    .map((sourceKind) => ({
+      name: `${sourceKind} provenance masquerading as verified verifier output`,
+      change: (record: EvidenceRecord) => ({ provenance: { ...record.provenance, sourceKind } }),
+    })),
+  {
+    name: "provenance bound to a different snapshot",
+    change: (record) => ({ provenance: { ...record.provenance, applicableSnapshot: newId("snap") } }),
+  },
+];
+
+for (const { name, change } of provenanceMismatches) {
+  test(`proof admission rejects ${name}`, () => {
+    const contract = makeContract({ conditions: [{ conditionId: "cond.tests" }] });
+    const original = makeEvidence(contract, { conditionIds: ["cond.tests"] });
+    const record = evidenceRecordSchema.parse({ ...original, ...change(original) }) as EvidenceRecord;
+    const input = { contract, branchId: BRANCH, changedPaths: [], evidence: [record] };
+    const decision = evaluateCompletion(input);
+    assert.equal(decision.outcome, "not_proven");
+    assert.equal(decision.conditionResults[0]?.reasonCode, "evidence_invalid");
+  });
+}
+
+test("normal runtime provenance triggers are not actual invalidations", () => {
+  const contract = makeContract({ conditions: [{ conditionId: "cond.tests" }] });
+  const original = makeEvidence(contract, { conditionIds: ["cond.tests"], environmentFingerprint: FP });
+  const record = evidenceRecordSchema.parse({
+    ...original,
+    provenance: {
+      ...original.provenance,
+      applicableSnapshot: original.workspaceSnapshotId,
+      invalidatedBy: ["workspace.changed", "verifier.changed"],
+      transformation: "verification-run",
+    },
+  }) as EvidenceRecord;
+  const input = { contract, branchId: BRANCH, changedPaths: [], workspaceFingerprint: FP, evidence: [record] };
+  assert.equal(evaluateCompletion(input).outcome, "proven");
+  const graph = buildProofGraph(input);
+  assert.equal(graph.nodes.find((node) => node.kind === "evidence")?.status, "supported");
+  assert.equal(renderProofPackage({ ...input, graph }).evidenceIndex[0]?.status, "valid");
+});
+
+test("an incomplete required observation is pending in completion and export", () => {
+  const contract = makeContract({ conditions: [{ conditionId: "cond.tests" }] });
+  const record = makeEvidence(contract, {
+    conditionIds: ["cond.tests"], environmentFingerprint: FP, incomplete: ["regression case did not run"],
+  });
+  const before = structuredClone(record);
+  const input = { contract, branchId: BRANCH, changedPaths: [], workspaceFingerprint: FP, evidence: [record] };
+  const decision = evaluateCompletion(input);
+  assert.equal(decision.outcome, "not_proven");
+  assert.equal(decision.conditionResults[0]?.reasonCode, "pending");
+  assert.match(decision.conditionResults[0]?.reason ?? "", /regression case did not run/);
+  const graph = buildProofGraph(input);
+  assert.deepEqual(graph.decision, decision);
+  assert.equal(graph.nodes.find((node) => node.kind === "evidence")?.status, "pending");
+  const pkg = renderProofPackage({ ...input, graph });
+  assert.equal(pkg.outcome, "not_proven");
+  assert.equal(pkg.evidenceIndex[0]?.status, "partially_invalid");
+  assert.ok(pkg.unverified.some((item) => item.includes("regression case did not run")));
+  assert.deepEqual(record, before);
+});
+
+for (const fingerprint of [undefined, "b".repeat(64)]) {
+  test(`current proof rejects ${fingerprint === undefined ? "unknown" : "stale"} workspace fingerprints`, () => {
+    const contract = makeContract({ conditions: [{ conditionId: "cond.tests" }] });
+    const record = makeEvidence(contract, {
+      conditionIds: ["cond.tests"],
+      ...(fingerprint === undefined ? {} : { environmentFingerprint: fingerprint }),
+    });
+    const input = { contract, branchId: BRANCH, changedPaths: [], workspaceFingerprint: FP, evidence: [record] };
+    const decision = evaluateCompletion(input);
+    assert.equal(decision.outcome, "not_proven");
+    assert.equal(decision.conditionResults[0]?.reasonCode, "workspace_changed");
+    const graph = buildProofGraph(input);
+    assert.deepEqual(graph.decision, decision);
+    assert.equal(graph.nodes.find((node) => node.kind === "evidence")?.status, "invalid");
+    const pkg = renderProofPackage({ ...input, graph, environment: { workspaceFingerprint: FP } });
+    assert.equal(pkg.outcome, "not_proven");
+    assert.equal(pkg.evidenceIndex[0]?.status, "invalid");
+    assert.equal(record.status, "valid");
+  });
+}
+
+test("historical proof without a current fingerprint remains replayable", () => {
+  const contract = makeContract({ conditions: [{ conditionId: "cond.tests" }] });
+  const record = makeEvidence(contract, { conditionIds: ["cond.tests"] });
+  const input = { contract, branchId: BRANCH, changedPaths: [], evidence: [record] };
+  assert.equal(evaluateCompletion(input).outcome, "proven");
+  assert.equal(buildProofGraph(input).decision.outcome, "proven");
+});
+
+test("a newer verifier failure supersedes an older pass in completion and exported support", () => {
+  const contract = makeContract({ conditions: [{ conditionId: "cond.tests" }] });
+  const pass = makeEvidence(contract, { conditionIds: ["cond.tests"], environmentFingerprint: FP });
+  const failure = evidenceRecordSchema.parse({
+    ...makeEvidence(contract, { conditionIds: ["cond.tests"], environmentFingerprint: FP, status: "invalid" }),
+    invalidatedBy: ["verifier.reported_failure"],
+  }) as EvidenceRecord;
+  const input = { contract, branchId: BRANCH, changedPaths: [], workspaceFingerprint: FP, evidence: [pass, failure] };
+  assert.equal(evaluateCompletion(input).outcome, "not_proven");
+  const graph = buildProofGraph(input);
+  assert.equal(renderProofPackage({ ...input, graph }).outcome, "not_proven");
+  assert.equal(graph.edges.filter((edge) => edge.relation === "supports").length, 0);
+  const foreign = evidenceRecordSchema.parse({ ...failure, taskId: newId("task") }) as EvidenceRecord;
+  assert.equal(evaluateCompletion({ ...input, evidence: [pass, foreign] }).outcome, "proven");
+  const repaired = makeEvidence(contract, { conditionIds: ["cond.tests"], environmentFingerprint: FP });
+  assert.equal(evaluateCompletion({ ...input, evidence: [pass, failure, repaired] }).outcome, "proven");
+});
+
+test("foreign high-level evidence cannot supply independence or appear as current support", () => {
+  const contract = makeContract({
+    conditions: [{ conditionId: "cond.tests", minEvidenceLevel: "E3", requiresIndependence: true }],
+  });
+  const local = makeEvidence(contract, {
+    conditionIds: ["cond.tests"], level: "E3", mode: "same_process", independentOf: [],
+  });
+  const foreign = evidenceRecordSchema.parse({
+    ...makeEvidence(contract, { conditionIds: ["cond.tests"], level: "E4" }),
+    branchId: newId("branch"),
+  }) as EvidenceRecord;
+  const input = { contract, branchId: BRANCH, changedPaths: [], evidence: [local, foreign] };
+  assert.equal(evaluateCompletion(input).conditionResults[0]?.reasonCode, "not_independent");
+
+  const independent = evidenceRecordSchema.parse({
+    ...local, independence: { mode: "separate_process", independentOf: ["builder_loop_process"] },
+  }) as EvidenceRecord;
+  const result = evaluateCompletion({ ...input, evidence: [independent, foreign] });
+  assert.equal(result.outcome, "proven");
+  assert.equal(result.conditionResults[0]?.achievedLevel, "E3");
+  assert.deepEqual(result.conditionResults[0]?.evidenceIds, [independent.evidenceId]);
+});
+
+test("a record supporting two conditions is admitted only for its declared verifier", () => {
+  const contract = makeContract({
+    conditions: [
+      { conditionId: "cond.tests" },
+      { conditionId: "cond.lint", verifier: { kind: "lint", id: "verifier.lint", version: "1.0.0" } },
+    ],
+  });
+  const record = makeEvidence(contract, { conditionIds: ["cond.tests", "cond.lint"], environmentFingerprint: FP });
+  const input = { contract, branchId: BRANCH, changedPaths: [], workspaceFingerprint: FP, evidence: [record] };
+  const graph = buildProofGraph(input);
+  assert.equal(graph.decision.outcome, "not_proven");
+  assert.equal(graph.decision.conditionResults[0]?.satisfied, true);
+  assert.equal(graph.decision.conditionResults[1]?.reasonCode, "evidence_invalid");
+  const supported = graph.edges.filter((edge) => edge.relation === "supports").map((edge) => edge.to);
+  assert.deepEqual(supported, [proofNodeId("condition", "cond.tests")]);
+});
+
+test("an auxiliary incomplete observation stays disclosed without blocking complete required evidence", () => {
+  const contract = makeContract({
+    conditions: [{ conditionId: "cond.tests" }, { conditionId: "cond.aux", required: false, minEvidenceLevel: "E1" }],
+  });
+  const complete = makeEvidence(contract, { conditionIds: ["cond.tests"], environmentFingerprint: FP });
+  const auxiliary = evidenceRecordSchema.parse({
+    ...makeEvidence(contract, {
+      conditionIds: ["cond.aux"], level: "E1", environmentFingerprint: FP, incomplete: ["optional check skipped"],
+    }),
+    provenance: { ...complete.provenance, trustLevel: "observed" },
+  }) as EvidenceRecord;
+  const input = { contract, branchId: BRANCH, changedPaths: [], workspaceFingerprint: FP, evidence: [complete, auxiliary] };
+  const graph = buildProofGraph(input);
+  assert.equal(graph.decision.outcome, "proven");
+  assert.equal(graph.decision.conditionResults[1]?.satisfied, true);
+  assert.ok(renderProofPackage({ ...input, graph }).unverified.some((item) => item.includes("optional check skipped")));
+});
+
+test("external CI proof requires the declared producer and trusted system provenance", () => {
+  const contract = makeContract({
+    conditions: [{
+      conditionId: "cond.ci", minEvidenceLevel: "E4", requiresIndependence: true,
+      verifier: { kind: "external_ci", id: "ci.test", version: "1.0.0" },
+    }],
+  });
+  const original = makeEvidence(contract, { conditionIds: ["cond.ci"], level: "E4", mode: "external_service" });
+  const record = evidenceRecordSchema.parse({
+    ...original,
+    producer: { kind: "external", id: "ci.test", version: "1.0.0" },
+    provenance: { ...original.provenance, sourceKind: "system" },
+  }) as EvidenceRecord;
+  const input = { contract, branchId: BRANCH, changedPaths: [], evidence: [record] };
+  assert.equal(evaluateCompletion(input).outcome, "proven");
+  const untrusted = evidenceRecordSchema.parse({
+    ...record, provenance: { ...record.provenance, trustLevel: "untrusted" },
+  }) as EvidenceRecord;
+  assert.equal(evaluateCompletion({ ...input, evidence: [untrusted] }).outcome, "not_proven");
 });

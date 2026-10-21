@@ -8,6 +8,7 @@
  */
 
 import type { ModelDescriptor } from "@keystone/schemas";
+import { assertModelContent, mapContent } from "./content.ts";
 
 import { ModelProtocolError } from "./types.ts";
 import type {
@@ -37,6 +38,7 @@ export function createOpenAiResponsesAdapter(options: OpenAiResponsesOptions): M
     descriptor,
 
     async complete(request: ModelRequest): Promise<ModelResponse> {
+      assertModelContent(descriptor, request);
       const secret = await resolveCallSecret(descriptor, credentials);
       const json = await callProvider({
         descriptor,
@@ -47,7 +49,7 @@ export function createOpenAiResponsesAdapter(options: OpenAiResponsesOptions): M
           model: descriptor.modelName,
           input: request.messages.map((message) => ({
             role: message.role,
-            content: message.content,
+            content: typeof message.content === "string" ? message.content : mapContent(message.content, "openai-responses"),
           })),
           ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
           ...(request.maxTokens === undefined ? {} : { max_output_tokens: request.maxTokens }),

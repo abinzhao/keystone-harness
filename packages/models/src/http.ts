@@ -38,12 +38,14 @@ export async function postJsonBody(
   }, call.timeoutMs);
   const onExternalAbort = (): void => controller.abort();
   call.signal?.addEventListener("abort", onExternalAbort, { once: true });
+  if (call.signal?.aborted) controller.abort();
   try {
     const response = await (call.fetchImpl ?? fetch)(call.url, {
       method: "POST",
       headers: { "content-type": "application/json", ...call.headers },
       body: JSON.stringify(call.body),
       signal: controller.signal,
+      redirect: "error",
     });
     const json = (await response.json().catch(() => ({}))) as Record<string, unknown>;
     return { status: response.status, json };
@@ -104,7 +106,7 @@ function statusRetriable(status: number): boolean {
 
 /** Last line of defence: nothing that leaves an adapter contains the secret. */
 export function redactSecret(message: string, secret: string): string {
-  if (secret.length < 8) return message;
+  if (secret.length === 0) return message;
   return message.split(secret).join("<redacted>");
 }
 

@@ -117,3 +117,21 @@ test("detectProjectProfile marks an absent command as unrecognized without guess
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("project command uses the detected npm/yarn manager and cannot guess a missing manager", async () => {
+  for (const [lock, expected] of [
+    ["package-lock.json", "npm run test"],
+    ["yarn.lock", "yarn run test"],
+    ["", undefined],
+  ] as const) {
+    const dir = await tempDir("keystone-profile-manager-");
+    try {
+      await writeFile(join(dir, "package.json"), JSON.stringify({ scripts: { test: "node --test" } }));
+      if (lock) await writeFile(join(dir, lock), "{}");
+      const profile = await detectProjectProfile(dir, newId("proj") as ProjectId);
+      assert.equal(profile.commands.find((entry) => entry.kind === "test")?.command, expected);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});

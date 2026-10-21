@@ -7,9 +7,11 @@ import test from "node:test";
 import {
   newId,
   nowIso,
+  outcomeContractSchema,
   projectFactSchema,
   type BranchId,
   type EvidenceRecord,
+  type OutcomeContract,
   type ProjectFact,
   type ProjectId,
   type Sha256Hex,
@@ -23,6 +25,9 @@ import { ProjectFactStore, resolveConflict } from "../src/project/model.ts";
 import { createProvenance, deriveProvenance } from "../src/provenance/registry.ts";
 import { recordEvidence, listEvidence, getEvidence, type RecordEvidenceInput } from "../src/evidence/store.ts";
 import { computeWorkspaceInvalidation, invalidateByTrigger } from "../src/evidence/invalidate.ts";
+import { evaluateCompletion } from "../src/proof/evaluate.ts";
+import { buildProofGraph } from "../src/proof/graph.ts";
+import { renderProofPackage } from "../src/proof/package.ts";
 
 async function tempDir(prefix: string): Promise<string> {
   return mkdtemp(join(tmpdir(), prefix));
@@ -330,6 +335,91 @@ test("invalidateByTrigger('verifier_changed') only affects verifier evidence", a
     // The caller's original records must not be mutated.
     const originalVerifier = records.find((record) => record.producer.kind === "verifier");
     assert.equal(originalVerifier?.status, "valid");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+function contractForRecord(record: EvidenceRecord): OutcomeContract {
+  const projectId = newId("proj");
+  const budget = { maxTokens: 1000, maxWallClockMs: 60_000, maxRetries: 1 };
+  return outcomeContractSchema.parse({
+    contractId: record.contractId,
+    version: record.contractVersion,
+    taskId: record.taskId,
+    projectId,
+    createdAt: record.createdAt,
+    createdBy: "kernel",
+    goal: "Prove the current workspace",
+    scope: { include: [{ kind: "glob", pattern: "src/**", intent: "write" }], exclude: [], unknown: [] },
+    invariants: [],
+    completionConditions: [{
+      conditionId: "cond.tests_pass", description: "Tests pass",
+      verifier: { kind: "test", id: record.producer.id, version: record.producer.version },
+      minEvidenceLevel: "E2", requiresIndependence: true, required: true,
+    }],
+    budget,
+    autonomy: {
+      projectId, readPaths: ["**"], writePaths: ["src/**"], allowedCommands: ["pnpm"],
+      allowedHosts: [], allowedCredentials: [], externalSystems: "none",
+      maxReversibility: "reversible", untrustedContentEgress: "deny_all",
+      budget, updatedAt: record.createdAt, updatedBy: "user", widenedBy: [],
+    },
+    uncertainties: [], interventionTriggers: ["ambiguity"],
+    exitConditions: [{ exitId: "exit.budget", kind: "budget_exhausted", description: "Budget exhausted" }],
+    status: "ready", schemaVersion: "keystone.contract.outcome@1.0.0",
+  }) as OutcomeContract;
+}
+
+test("current proof projection invalidates stale persisted evidence without changing the stored record", async () => {
+  const dir = await tempDir("keystone-proof-projection-");
+  try {
+    const paths = resolveKeystonePaths(dir);
+    const taskId = newId("task") as TaskId;
+    const branchId = newId("branch") as BranchId;
+    const fingerprint = "a".repeat(64);
+    const record = await recordEvidence(paths, {
+      ...evidenceInput(taskId, branchId, "verifier"),
+      contractId: newId("contract"),
+      independence: {
+        mode: "separate_process", independentOf: ["builder_loop_process"], environmentFingerprint: fingerprint,
+      },
+    });
+    const contract = contractForRecord(record);
+    const input = { contract, branchId, changedPaths: ["src/index.ts"], evidence: [record] };
+    const historical = buildProofGraph({ ...input, workspaceFingerprint: fingerprint });
+    assert.equal(historical.decision.outcome, "proven");
+    const current = buildProofGraph({ ...input, workspaceFingerprint: "b".repeat(64) });
+    const pkg = renderProofPackage({ ...input, graph: current });
+    assert.equal(current.decision.outcome, "not_proven");
+    assert.equal(pkg.evidenceIndex[0]?.status, "invalid");
+    assert.equal(historical.nodes.find((node) => node.kind === "evidence")?.status, "supported");
+    assert.notEqual(current.contentHash, historical.contentHash);
+    assert.deepEqual(await getEvidence(paths, taskId, record.evidenceId), record);
+    assert.equal(record.status, "valid");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("persisted earlier-revision evidence is retained but not silently reused", async () => {
+  const dir = await tempDir("keystone-proof-revision-");
+  try {
+    const paths = resolveKeystonePaths(dir);
+    const taskId = newId("task") as TaskId;
+    const branchId = newId("branch") as BranchId;
+    const record = await recordEvidence(paths, {
+      ...evidenceInput(taskId, branchId, "verifier"), contractId: newId("contract"),
+    });
+    const contract = contractForRecord(record);
+    const input = { contract, branchId, changedPaths: [], evidence: [record] };
+    assert.equal(evaluateCompletion(input).outcome, "proven");
+    const revised = outcomeContractSchema.parse({ ...contract, version: 2 }) as OutcomeContract;
+    const current = evaluateCompletion({ ...input, contract: revised });
+    assert.equal(current.outcome, "not_proven");
+    assert.equal(current.conditionResults[0]?.reasonCode, "evidence_invalid");
+    assert.match(current.conditionResults[0]?.reason ?? "", /revision/);
+    assert.deepEqual(await listEvidence(paths, taskId), [record]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

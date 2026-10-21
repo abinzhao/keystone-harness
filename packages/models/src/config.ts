@@ -26,11 +26,15 @@ import { createGeminiGenerateAdapter } from "./gemini-generate.ts";
 import { createOpenAiCompatibleAdapter } from "./openai.ts";
 import { createOpenAiResponsesAdapter } from "./openai-responses.ts";
 import { MODEL_PROTOCOLS, presetFor } from "./providers.ts";
+import type { FetchLike } from "./http.ts";
 import type { CredentialResolver, ModelAdapter, ModelRole } from "./types.ts";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, open, readFile, rename, rmdir, unlink } from "node:fs/promises";
+import { dirname } from "node:path";
 
 export const modelConfigEntrySchema = defineSchema(
   "keystone.config.model",
-  "2.0.0",
+  "2.1.0",
   objectOf({
     id: str({ pattern: /^[a-z0-9][a-z0-9._-]{0,63}$/ }),
     kind: enumOf(["cloud", "local"] as const),
@@ -48,6 +52,8 @@ export const modelConfigEntrySchema = defineSchema(
     credentialHandle: optional(str({ pattern: /^[a-z0-9][a-z0-9._-]{1,63}$/ })),
     endpointHost: nonEmptyStr(),
     contextTokens: optional(int({ min: 1 })),
+    /** User declaration, not inferred from provider/protocol or model name. */
+    multimodal: optional(bool()),
     /** Enabled by default; a disabled entry stays visible but is not routed. */
     enabled: bool(),
   }),
@@ -55,7 +61,7 @@ export const modelConfigEntrySchema = defineSchema(
 
 export const keystoneConfigSchema = defineSchema(
   "keystone.config",
-  "2.0.0",
+  "2.1.0",
   objectOf({
     schemaVersion: nonEmptyStr(),
     /**
@@ -101,24 +107,132 @@ export interface ConfigLocation {
 }
 
 export async function loadConfig(location: ConfigLocation): Promise<KeystoneConfig> {
-  const { readFile } = await import("node:fs/promises");
-  try {
-    const text = await readFile(location.configFile, "utf8");
-    return keystoneConfigSchema.parse(JSON.parse(text));
-  } catch (error) {
-    if (isMissing(error)) return defaultConfig();
-    throw error;
-  }
+  return (await loadConfigSnapshot(location)).config;
 }
 
 export async function saveConfig(
   location: ConfigLocation,
   config: KeystoneConfig,
 ): Promise<void> {
-  const { mkdir, writeFile } = await import("node:fs/promises");
-  const { dirname } = await import("node:path");
+  const parsed = parseConfig(config);
+  await withConfigLock(location, () => writeConfigAtomic(location, parsed));
+}
+
+export interface ConfigSnapshot {
+  readonly revision: string;
+  readonly config: KeystoneConfig;
+}
+
+export class ConfigConflictError extends Error {
+  readonly revision: string;
+  constructor(revision: string) {
+    super("configuration changed; reload settings before saving");
+    this.name = "ConfigConflictError";
+    this.revision = revision;
+  }
+}
+
+function revisionFor(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+function parseConfig(value: unknown): KeystoneConfig {
+  const config = keystoneConfigSchema.parse(value);
+  if (!["keystone.config@1.0.0", "keystone.config@2.0.0", "keystone.config@2.1.0"].includes(config.schemaVersion)) {
+    throw new Error("unsupported configuration version; preserve the source for export");
+  }
+  return config;
+}
+
+export function validateConfigUpdate(value: unknown): KeystoneConfig {
+  const config = parseConfig(value);
+  const ids = new Set(config.models.map((entry) => entry.id));
+  if (ids.size !== config.models.length) throw new Error("duplicate model IDs");
+  for (const route of Object.values(config.routes ?? {})) {
+    if (route?.some((id) => !ids.has(id))) throw new Error("route references an unknown model");
+  }
+  for (const entry of config.models) {
+    if (entry.baseUrl !== undefined) {
+      const endpoint = new URL(normalizeModelEndpoint(entry.baseUrl));
+      if (entry.endpointHost !== endpoint.host) throw new Error("endpointHost must match baseUrl");
+      if (entry.kind === "local" && !isLoopbackEndpoint(endpoint)) throw new Error("local models require a loopback endpoint");
+    }
+  }
+  return config;
+}
+
+export async function loadConfigSnapshot(location: ConfigLocation): Promise<ConfigSnapshot> {
+  try {
+    const text = await readFile(location.configFile, "utf8");
+    return { revision: revisionFor(text), config: parseConfig(JSON.parse(text)) };
+  } catch (error) {
+    if (isMissing(error)) return { revision: "missing", config: defaultConfig() };
+    throw error;
+  }
+}
+
+export async function saveConfigSnapshot(
+  location: ConfigLocation,
+  input: ConfigSnapshot,
+): Promise<ConfigSnapshot> {
+  const config = validateConfigUpdate(input.config);
+  return withConfigLock(location, async () => {
+    const current = await loadConfigSnapshot(location);
+    if (current.revision !== input.revision) throw new ConfigConflictError(current.revision);
+    await writeConfigAtomic(location, config);
+    return loadConfigSnapshot(location);
+  });
+}
+
+async function withConfigLock<T>(location: ConfigLocation, run: () => Promise<T>): Promise<T> {
   await mkdir(dirname(location.configFile), { recursive: true, mode: 0o700 });
-  await writeFile(location.configFile, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  const lock = `${location.configFile}.lock`;
+  for (let attempt = 0; ; attempt++) {
+    try { await mkdir(lock, { mode: 0o700 }); break; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (attempt >= 100) throw new Error("configuration writer lock is busy; retry or inspect a stale lock");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  try { return await run(); }
+  finally { await rmdir(lock); }
+}
+
+async function writeConfigAtomic(location: ConfigLocation, config: KeystoneConfig): Promise<void> {
+  const temporary = `${location.configFile}.${randomUUID()}.tmp`;
+  try {
+    const file = await open(temporary, "wx", 0o600);
+    try {
+      await file.writeFile(`${JSON.stringify(config, null, 2)}\n`);
+      await file.sync();
+    } finally { await file.close(); }
+    await rename(temporary, location.configFile);
+  } finally { await unlink(temporary).catch((error: unknown) => { if (!isMissing(error)) throw error; }); }
+}
+
+export function normalizeModelEndpoint(value: string): string {
+  let url: URL;
+  try { url = new URL(value.trim()); } catch { throw new Error("baseUrl must be an HTTP(S) endpoint"); }
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new Error("baseUrl must be HTTP(S) without credentials, query or fragment");
+  }
+  return url.href.replace(/\/+$/, "");
+}
+
+function isLoopbackEndpoint(url: URL): boolean {
+  return url.hostname === "localhost" || url.hostname === "[::1]" || /^127\.\d+\.\d+\.\d+$/.test(url.hostname);
+}
+
+export function stableModelId(input: {
+  readonly baseUrl: string; readonly protocol?: string; readonly modelName: string;
+}): string {
+  const protocol = presetFor(input.protocol ?? "openai-chat").protocol;
+  if (!input.modelName.trim()) throw new Error("modelName is required");
+  const hash = createHash("sha256")
+    .update(JSON.stringify([normalizeModelEndpoint(input.baseUrl), protocol, input.modelName.trim()]))
+    .digest("hex");
+  return `model-${hash.slice(0, 40)}`;
 }
 
 /**
@@ -137,11 +251,16 @@ export async function saveConfig(
 export function buildAdapter(
   entry: ModelConfigEntry,
   credentials: CredentialResolver,
+  transport: { readonly fetchImpl?: FetchLike; readonly timeoutMs?: number } = {},
 ): ModelAdapter {
   if (entry.baseUrl === undefined) {
     throw new Error(
       `model "${entry.id}" has no baseUrl; HTTP-served models must configure one`,
     );
+  }
+  const endpoint = new URL(normalizeModelEndpoint(entry.baseUrl));
+  if (entry.kind === "local" && !isLoopbackEndpoint(endpoint)) {
+    throw new Error("local models require a loopback endpoint");
   }
   const protocol = entry.protocol ?? "openai-chat";
   const preset = presetFor(protocol);
@@ -155,6 +274,7 @@ export function buildAdapter(
     protocol,
     capabilities: {
       ...preset.capabilities,
+      multimodal: entry.multimodal ?? false,
       contextTokens: entry.contextTokens ?? preset.capabilities.contextTokens,
     },
     ...(entry.credentialHandle === undefined ? {} : { credentialHandle: entry.credentialHandle }),
@@ -164,7 +284,7 @@ export function buildAdapter(
     },
   };
 
-  const options = { descriptor, credentials, baseUrl: entry.baseUrl };
+  const options = { descriptor, credentials, baseUrl: entry.baseUrl, ...transport };
   switch (protocol) {
     case "openai-responses":
       return createOpenAiResponsesAdapter(options);

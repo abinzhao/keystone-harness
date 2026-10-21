@@ -9,13 +9,15 @@
  * `canSatisfyRequiredCondition: true`, which would let a weak check masquerade as
  * enough to call a task done.
  *
- * The kit does not know how to load a `.ts` entry in this host, so the host
- * supplies a `loadEntry` function. That keeps this module side-effect-free and
- * generic — it is not tied to any single extension.
+ * Trusted fixtures may supply a loader. Local installation uses the separate
+ * bounded child probe below; unknown code never runs in the trusted host.
  */
 
 import { EVIDENCE_LEVELS, VERIFIER_KINDS, levelCanStandAlone } from "@keystone/schemas";
 import type { EvidenceLevel, VerifierKind } from "@keystone/schemas";
+import { spawn } from "node:child_process";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import type { ConformanceProbe } from "./conformance.ts";
 
@@ -160,6 +162,133 @@ export function verifierEntryShapeProbe(options: {
         };
       }
       return inspectVerifierEntry(loaded);
+    },
+  };
+}
+
+export interface IsolatedProbeLimits {
+  readonly timeoutMs?: number;
+  readonly maxOutputBytes?: number;
+}
+
+/** Fixed upper bounds cannot be enlarged by a manifest or caller. */
+export function probeLimits(options: IsolatedProbeLimits): {
+  readonly timeoutMs: number;
+  readonly maxOutputBytes: number;
+} {
+  const timeoutMs = options.timeoutMs ?? 5_000;
+  const maxOutputBytes = options.maxOutputBytes ?? 64 * 1024;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 ||
+      !Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1) {
+    throw new Error("probe limits must be positive safe integers");
+  }
+  return {
+    timeoutMs: Math.min(timeoutMs, 5_000),
+    maxOutputBytes: Math.min(maxOutputBytes, 64 * 1024),
+  };
+}
+
+/** No inherited credentials, NODE_OPTIONS, preload hooks, or user HOME. */
+export function probeEnvironment(workspace: string): Record<string, string> {
+  return {
+    PATH: dirname(process.execPath),
+    HOME: workspace,
+    TMPDIR: workspace,
+    TEMP: workspace,
+    TMP: workspace,
+    NODE_NO_WARNINGS: "1",
+    ...(process.platform === "win32" && process.env.SystemRoot !== undefined
+      ? { SystemRoot: process.env.SystemRoot } : {}),
+  };
+}
+
+/** This is process/Node-permission isolation, not a network or OS sandbox. */
+export function isolatedVerifierEntryShapeProbe(options: IsolatedProbeLimits & {
+  readonly workspace: string;
+  readonly entry: { readonly module: string; readonly export: string };
+}): ConformanceProbe {
+  return {
+    checkId: "entry.verifier_shape",
+    blocking: true,
+    detail: "inspects the copied verifier export in a bounded child, never in the host",
+    async run() {
+      const limits = probeLimits(options);
+      const here = dirname(fileURLToPath(import.meta.url));
+      const packages = resolve(here, "../..");
+      const inspectUrl = import.meta.url;
+      const entryUrl = pathToFileURL(resolve(options.workspace, options.entry.module)).href;
+      const script = [
+        "import { writeFileSync } from 'node:fs';",
+        `import { inspectVerifierEntry } from ${JSON.stringify(inspectUrl)};`,
+        "let result;",
+        "try {",
+        `  const entry = await import(${JSON.stringify(entryUrl)});`,
+        `  result = inspectVerifierEntry(entry[${JSON.stringify(options.entry.export)}]);`,
+        "} catch { result = { passed: false, detail: 'could not load or inspect the copied verifier entry' }; }",
+        "writeFileSync(3, JSON.stringify(result));",
+      ].join("\n");
+      return await new Promise<VerifierEntryInspection>((complete) => {
+        const child = spawn(process.execPath, [
+          "--experimental-permission",
+          `--allow-fs-read=${options.workspace}`,
+          `--allow-fs-write=${options.workspace}`,
+          `--allow-fs-read=${fileURLToPath(import.meta.url)}`,
+          `--allow-fs-read=${resolve(here, "../node_modules/@keystone/schemas")}`,
+          ...["schemas", "kernel", "verifiers", "spawn"].map((name) =>
+            `--allow-fs-read=${resolve(packages, name)}`),
+          "--input-type=module", "--eval", script,
+        ], {
+          cwd: options.workspace,
+          env: probeEnvironment(options.workspace),
+          shell: false,
+          detached: process.platform !== "win32",
+          stdio: ["ignore", "pipe", "pipe", "pipe"],
+        });
+        let bytes = 0;
+        let response = "";
+        let failure: string | undefined;
+        const kill = () => {
+          if (child.pid === undefined) return;
+          try {
+            if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
+            else child.kill("SIGKILL");
+          } catch { child.kill("SIGKILL"); }
+        };
+        const timer = setTimeout(() => {
+          failure = "verifier entry probe timed out";
+          kill();
+        }, limits.timeoutMs);
+        for (const [index, stream] of child.stdio.entries()) {
+          if (index < 1 || stream === null || stream === undefined) continue;
+          stream.on("data", (chunk: Buffer) => {
+            bytes += chunk.byteLength;
+            if (bytes > limits.maxOutputBytes) {
+              failure = "verifier entry probe exceeded its output limit";
+              kill();
+            } else if (index === 3) response += chunk.toString("utf8");
+          });
+        }
+        child.on("error", () => { failure = "could not launch verifier entry probe"; });
+        child.once("close", (code) => {
+          clearTimeout(timer);
+          // Kill any remaining group members before removing the workspace.
+          kill();
+          if (failure !== undefined || code !== 0) {
+            complete({ passed: false, detail: failure ?? "verifier entry probe exited unsuccessfully" });
+            return;
+          }
+          try {
+            const result: unknown = JSON.parse(response);
+            if (!isObject(result) || typeof result.passed !== "boolean" ||
+                typeof result.detail !== "string" || result.detail.length > 1_500) {
+              throw new Error("invalid result");
+            }
+            complete({ passed: result.passed, detail: result.detail });
+          } catch {
+            complete({ passed: false, detail: "verifier entry probe returned no valid inspection result" });
+          }
+        });
+      });
     },
   };
 }

@@ -111,6 +111,16 @@ export function renderProofPackage(input: RenderProofPackageInput): ProofPackage
   const decision = graph.decision;
   const redaction: RedactionMode = input.redaction ?? "none";
   const metadataOnly = redaction === "metadata_only";
+  const evidenceNodes = new Map(
+    graph.nodes.filter((node) => node.kind === "evidence").map((node) => [node.refId, node]),
+  );
+  const projectedStatus = (record: EvidenceRecord): EvidenceRecord["status"] => {
+    const node = evidenceNodes.get(record.evidenceId);
+    if (record.status === "invalid" || node === undefined || node.status === "invalid" || node.status === "unsupported") {
+      return "invalid";
+    }
+    return record.status === "partially_invalid" || node.status === "pending" ? "partially_invalid" : "valid";
+  };
 
   const scopeCheck = checkPaths(input.changedPaths, "write", contract.scope);
   const changes = proofChangesSchema.parse({
@@ -132,6 +142,11 @@ export function renderProofPackage(input: RenderProofPackageInput): ProofPackage
     }
   }
   for (const record of input.evidence) {
+    if (projectedStatus(record) !== "valid") {
+      unverified.push(
+        `evidence ${record.evidenceId} is not current support: ${evidenceNodes.get(record.evidenceId)?.reason ?? "not admitted by the proof graph"}`,
+      );
+    }
     const incomplete = record.observation.incomplete ?? [];
     if (incomplete.length > 0) {
       unverified.push(`evidence ${record.evidenceId} left items unresolved: ${incomplete.join("; ")}`);
@@ -140,7 +155,7 @@ export function renderProofPackage(input: RenderProofPackageInput): ProofPackage
 
   const partiallyInvalidEvidence = new Set(
     input.evidence
-      .filter((record) => record.status === "partially_invalid")
+      .filter((record) => projectedStatus(record) === "partially_invalid")
       .map((record) => record.evidenceId),
   );
   const residualRisks: string[] = [];
@@ -199,7 +214,7 @@ export function renderProofPackage(input: RenderProofPackageInput): ProofPackage
       producerVersion: record.producer.version,
       conditionIds: [...record.conditionIds],
       createdAt: record.createdAt,
-      status: record.status,
+      status: projectedStatus(record),
       independenceMode: record.independence.mode,
     })),
 

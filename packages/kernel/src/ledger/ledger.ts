@@ -10,7 +10,7 @@
 import type { RunEvent, Sha256Hex } from "@keystone/schemas";
 import { canonicalJson, sha256Hex } from "@keystone/schemas";
 
-import { appendLineDurable, readJsonLines } from "../storage/atomic.ts";
+import { appendLineDurable, readJsonLines, withLock } from "../storage/atomic.ts";
 import { verifyStoredEvent, type ChainPosition } from "./events.ts";
 
 export interface LedgerIntegrity {
@@ -40,9 +40,18 @@ export function chainTip(events: readonly RunEvent[]): ChainPosition {
 }
 
 export async function appendEvent(filePath: string, event: RunEvent): Promise<void> {
-  // One write, one line, newline included: a crash leaves either a complete
-  // record or a torn tail that the reader drops.
-  await appendLineDurable(filePath, canonicalJson(event));
+  await withLock(`${filePath}.append.lock`, {}, async () => {
+    const persisted = await readLedger(filePath);
+    if (!persisted.integrity.ok) throw new LedgerIntegrityError(filePath, persisted.integrity);
+    if (persisted.tornTail) throw new Error("ledger has a torn tail; recovery is required before append");
+    const expected = chainTip(persisted.events);
+    if (event.seq !== expected.seq || event.prevHash !== expected.prevHash) {
+      throw new Error("ledger tip differs from the proposed event; refusing stale sequence");
+    }
+    const verified = verifyStoredEvent(event, expected.prevHash);
+    if (!verified.ok) throw new Error(`event cannot be appended: ${verified.reason}`);
+    await appendLineDurable(filePath, canonicalJson(event));
+  });
 }
 
 export function verifyChain(events: readonly RunEvent[]): LedgerIntegrity {

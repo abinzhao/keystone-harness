@@ -32,7 +32,10 @@ export interface ConformanceProbe {
 export interface ConformanceContext {
   readonly manifest: ExtensionManifest;
   readonly integrityVerified: boolean;
+  readonly integrityBasis?: "entry_digest" | "local_path_trust";
   readonly apiVersionSupported?: string;
+  /** Static review must never invoke a loader or any supplied probe. */
+  readonly staticOnly?: boolean;
   /** Behavioural probes supplied by the extension host, when it has one. */
   readonly probes?: readonly ConformanceProbe[];
   /**
@@ -111,7 +114,9 @@ export async function runConformance(context: ConformanceContext): Promise<Confo
       "manifest.integrity",
       context.integrityVerified,
       true,
-      context.integrityVerified
+      context.integrityBasis === "local_path_trust"
+        ? "local-path trust is not a verified content digest; explicit source approval is required"
+        : context.integrityVerified
         ? "the package digest matches the manifest"
         : "the package digest does not match the manifest; the package may have been altered",
     ),
@@ -162,6 +167,15 @@ export async function runConformance(context: ConformanceContext): Promise<Confo
     );
   }
 
+  if (context.staticOnly) {
+    results.push(check(
+      "execution.consent",
+      false,
+      true,
+      "static checks only; explicitly approved bounded probes have not run",
+    ));
+  }
+
   // The generic verifier-entry probe runs automatically when the host can load
   // entries and the manifest declares a verifier. Host-supplied probes still run
   // afterwards, in the order they were given.
@@ -170,7 +184,7 @@ export async function runConformance(context: ConformanceContext): Promise<Confo
       ? [verifierEntryShapeProbe({ manifest: { entry: manifest.entry }, loadEntry: context.entryLoader })]
       : [];
 
-  for (const probe of [...autoProbes, ...(context.probes ?? [])]) {
+  for (const probe of context.staticOnly ? [] : [...autoProbes, ...(context.probes ?? [])]) {
     const outcome = await probe.run();
     results.push(check(probe.checkId, outcome.passed, probe.blocking, outcome.detail));
   }

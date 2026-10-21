@@ -26,6 +26,7 @@ import {
   arrayOf,
   bool,
   defineSchema,
+  contentHash,
   enumOf,
   int,
   objectOf,
@@ -92,10 +93,12 @@ export function assertWithinRoot(rootPath: string, target: string): string {
 export function assertLeaseCovers(
   lease: CapabilityLease,
   requirement: { capability: Capability; resourceValues: readonly string[] },
+  parameters?: unknown,
 ): void {
   const result = validateLease(lease, {
     capability: requirement.capability,
     resourceValues: requirement.resourceValues,
+    ...(parameters === undefined ? {} : { parametersHash: contentHash(parameters) }),
   });
   if (!result.ok) {
     throw new ToolRefusedError(result.denial.detail, result.denial.code);

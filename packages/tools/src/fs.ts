@@ -80,7 +80,7 @@ export const readFileTool: Tool<ReadFileArgs> = {
     const start = Date.now();
     const absolute = assertWithinRoot(ctx.rootPath, args.path);
     const rel = toRelative(ctx.rootPath, absolute);
-    assertLeaseCovers(ctx.lease, { capability: "fs.read", resourceValues: [rel] });
+    assertLeaseCovers(ctx.lease, { capability: "fs.read", resourceValues: [rel] }, args);
 
     const limit =
       args.maxBytes ?? ctx.lease.constraints.maxOutputBytes ?? readFileTool.descriptor.maxOutputBytes;
@@ -150,7 +150,7 @@ export const writeFileTool: Tool<WriteFileArgs> = {
     // reaches the disk (PRD EX-03).
     const absolute = assertWithinRoot(ctx.rootPath, args.path);
     const rel = toRelative(ctx.rootPath, absolute);
-    assertLeaseCovers(ctx.lease, { capability: "fs.write", resourceValues: [rel] });
+    assertLeaseCovers(ctx.lease, { capability: "fs.write", resourceValues: [rel] }, args);
 
     try {
       if (args.createDirectories === false) {
@@ -206,7 +206,7 @@ export const deleteFileTool: Tool<DeleteFileArgs> = {
     const start = Date.now();
     const absolute = assertWithinRoot(ctx.rootPath, args.path);
     const rel = toRelative(ctx.rootPath, absolute);
-    assertLeaseCovers(ctx.lease, { capability: "fs.delete", resourceValues: [rel] });
+    assertLeaseCovers(ctx.lease, { capability: "fs.delete", resourceValues: [rel] }, args);
 
     try {
       await rm(absolute);
@@ -262,7 +262,7 @@ export const listDirTool: Tool<ListDirArgs> = {
     const start = Date.now();
     const absolute = assertWithinRoot(ctx.rootPath, args.path);
     const rel = toRelative(ctx.rootPath, absolute);
-    assertLeaseCovers(ctx.lease, { capability: "fs.read", resourceValues: [rel] });
+    assertLeaseCovers(ctx.lease, { capability: "fs.read", resourceValues: [rel] }, args);
 
     const limit = args.maxEntries ?? DEFAULT_MAX_ENTRIES;
     const lines: string[] = [];
@@ -343,7 +343,7 @@ export const searchTextTool: Tool<SearchTextArgs> = {
     const glob = args.glob;
     // The lease names the searched area; with no glob the whole workspace is in
     // scope, so the requirement is "**".
-    assertLeaseCovers(ctx.lease, { capability: "fs.read", resourceValues: [glob ?? "**"] });
+    assertLeaseCovers(ctx.lease, { capability: "fs.read", resourceValues: [glob ?? "**"] }, args);
 
     let matcher: RegExp;
     try {
@@ -443,4 +443,3 @@ export const fsTools: readonly Tool<unknown>[] = [
   listDirTool as unknown as Tool<unknown>,
   searchTextTool as unknown as Tool<unknown>,
 ];
-

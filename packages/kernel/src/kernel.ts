@@ -15,7 +15,9 @@
 import {
   actionRejectedPayloadSchema,
   canonicalJson,
+  userDecisionSchema,
   checkpointSchema,
+  contentHash,
   newId,
   nowIso,
   type ActionProposal,
@@ -26,6 +28,8 @@ import {
   type CheckpointReason,
   type CompletionDecision,
   type ContextPlan,
+  type ConfigurationSnapshot,
+  type InputAttachment,
   type EventActorKind,
   type EventType,
   type ExecutionStage,
@@ -57,7 +61,7 @@ import { buildEvent } from "./ledger/events.ts";
 import { foldTaskState } from "./ledger/fold.ts";
 import { appendEvent, chainTip, readLedger, type LedgerRead } from "./ledger/ledger.ts";
 import { assertTransition } from "./ledger/transitions.ts";
-import { issueLease, type LeaseDenial, type LeaseIssueResult } from "./lease/lease.ts";
+import { issueLease, type IssueLeaseInput, type LeaseDenial, type LeaseIssueResult } from "./lease/lease.ts";
 import type { ActionCapabilityResolver } from "./lease/resolve.ts";
 import { buildProofGraph } from "./proof/graph.ts";
 import { renderProofPackage, type RenderProofPackageInput } from "./proof/package.ts";
@@ -88,6 +92,8 @@ export interface CreateTaskOptions {
   readonly request: string;
   readonly references?: readonly TaskReference[];
   readonly requestedBy?: "user" | "cli" | "ci";
+  readonly attachments?: readonly InputAttachment[];
+  readonly configurationSnapshot?: ConfigurationSnapshot;
   readonly actorId?: string;
   /**
    * The scenario pack that drafts the Outcome Contract (ADR-0006). The runtime
@@ -199,6 +205,8 @@ export class KernelSession {
       request: options.request,
       requestedBy: options.requestedBy ?? "cli",
       references: [...(options.references ?? [])],
+      ...(options.attachments === undefined ? {} : { attachments: options.attachments }),
+      ...(options.configurationSnapshot === undefined ? {} : { configurationSnapshot: options.configurationSnapshot }),
     });
     return session;
   }
@@ -357,6 +365,7 @@ export class KernelSession {
 
   async pause(reason: string, byUser = true): Promise<void> {
     this.requireStatus(["executing", "verifying", "auto_repairing"], "pause the task");
+    await this.revokeExecutionLeases(reason);
     await this.append("task.paused", { reason, byUser });
     await this.transition("task.paused", "paused");
   }
@@ -365,6 +374,7 @@ export class KernelSession {
     if (isTerminal(this.folded.status)) {
       throw new KernelError("invalid_state", `the task is already ${this.folded.status}`);
     }
+    await this.revokeExecutionLeases(reason);
     await this.append("task.stopped", { reason, byUser, outstanding: [...outstanding] });
     await this.transition("task.stopped", "stopped");
   }
@@ -417,6 +427,15 @@ export class KernelSession {
     // so returning it to work would be inventing one.
     if (decision.decision === "expire") return;
     await this.transition("intervention.decided", "executing");
+  }
+
+  /** Client-origin explicit actions record consent without inventing an intervention. */
+  async recordUserDecision(input: UserDecision): Promise<void> {
+    const decision = userDecisionSchema.parse(input);
+    if (decision.taskId !== this.taskIdValue || decision.branchId !== this.branchIdValue) {
+      throw new KernelError("foreign_decision", "the decision belongs to another task or branch");
+    }
+    await this.append("intervention.decided", asPayload(decision));
   }
 
   /**
@@ -578,6 +597,16 @@ export class KernelSession {
     if (contract === undefined) {
       throw new KernelError("no_contract", "cannot authorise an action without a contract");
     }
+    if (!["executing", "auto_repairing"].includes(this.folded.status) ||
+        proposal.taskId !== this.taskIdValue || proposal.branchId !== this.branchIdValue) {
+      const denial: LeaseDenial = {
+        code: "task_inactive",
+        detail: "the proposal does not belong to this active task and branch",
+      };
+      await this.recordRefusal(proposal, denial);
+      return { ok: false, denial };
+    }
+    await this.append("action.proposed", asPayload(proposal));
 
     const resolver = this.resolveAction;
     if (resolver === undefined) {
@@ -603,6 +632,14 @@ export class KernelSession {
       return { ok: false, denial };
     }
 
+    if (proposal.reversibility === "irreversible" && !this.eventLog.some((event) =>
+      event.type === "intervention.decided" && options.decision !== undefined &&
+      canonicalJson(event.payload) === canonicalJson(options.decision),
+    )) {
+      const denial: LeaseDenial = { code: "irreversible_requires_confirmation", detail: "a matching recorded user decision is required" };
+      await this.recordRefusal(proposal, denial);
+      return { ok: false, denial };
+    }
     const result = issueLease({
       taskId: this.taskIdValue,
       branchId: this.branchIdValue,
@@ -611,6 +648,7 @@ export class KernelSession {
       resourceValues: resolution.resourceValues,
       contract,
       envelope: contract.autonomy,
+      parametersHash: contentHash(proposal.parameters),
       ...(options.maxCalls === undefined ? {} : { maxCalls: options.maxCalls }),
       ...(options.decision === undefined ? {} : { decision: options.decision }),
       ...(options.derivedFromUntrusted === undefined
@@ -631,6 +669,61 @@ export class KernelSession {
     return result;
   }
 
+  /** Generic composition-side execution admission; it never revises policy. */
+  async authorizeOperation(
+    input: Omit<IssueLeaseInput, "taskId" | "branchId" | "contract" | "envelope">,
+  ): Promise<LeaseIssueResult> {
+    const contract = this.contract();
+    if (contract === undefined) throw new KernelError("no_contract", "operation needs a contract");
+    if (!["executing", "auto_repairing", "verifying"].includes(this.folded.status)) {
+      return { ok: false, denial: { code: "task_inactive", detail: `task is ${this.folded.status}` } };
+    }
+    const used = this.folded.budgetUsed;
+    if (used.tokens >= contract.budget.maxTokens || used.wallClockMs >= contract.budget.maxWallClockMs) {
+      return { ok: false, denial: { code: "lease_exhausted", detail: "the task budget is exhausted" } };
+    }
+    if (input.reversibility === "irreversible" && !this.eventLog.some((event) =>
+      event.type === "intervention.decided" && input.decision !== undefined &&
+      canonicalJson(event.payload) === canonicalJson(input.decision),
+    )) return { ok: false, denial: { code: "irreversible_requires_confirmation", detail: "a matching recorded user decision is required" } };
+    const result = issueLease({
+      ...input, taskId: this.taskIdValue, branchId: this.branchIdValue,
+      contract, envelope: contract.autonomy,
+    });
+    if (result.ok) await this.append("lease.issued", asPayload(result.lease));
+    return result;
+  }
+
+  async recordBudget(input: {
+    readonly tokens?: number;
+    readonly wallClockMs: number;
+    readonly costUsd?: number;
+    readonly reason: string;
+    readonly measured?: boolean;
+  }): Promise<void> {
+    await this.append("budget.consumed", {
+      delta: { tokens: input.tokens ?? 0, retries: 0, wallClockMs: input.wallClockMs, costUsd: input.costUsd ?? 0 },
+      reason: input.reason, measured: input.measured ?? true,
+    });
+  }
+
+  async consumeExecutionLease(leaseId: string, proposalId?: string): Promise<void> {
+    const leases = collectLeases(this.eventLog);
+    const lease = leases.find((entry) => entry.leaseId === leaseId);
+    if (lease === undefined) throw new KernelError("unknown_lease", "execution names an unknown lease");
+    if (lease.consumedCalls >= lease.budget.maxCalls) throw new KernelError("lease_exhausted", "lease already consumed");
+    await this.append("lease.consumed", {
+      leaseId, calls: 1,
+      ...(proposalId === undefined ? {} : { proposalId }),
+    });
+  }
+
+  private async revokeExecutionLeases(reason: string): Promise<void> {
+    for (const lease of collectLeases(this.eventLog)) {
+      if (lease.status === "active") await this.append("lease.revoked", { leaseId: lease.leaseId, reason });
+    }
+  }
+
   async recordExecution(input: {
     readonly proposalId: string;
     readonly leaseId?: string;
@@ -643,8 +736,10 @@ export class KernelSession {
     readonly changedPaths?: readonly string[];
     readonly errorCode?: string;
     readonly workspaceSnapshotId?: string;
+    readonly origin?: "agent" | "human" | "verifier";
   }): Promise<void> {
     const contract = this.contract();
+    if (input.leaseId !== undefined) await this.consumeExecutionLease(input.leaseId, input.proposalId);
     await this.append("action.executed", {
       proposalId: input.proposalId,
       ...(input.leaseId === undefined ? {} : { leaseId: input.leaseId }),
@@ -659,7 +754,9 @@ export class KernelSession {
         ? {}
         : { workspaceSnapshotId: input.workspaceSnapshotId }),
       ...(input.errorCode === undefined ? {} : { errorCode: input.errorCode }),
+      origin: input.origin ?? "agent",
     });
+    await this.recordBudget({ wallClockMs: input.durationMs, reason: `tool.${input.proposalId}` });
 
     // A scope violation discovered after the fact stops the run instead of being
     // folded into the next round of edits (PRD EX-03).
@@ -754,7 +851,7 @@ export class KernelSession {
       contract,
       branchId: this.branchIdValue,
       changedPaths: [...input.changedPaths],
-      workspaceFingerprint: input.workspaceFingerprint ?? "",
+      ...(input.workspaceFingerprint === undefined ? {} : { workspaceFingerprint: input.workspaceFingerprint }),
       evidence,
       ...(input.verifierFailures === undefined
         ? {}
@@ -800,6 +897,8 @@ export class KernelSession {
 
   async exportProof(options: {
     readonly changedPaths: readonly string[];
+    readonly workspaceFingerprint?: string;
+    readonly verifierFailures?: readonly { conditionId: string; detail: string }[];
     readonly redaction?: "none" | "metadata_only";
     readonly diffArtifactId?: string;
     readonly environment?: RenderProofPackageInput["environment"];
@@ -816,7 +915,10 @@ export class KernelSession {
       contract,
       branchId: this.branchIdValue,
       changedPaths: [...options.changedPaths],
-      workspaceFingerprint: "",
+      ...((options.workspaceFingerprint ?? options.environment?.workspaceFingerprint) === undefined
+        ? {}
+        : { workspaceFingerprint: options.workspaceFingerprint ?? options.environment?.workspaceFingerprint }),
+      ...(options.verifierFailures === undefined ? {} : { verifierFailures: options.verifierFailures }),
       evidence,
     });
 
@@ -1003,6 +1105,13 @@ export class KernelSession {
       this.paths.taskLockFile(this.taskIdValue),
       { holder: `kernel:${this.actorId}`, timeoutMs: 10_000 },
       async () => {
+        const persisted = await readLedger(this.ledgerFile);
+        const expected = chainTip(this.eventLog);
+        const actual = chainTip(persisted.events);
+        if (!persisted.integrity.ok || persisted.tornTail ||
+            expected.seq !== actual.seq || expected.prevHash !== actual.prevHash) {
+          throw new KernelError("stale_ledger", "durable ledger tip changed or requires recovery; refusing a stale writer");
+        }
         const event = buildEvent(
           {
             taskId: this.taskIdValue,
@@ -1014,9 +1123,10 @@ export class KernelSession {
           },
           chainTip(this.eventLog),
         );
+        const nextState = foldTaskState([...this.eventLog, event]);
         await appendEvent(this.ledgerFile, event);
         this.eventLog = [...this.eventLog, event];
-        this.folded = foldTaskState(this.eventLog);
+        this.folded = nextState;
         return event;
       },
     );
@@ -1094,9 +1204,23 @@ function denialCodeForEvent(code: LeaseDenial["code"]): string {
 }
 
 function collectLeases(events: readonly RunEvent[]): readonly CapabilityLease[] {
-  return events
-    .filter((event) => event.type === "lease.issued")
-    .map((event) => event.payload as unknown as CapabilityLease);
+  const leases = new Map<string, CapabilityLease>();
+  for (const event of events) {
+    if (event.type === "lease.issued") {
+      const lease = event.payload as unknown as CapabilityLease;
+      leases.set(lease.leaseId, lease);
+    } else if (event.type === "lease.consumed" || event.type === "lease.revoked") {
+      const id = String(event.payload["leaseId"]);
+      const lease = leases.get(id);
+      if (lease === undefined) continue;
+      if (event.type === "lease.revoked") leases.set(id, { ...lease, status: "revoked", revokedReason: String(event.payload["reason"]) });
+      else {
+        const consumedCalls = lease.consumedCalls + Number(event.payload["calls"]);
+        leases.set(id, { ...lease, consumedCalls, status: consumedCalls >= lease.budget.maxCalls ? "consumed" : lease.status });
+      }
+    }
+  }
+  return [...leases.values()];
 }
 
 function collectInterventions(
