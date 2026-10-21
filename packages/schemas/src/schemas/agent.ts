@@ -119,10 +119,16 @@ export type ActionProposal = InferSchema<typeof actionProposalSchema>;
 /**
  * A model endpoint Keystone can use. Credentials are referenced by handle; the
  * secret never appears here, in the ledger, or in a prompt (PRD ST-01, 11.3).
+ *
+ * v1.1.0 renames the capability block after ADR-0010: `tools -> nativeTools` and
+ * `jsonMode -> structuredOutput`, and adds `multimodal`. A capability is declared
+ * true only when the adapter implements it and a test proves the mapping — the
+ * block is the contract, never an aspiration. `streaming`/`multimodal` are false
+ * for every v1 adapter.
  */
 export const modelDescriptorSchema = defineSchema(
   "keystone.agent.modelDescriptor",
-  "1.0.0",
+  "1.1.0",
   objectOf({
     id: nonEmptyStr(),
     kind: enumOf(["cloud", "local"] as const),
@@ -130,10 +136,25 @@ export const modelDescriptorSchema = defineSchema(
     modelName: nonEmptyStr(),
     /** Host only, so the user can see where data would go (PRD 11.4). */
     endpointHost: nonEmptyStr(),
+    /**
+     * Which provider wire protocol this adapter speaks. Drives capability
+     * negotiation and the request/response mapping; see ADR-0010 §2.
+     */
+    protocol: enumOf([
+      "openai-chat",
+      "openai-responses",
+      "anthropic-messages",
+      "gemini-generate",
+    ] as const),
     capabilities: objectOf({
-      tools: bool(),
-      jsonMode: bool(),
+      /** Accepts provider-native tool definitions and returns structured calls. */
+      nativeTools: bool(),
+      /** Sends a provider-native constraint that the output be JSON/schema. */
+      structuredOutput: bool(),
+      /** Consumes a streaming response incrementally. v1: always false. */
       streaming: bool(),
+      /** Accepts non-text content parts. v1: always false. */
+      multimodal: bool(),
       contextTokens: int({ min: 1 }),
     }),
     credentialHandle: optional(nonEmptyStr()),

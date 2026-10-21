@@ -110,6 +110,18 @@ test("resolves tool-specific resource values", () => {
     resolveEngineeringAction(proposal({ toolId: "git.diff" })).resourceValues,
     ["."],
   );
+  // A commit names exactly the paths it will stage; a rollback spans the worktree.
+  assert.deepEqual(
+    resolveEngineeringAction(
+      proposal({ toolId: "git.commit", parameters: { paths: ["src/a.ts", "src/b.ts"], message: "x" } }),
+    ).resourceValues,
+    ["src/a.ts", "src/b.ts"],
+  );
+  assert.deepEqual(
+    resolveEngineeringAction(proposal({ toolId: "git.rollback", parameters: { target: "abc123" } }))
+      .resourceValues,
+    ["."],
+  );
 });
 
 test("an extension-provided tool names its declared expected effects", () => {

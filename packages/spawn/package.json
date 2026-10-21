@@ -1,6 +1,6 @@
 {
   "name": "@keystone/spawn",
-  "version": "0.0.0",
+  "version": "1.0.0-rc.1",
   "private": true,
   "type": "module",
   "description": "Generic cross-platform child-process launch compatibility: Windows .cmd/.bat shim resolution and cmd.exe argument escaping, shared by the execution boundaries (tools and verifiers). No scenario vocabulary, zero dependencies.",

@@ -2,7 +2,7 @@
 
 Thank you for your willingness to contribute to Keystone. Keystone is an evidence-native, local-first engineering Agent Harness. Before you begin, please read this document, [`AGENTS.md`](./AGENTS.md) (kernel invariants and code conventions), [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md), and [`SECURITY.md`](./SECURITY.md).
 
-> The project is currently in the **product and architecture design phase** and has not yet released a production runtime. Some processes (such as initial-release acceptance and the release scorecard) will be implemented progressively as milestones advance (see [`ROADMAP.md`](./ROADMAP.md)).
+> The project is currently shipping its first pre-release candidate, **`1.0.0-rc.1`**: a developer-preview, CLI-first build. It is **not** a stable 1.0.0 — the root package stays private, nothing is published, and a stable release still needs explicit admission after the ROADMAP acceptance gates close (see [ADR-0012](./docs/adr/0012-release-candidate-boundary.md)). Some processes (such as the initial-release scorecard) will be implemented progressively as milestones advance (see [`ROADMAP.md`](./ROADMAP.md)).
 
 ## 1. Development Environment Requirements
 
@@ -29,6 +29,22 @@ pnpm test
 ```
 
 > If the above scripts are not yet defined before the corresponding milestone lands, defer to the actual script names in the repository-root `package.json` and update this document accordingly in the PR.
+
+### CI and local release assets
+
+CI (`.github/workflows/ci.yml`) runs the same gate on macOS and Linux: `pnpm install --frozen-lockfile`, `pnpm run typecheck`, `pnpm test`, the release check, and it generates the offline release artifacts as CI artifacts. A separate `windows-verify.yml` runs the install/typecheck/test gate on `windows-latest`; it is intentionally **non-blocking** because the suite has not yet been validated on a real Windows machine — treat it as an advisory signal, not as proof that Windows works end to end.
+
+Release tooling lives in `scripts/release/` and is dependency-free (Node built-ins only):
+
+```bash
+pnpm run release:check       # version consistency + release-readiness report (non-zero on mismatch)
+pnpm run release:sbom        # offline SBOM -> dist/release/sbom.json (deterministic, no timestamp)
+pnpm run release:buildinfo   # build info -> dist/release/build-info.json
+pnpm run release:all         # check + sbom + buildinfo
+pnpm run release:bump <v>    # authoritative workspace version move, e.g. 1.0.0-rc.1 (then rerun release:all)
+```
+
+These scripts **never** tag, publish, sign, or notarize. The current workspace is the pre-release candidate `1.0.0-rc.1`; the readiness checker runs two channels — a prerelease passes as a local RC artifact build, while a plain `1.0.0` is refused unless passed `--allow-1.0`, and the 1.0.0 release gates are not yet met. Version moves go **only** through `release:bump`; never hand-edit `package.json` versions, generated artifacts, or the lockfile — regenerate artifacts with `release:sbom` / `release:buildinfo` and the lockfile with `pnpm install`. Generated files land in `dist/`, which is git-ignored.
 
 ## 3. Extension Points That Can Be Contributed Independently
 

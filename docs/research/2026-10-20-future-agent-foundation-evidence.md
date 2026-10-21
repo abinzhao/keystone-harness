@@ -40,7 +40,7 @@ Each item is a fact about something that exists today, with the canonical source
 
 - OpenAI's developer surface has converged on the Responses API alongside Chat Completions; OpenAI-compatible endpoints (cloud and local) are the de facto interoperable wire, which is why local runtimes can reuse it. Source: https://platform.openai.com/docs
 
-**Implication:** a thin OpenAI-compatible adapter is a durable, low-lock-in choice. Native Responses, native tool-calling, and Anthropic/Gemini native endpoints are tracked as *planned* adapters, not current capability.
+**Implication:** a thin OpenAI-compatible adapter is a durable, low-lock-in choice. Native Responses, native tool-calling, and Anthropic/Gemini native endpoints have since been implemented as v1 adapters (ADR-0010, mock-tested in-process; the Builder Loop still drives the text envelope and no live provider call has been made).
 
 ## Part B — 2027–2030 projections (opinion, not evidence)
 

@@ -54,7 +54,7 @@ test("the server refuses unauthenticated callers and serves the protocol with a 
 
   try {
     const base = `http://127.0.0.1:${server.port}`;
-    assert.equal(server.protocolVersion, "keystone.run.protocol@1.0.0");
+    assert.equal(server.protocolVersion, "keystone.run.protocol@1.2.0");
 
     // No token, and a wrong token, are both refused.
     const anonymous = await fetch(`${base}/v1/tasks`);
@@ -83,6 +83,68 @@ test("the server refuses unauthenticated callers and serves the protocol with a 
       headers: { authorization: `Bearer ${server.token}` },
     });
     assert.equal(unknown.status, 404);
+  } finally {
+    await server.close();
+    await removeFixture(fixture);
+  }
+});
+
+test("contract preview drafts a readable contract, writes nothing, and stays authed", async () => {
+  const fixture = await makeFixture();
+  const server = await startServer({
+    paths: fixture.paths,
+    token: "test-token-0123456789",
+  });
+  const auth = { authorization: `Bearer ${server.token}`, "content-type": "application/json" };
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+
+    // No token -> refused like every other route.
+    const anonymous = await fetch(`${base}/v1/contract/preview`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspacePath: fixture.root, request: "fix session refresh" }),
+    });
+    assert.equal(anonymous.status, 401);
+
+    // Missing fields -> a 400, not a half-created task.
+    const bad = await fetch(`${base}/v1/contract/preview`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ workspacePath: fixture.root }),
+    });
+    assert.equal(bad.status, 400);
+
+    const preview = await fetch(`${base}/v1/contract/preview`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        workspacePath: fixture.root,
+        request: "Fix the duplicate session refresh in src/auth/session.js.",
+        writePaths: ["src/**"],
+        allowedCommands: ["node", "npm"],
+      }),
+    });
+    if (preview.status !== 200) {
+      assert.fail(`expected contract preview 200, got ${preview.status}: ${await preview.text()}`);
+    }
+    const body = (await preview.json()) as {
+      contract: { goal: string; completionConditions: readonly { required: boolean }[] };
+      writePaths: readonly string[];
+      allowedCommands: readonly string[];
+      questions: readonly unknown[];
+    };
+    assert.ok(body.contract.goal.length > 0);
+    // The boundary the user confirms is the envelope's authorized write paths.
+    assert.ok(body.writePaths.includes("src/**"));
+    assert.ok(body.allowedCommands.includes("node"));
+    assert.ok(body.contract.completionConditions.length >= 1);
+
+    // The preview must not have created a task: it is a draft for the user to read.
+    const tasks = (await (await fetch(`${base}/v1/tasks`, { headers: auth })).json()) as {
+      tasks: readonly unknown[];
+    };
+    assert.equal(tasks.tasks.length, 0);
   } finally {
     await server.close();
     await removeFixture(fixture);

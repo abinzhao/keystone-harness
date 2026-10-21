@@ -6,6 +6,11 @@
  * own version, telemetry and retry semantics between the user's key and the
  * request (ADR-0004).
  *
+ * This is the **text-envelope** adapter: it speaks no native tool calling. When a
+ * request carries tool descriptors it refuses *before* any network call, because
+ * silently dropping them would leave the caller believing structured calls are
+ * negotiated (ADR-0010 §3). It does enforce JSON output (`response_format`).
+ *
  * The API key is fetched from the credential store at call time. Nothing in this
  * file logs, returns or embeds it — including error paths, where a leaked key in
  * a stack trace is the classic way a "local-first" tool stops being local.
@@ -16,14 +21,23 @@ import type { ModelDescriptor } from "@keystone/schemas";
 import {
   CredentialMissingError,
   ModelProtocolError,
+  ModelToolsUnsupportedError,
   ModelUnavailableError,
   type CredentialResolver,
   type ModelAdapter,
   type ModelRequest,
   type ModelResponse,
 } from "./types.ts";
+import {
+  asCount,
+  describeError,
+  httpFailure,
+  isAbortError,
+  redactSecret,
+  type FetchLike,
+} from "./http.ts";
 
-export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
+export type { FetchLike };
 
 export interface OpenAiCompatibleOptions {
   readonly descriptor: ModelDescriptor;
@@ -53,6 +67,14 @@ export function createOpenAiCompatibleAdapter(options: OpenAiCompatibleOptions):
     descriptor,
 
     async complete(request: ModelRequest): Promise<ModelResponse> {
+      // No native tool calling: this adapter sends a text envelope and nothing
+      // else. A non-empty `tools` array means the caller expects structured tool
+      // negotiation, which we must refuse *before* spending a credential lookup
+      // or a network round trip.
+      if (request.tools.length > 0) {
+        throw new ModelToolsUnsupportedError(descriptor.id, request.tools.length);
+      }
+
       const handle = descriptor.credentialHandle;
       if (handle === undefined) {
         throw new CredentialMissingError(`${descriptor.id}:no-handle`);
@@ -93,7 +115,10 @@ export function createOpenAiCompatibleAdapter(options: OpenAiCompatibleOptions):
         });
 
         if (!response.ok) {
-          throw mapHttpFailure(descriptor, response, secret);
+          throw httpFailure(descriptor.id, response.status, secret, {
+            credentialHandle: handle,
+            endpointHost: descriptor.endpointHost,
+          });
         }
 
         const body = (await response.json().catch(() => {
@@ -111,6 +136,7 @@ export function createOpenAiCompatibleAdapter(options: OpenAiCompatibleOptions):
 
         return {
           text: content,
+          toolCalls: [],
           usage: {
             inputTokens: asCount(body.usage?.prompt_tokens),
             outputTokens: asCount(body.usage?.completion_tokens),
@@ -121,7 +147,7 @@ export function createOpenAiCompatibleAdapter(options: OpenAiCompatibleOptions):
       } catch (error) {
         if (error instanceof ModelProtocolError || error instanceof CredentialMissingError) throw error;
         if (error instanceof ModelUnavailableError) throw error;
-        if (isAbort(error)) {
+        if (isAbortError(error)) {
           throw new ModelUnavailableError(
             descriptor.id,
             `the model call did not answer within ${timeoutMs}ms`,
@@ -129,7 +155,7 @@ export function createOpenAiCompatibleAdapter(options: OpenAiCompatibleOptions):
         }
         throw new ModelUnavailableError(
           descriptor.id,
-          `the model call failed: ${redact(describeError(error), secret)}`,
+          `the model call failed: ${redactSecret(describeError(error), secret)}`,
         );
       } finally {
         clearTimeout(timer);
@@ -137,62 +163,4 @@ export function createOpenAiCompatibleAdapter(options: OpenAiCompatibleOptions):
       }
     },
   };
-}
-
-function mapHttpFailure(
-  descriptor: ModelDescriptor,
-  response: Response,
-  secret: string,
-): ModelUnavailableError | ModelProtocolError {
-  const status = response.status;
-  if (status === 401 || status === 403) {
-    return new ModelUnavailableError(
-      descriptor.id,
-      `the provider rejected the stored credential for "${descriptor.credentialHandle ?? "?"}" (HTTP ${status}); ` +
-        "the key itself is never included in errors — check the credential store",
-      false,
-    );
-  }
-  if (status === 404) {
-    return new ModelUnavailableError(
-      descriptor.id,
-      `the provider does not expose "${descriptor.modelName}" at ${descriptor.endpointHost} (HTTP 404)`,
-      false,
-    );
-  }
-  if (status === 429 || status >= 500) {
-    return new ModelUnavailableError(
-      descriptor.id,
-      `the provider is temporarily unavailable (HTTP ${status}); switching models or waiting is safe`,
-      true,
-    );
-  }
-  return new ModelUnavailableError(
-    descriptor.id,
-    `the provider rejected the request (HTTP ${status})`,
-    false,
-  );
-}
-
-function asCount(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
-}
-
-function isAbort(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "name" in error &&
-    (error as { name?: unknown }).name === "AbortError"
-  );
-}
-
-function describeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-/** Last line of defence: nothing leaves this module containing the key. */
-function redact(message: string, secret: string): string {
-  if (secret.length < 8) return message;
-  return message.split(secret).join("<redacted>");
 }

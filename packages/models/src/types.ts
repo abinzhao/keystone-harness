@@ -36,14 +36,36 @@ export interface ModelUsage {
   readonly outputTokens: number;
 }
 
+/**
+ * A provider-native tool call, mapped to Keystone's neutral shape. The adapter
+ * only *maps* it; it never executes the tool — execution stays behind the
+ * Capability Lease (AGENTS.md §2 I3). `id` is the provider call id (or one we
+ * synthesised), `name` the tool id the caller registered, `args` the parsed JSON.
+ */
+export interface ModelToolCall {
+  readonly id: string;
+  readonly name: string;
+  readonly args: Record<string, unknown>;
+}
+
 export interface ModelResponse {
+  /** Free-text answer. Empty when the model's only output was tool calls. */
   readonly text: string;
+  /** Structured tool calls the model requested; empty when it answered in prose. */
+  readonly toolCalls: readonly ModelToolCall[];
   readonly usage: ModelUsage;
   readonly modelName: string;
   readonly finishReason: string;
 }
 
 export type ModelRole = "builder" | "summarizer" | "planner";
+
+/** The wire protocol an adapter speaks. See ADR-0010 §2. */
+export type ModelProtocol =
+  | "openai-chat"
+  | "openai-responses"
+  | "anthropic-messages"
+  | "gemini-generate";
 
 export interface ModelAdapter {
   readonly descriptor: ModelDescriptor;
@@ -80,6 +102,32 @@ export class ModelProtocolError extends Error {
   }
 }
 
+/**
+ * The caller asked for native tool calling (`ModelRequest.tools`), but this
+ * adapter only speaks a text envelope.
+ *
+ * Thrown *before* any network call on purpose: silently dropping the tool
+ * descriptions would send the model a prompt it can act on while the caller
+ * believes structured tool calls are negotiated, which is the worst kind of
+ * silent contract drift. This is a permanent configuration mismatch, not a
+ * transient provider fault, so it is not retriable and the router must not
+ * treat it as "the model is unavailable".
+ */
+export class ModelToolsUnsupportedError extends Error {
+  readonly modelId: string;
+  readonly toolCount: number;
+  constructor(modelId: string, toolCount: number) {
+    super(
+      `model "${modelId}" cannot use native tool calling: the request carries ${toolCount} tool ` +
+        "descriptor(s), but this adapter only sends a plain-text envelope. Describe the tools in the " +
+        "prompt and parse a text envelope, or route this role to an adapter that implements native tools.",
+    );
+    this.name = "ModelToolsUnsupportedError";
+    this.modelId = modelId;
+    this.toolCount = toolCount;
+  }
+}
+
 export class CredentialMissingError extends Error {
   readonly handle: string;
   constructor(handle: string) {
@@ -88,5 +136,22 @@ export class CredentialMissingError extends Error {
     );
     this.name = "CredentialMissingError";
     this.handle = handle;
+  }
+}
+
+/**
+ * The router was asked for a capability (native tool calling) that none of the
+ * routed adapters implements. Thrown before any network call on purpose: picking
+ * a text-envelope adapter here would silently drop the tool descriptors the caller
+ * negotiated. This is a permanent configuration mismatch, never retried.
+ */
+export class ModelCapabilityUnsatisfiedError extends Error {
+  readonly role: string;
+  readonly capability: string;
+  constructor(role: string, capability: string, detail: string) {
+    super(`no model on the "${role}" route can satisfy "${capability}": ${detail}`);
+    this.name = "ModelCapabilityUnsatisfiedError";
+    this.role = role;
+    this.capability = capability;
   }
 }

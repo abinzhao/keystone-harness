@@ -164,6 +164,29 @@ export function checkDeclarations(manifest: ExtensionManifest): readonly Declara
       : "the extension cannot activate other extensions",
   });
 
+  // A `protocol` extension in this build is only reachable over a declared
+  // local stdio transport (ADR-0009). A transport block, in turn, belongs only
+  // on a protocol extension: an in-process verifier that declares one is lying
+  // about how it runs.
+  if (manifest.kind === "protocol") {
+    checks.push({
+      checkId: "declaration.protocol_transport",
+      passed: manifest.transport?.type === "stdio",
+      blocking: true,
+      detail:
+        manifest.transport?.type === "stdio"
+          ? `launched as stdio command "${manifest.transport.command}"`
+          : "a protocol extension must declare a local stdio transport (no remote transport exists in this build)",
+    });
+  } else if (manifest.transport !== undefined) {
+    checks.push({
+      checkId: "declaration.protocol_transport",
+      passed: false,
+      blocking: true,
+      detail: `a stdio transport may only be declared by kind "protocol", not "${manifest.kind}"`,
+    });
+  }
+
   checks.push({
     checkId: "declaration.uninstall",
     passed: manifest.uninstall !== "requires_cleanup" || manifest.description !== undefined,

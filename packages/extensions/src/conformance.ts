@@ -166,8 +166,8 @@ export async function runConformance(context: ConformanceContext): Promise<Confo
   // entries and the manifest declares a verifier. Host-supplied probes still run
   // afterwards, in the order they were given.
   const autoProbes: ConformanceProbe[] =
-    manifest.kind === "verifier" && context.entryLoader !== undefined
-      ? [verifierEntryShapeProbe({ manifest, loadEntry: context.entryLoader })]
+    manifest.kind === "verifier" && context.entryLoader !== undefined && manifest.entry !== undefined
+      ? [verifierEntryShapeProbe({ manifest: { entry: manifest.entry }, loadEntry: context.entryLoader })]
       : [];
 
   for (const probe of [...autoProbes, ...(context.probes ?? [])]) {

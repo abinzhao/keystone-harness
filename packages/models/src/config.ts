@@ -18,19 +18,30 @@ import {
   optional,
   str,
   type InferSchema,
+  type ModelDescriptor,
 } from "@keystone/schemas";
 
+import { createAnthropicMessagesAdapter } from "./anthropic-messages.ts";
+import { createGeminiGenerateAdapter } from "./gemini-generate.ts";
 import { createOpenAiCompatibleAdapter } from "./openai.ts";
+import { createOpenAiResponsesAdapter } from "./openai-responses.ts";
+import { MODEL_PROTOCOLS, presetFor } from "./providers.ts";
 import type { CredentialResolver, ModelAdapter, ModelRole } from "./types.ts";
 
 export const modelConfigEntrySchema = defineSchema(
   "keystone.config.model",
-  "1.0.0",
+  "2.0.0",
   objectOf({
     id: str({ pattern: /^[a-z0-9][a-z0-9._-]{0,63}$/ }),
     kind: enumOf(["cloud", "local"] as const),
     provider: nonEmptyStr(),
     modelName: nonEmptyStr(),
+    /**
+     * Which provider wire protocol this entry speaks (ADR-0010 §2). Optional so
+     * a 1.0.0 config with no field is still readable; it defaults to
+     * `openai-chat`, the previously only behaviour.
+     */
+    protocol: optional(enumOf(MODEL_PROTOCOLS)),
     /** Base URL including the version segment. Required for HTTP models. */
     baseUrl: optional(nonEmptyStr()),
     /** Handle of the credential in the credential store. Never the secret. */
@@ -44,7 +55,7 @@ export const modelConfigEntrySchema = defineSchema(
 
 export const keystoneConfigSchema = defineSchema(
   "keystone.config",
-  "1.0.0",
+  "2.0.0",
   objectOf({
     schemaVersion: nonEmptyStr(),
     /**
@@ -78,7 +89,7 @@ export type KeystoneConfig = InferSchema<typeof keystoneConfigSchema>;
 
 export function defaultConfig(): KeystoneConfig {
   return keystoneConfigSchema.parse({
-    schemaVersion: "keystone.config@1.0.0",
+    schemaVersion: "keystone.config@2.0.0",
     models: [],
     routes: {},
     defaults: { maxTokens: 300_000, maxWallClockMs: 7_200_000, maxRetries: 3 },
@@ -111,13 +122,17 @@ export async function saveConfig(
 }
 
 /**
- * Build a runtime adapter for a configured model.
+ * Build a runtime adapter for a configured model (ADR-0010 §2).
  *
- * Both cloud and local HTTP endpoints go through the same OpenAI-compatible
- * client, because that is the interface local runtimes actually expose. A
- * genuinely offline model is injected by the caller instead (see
- * `createScriptedAdapter`), which keeps "fully offline" an explicit choice
- * rather than a mode that silently degrades.
+ * The entry's `protocol` selects the wire adapter; an entry written by the 1.0.0
+ * schema has no protocol and defaults to `openai-chat`, preserving prior
+ * behaviour. The descriptor's capability block is taken from the protocol preset
+ * and then narrowed to what this adapter implements — it is never claimed as
+ * `tools: true` while the adapter refuses tools.
+ *
+ * A genuinely offline model is injected by the caller instead (see
+ * `createScriptedAdapter`), which keeps "fully offline" an explicit choice rather
+ * than a mode that silently degrades.
  */
 export function buildAdapter(
   entry: ModelConfigEntry,
@@ -128,28 +143,39 @@ export function buildAdapter(
       `model "${entry.id}" has no baseUrl; HTTP-served models must configure one`,
     );
   }
-  return createOpenAiCompatibleAdapter({
-    descriptor: {
-      id: entry.id,
-      kind: entry.kind,
-      provider: entry.provider,
-      modelName: entry.modelName,
-      endpointHost: entry.endpointHost,
-      capabilities: {
-        tools: true,
-        jsonMode: true,
-        streaming: false,
-        contextTokens: entry.contextTokens ?? 128_000,
-      },
-      ...(entry.credentialHandle === undefined ? {} : { credentialHandle: entry.credentialHandle }),
-      dataEgress: {
-        classes: entry.kind === "local" ? [] : ["internal"],
-        local: entry.kind === "local",
-      },
+  const protocol = entry.protocol ?? "openai-chat";
+  const preset = presetFor(protocol);
+
+  const descriptor: ModelDescriptor = {
+    id: entry.id,
+    kind: entry.kind,
+    provider: entry.provider,
+    modelName: entry.modelName,
+    endpointHost: entry.endpointHost,
+    protocol,
+    capabilities: {
+      ...preset.capabilities,
+      contextTokens: entry.contextTokens ?? preset.capabilities.contextTokens,
     },
-    credentials,
-    baseUrl: entry.baseUrl,
-  });
+    ...(entry.credentialHandle === undefined ? {} : { credentialHandle: entry.credentialHandle }),
+    dataEgress: {
+      classes: entry.kind === "local" ? [] : ["internal"],
+      local: entry.kind === "local",
+    },
+  };
+
+  const options = { descriptor, credentials, baseUrl: entry.baseUrl };
+  switch (protocol) {
+    case "openai-responses":
+      return createOpenAiResponsesAdapter(options);
+    case "anthropic-messages":
+      return createAnthropicMessagesAdapter(options);
+    case "gemini-generate":
+      return createGeminiGenerateAdapter(options);
+    case "openai-chat":
+    default:
+      return createOpenAiCompatibleAdapter(options);
+  }
 }
 
 /** Enabled entries only, in configuration order. */

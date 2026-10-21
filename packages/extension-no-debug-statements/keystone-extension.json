@@ -1,0 +1,47 @@
+{
+  "name": "keystone-extension-no-debug-statements",
+  "version": "1.0.0",
+  "publisher": "keystone",
+  "integrity": {
+    "algorithm": "sha256",
+    "digest": "44cc7fb32a8e1ee54e22f679c6fbe76dd3f761a57548b35c72023206adfadc08"
+  },
+  "kind": "verifier",
+  "apiVersion": "1.0",
+  "capabilities": [
+    "fs.read"
+  ],
+  "sideEffects": [
+    {
+      "kind": "fs_read",
+      "scope": "reads only the changed files the contract already permits"
+    }
+  ],
+  "reversibility": "reversible",
+  "egressHosts": [],
+  "credentialHandles": [],
+  "dataClassification": {
+    "reads": "internal",
+    "egress": []
+  },
+  "produces": {
+    "observations": [
+      "debug_statement_scan"
+    ],
+    "evidenceTypes": [
+      "project_rule_check"
+    ]
+  },
+  "execution": {
+    "replayable": true,
+    "idempotent": true
+  },
+  "dependencies": [],
+  "conflicts": [],
+  "uninstall": "safe",
+  "entry": {
+    "module": "src/index.ts",
+    "export": "noDebugStatementsVerifier"
+  },
+  "description": "Fails a task whose change set still contains debug statements."
+}

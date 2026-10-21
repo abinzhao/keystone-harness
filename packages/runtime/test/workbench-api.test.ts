@@ -60,6 +60,7 @@ function gatedModel(responses: readonly string[]): GatedModel {
       if (calls >= 2) await gate;
       return {
         text: responses[Math.min(calls - 1, responses.length - 1)] ?? "",
+        toolCalls: [],
         usage: { inputTokens: 0, outputTokens: 0 },
         modelName: "scripted-1",
         finishReason: "stop" as const,

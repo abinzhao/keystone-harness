@@ -9,6 +9,7 @@
  */
 
 import {
+  ModelCapabilityUnsatisfiedError,
   ModelProtocolError,
   ModelUnavailableError,
   type ModelAdapter,
@@ -39,8 +40,11 @@ export interface EgressDescription {
   readonly modelId: string;
   readonly provider: string;
   readonly endpointHost: string;
+  readonly protocol: string;
   readonly local: boolean;
   readonly dataClasses: readonly string[];
+  readonly nativeTools: boolean;
+  readonly structuredOutput: boolean;
   readonly credentialHandle?: string;
 }
 
@@ -101,8 +105,11 @@ export class ModelRouter {
         modelId: primary?.id ?? "(none configured)",
         provider: primary?.provider ?? "(none)",
         endpointHost: primary?.endpointHost ?? "(none)",
+        protocol: primary?.protocol ?? "(none)",
         local: primary?.dataEgress.local ?? true,
         dataClasses: primary?.dataEgress.classes ?? [],
+        nativeTools: primary?.capabilities.nativeTools ?? false,
+        structuredOutput: primary?.capabilities.structuredOutput ?? false,
         ...(primary?.credentialHandle === undefined
           ? {}
           : { credentialHandle: primary.credentialHandle }),
@@ -110,15 +117,42 @@ export class ModelRouter {
     });
   }
 
+  /**
+   * Adapters on the route that can satisfy what this request actually asks for
+   * (ADR-0010 §3). Today the one hard-filtered capability is native tool calling:
+   * a request carrying tool descriptors must not be routed to an adapter that would
+   * silently drop them.
+   */
+  private routeSatisfying(role: ModelRole, request: ModelRequest): readonly ModelAdapter[] {
+    const needNativeTools = request.tools.length > 0;
+    if (!needNativeTools) return this.route(role);
+    return this.route(role).filter(
+      (adapter) => adapter.descriptor.capabilities.nativeTools,
+    );
+  }
+
   async complete(role: ModelRole, request: ModelRequest): Promise<RouteOutcome> {
-    const candidates = this.route(role);
+    const all = this.route(role);
     const attempts: RouteAttempt[] = [];
 
-    if (candidates.length === 0) {
+    if (all.length === 0) {
       throw new ModelUnavailableError(
         "(none)",
         `no model is configured for the "${role}" role; configure a model before running tasks`,
         false,
+      );
+    }
+
+    const candidates = this.routeSatisfying(role, request);
+    if (request.tools.length > 0 && candidates.length === 0) {
+      // Loud refusal, before any network call: do not pick a text-envelope adapter
+      // that would discard the tool descriptors.
+      throw new ModelCapabilityUnsatisfiedError(
+        role,
+        "native_tools",
+        `the request carries ${request.tools.length} tool descriptor(s), but every model on the ` +
+          `"${role}" route is a text-envelope adapter. Add a native-tools model (openai-responses, ` +
+          `anthropic-messages or gemini-generate) or describe the tools in the prompt instead.`,
       );
     }
 

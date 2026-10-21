@@ -23,6 +23,14 @@ export interface ToolContext {
   readonly lease: CapabilityLease;
   readonly workingDirectory?: string;
   readonly signal?: AbortSignal;
+  /**
+   * Repository-relative paths that were already dirty/untracked at project
+   * onboarding. Supplied by the runtime from the onboarding workspace snapshot
+   * so a git write can refuse to sweep a user's pre-existing changes into an
+   * agent commit (PRD PI-01 line 312, ADR-0007, decision B1). Optional so
+   * read-only and fs tools are unaffected.
+   */
+  readonly baselineDirtyPaths?: ReadonlySet<string>;
 }
 
 export interface ToolResult {

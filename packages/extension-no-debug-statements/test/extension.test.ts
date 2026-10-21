@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +20,7 @@ import {
   checkDeclarations,
   describeInstallReview,
   reachesOutside,
+  readLocalPackage,
   runConformance,
 } from "@keystone/extensions";
 import { resolveKeystonePaths } from "@keystone/kernel";
@@ -197,4 +198,25 @@ test("the registry accepts the reference extension end to end", async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("the committed keystone-extension.json matches the built manifest and real entry bytes", async () => {
+  const { manifest, integrityVerified } = await loadDeclaration(packageRoot);
+  assert.equal(integrityVerified, true);
+
+  const committed = JSON.parse(
+    await readFile(join(packageRoot, "keystone-extension.json"), "utf8"),
+  ) as { integrity: { digest: string }; name: string; entry: { module: string } };
+
+  // The committed manifest is what `keystone extension install <path>` reads; it
+  // must describe the same bytes the authoring builder hashes, or the public
+  // entry would refuse a package that is supposed to be the worked example.
+  assert.equal(committed.name, manifest.name);
+  assert.equal(committed.entry?.module, manifest.entry?.module);
+  assert.equal(committed.integrity.digest, manifest.integrity.digest);
+
+  // Loading the committed manifest through the public local-package reader must
+  // verify against the real entry on disk.
+  const read = await readLocalPackage(packageRoot);
+  assert.equal(read.integrityVerified, true);
 });

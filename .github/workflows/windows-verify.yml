@@ -1,0 +1,50 @@
+name: Windows verification
+
+# Windows verification PATH. It runs the same install / typecheck / test gate on a
+# windows-latest runner.
+#
+# STATUS (be honest): this repository is developed and verified on macOS. The Windows
+# child-process layer is implemented and unit-tested at the resolution layer
+# (@keystone/spawn), but the end-to-end suite has NOT yet been run on a real Windows
+# machine. This job is therefore `continue-on-error: true`: it is an advisory signal,
+# not a release gate, until a maintainer runs it on a Windows runner and fixes the
+# gaps. Do not treat a green macOS/Linux CI as "Windows works".
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm via Corepack
+        shell: pwsh
+        run: corepack enable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Print toolchain
+        shell: pwsh
+        run: |
+          node --version
+          pnpm --version
+
+      - name: Install (frozen lockfile)
+        shell: pwsh
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        shell: pwsh
+        run: pnpm run typecheck
+
+      - name: Test
+        shell: pwsh
+        run: pnpm test

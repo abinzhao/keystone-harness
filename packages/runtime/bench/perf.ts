@@ -28,6 +28,10 @@ import {
   resolveKeystonePaths,
 } from "@keystone/kernel";
 import {
+  compileContract,
+  resolveEngineeringAction,
+} from "@keystone/pack-engineering";
+import {
   autonomyEnvelopeSchema,
   newId,
   nowIso,
@@ -121,6 +125,11 @@ async function seed(
       projectId: projectId as never,
       request: `benchmark task ${index}`,
       actorId: "bench",
+      // The kernel ships no engineering policy (ADR-0006, M1): it cannot draft a
+      // contract or resolve capabilities on its own. Like @keystone/runtime, the
+      // bench wires the engineering scenario seams, or compile() fails loudly.
+      proposeContract: compileContract,
+      resolveAction: resolveEngineeringAction,
     });
     await session.submit();
     await session.compile({

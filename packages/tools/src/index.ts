@@ -31,6 +31,8 @@ export const TOOL_IDS = [
   "git.status",
   "git.diff",
   "git.show_head",
+  "git.commit",
+  "git.rollback",
 ] as const;
 
 export type ToolId = (typeof TOOL_IDS)[number];

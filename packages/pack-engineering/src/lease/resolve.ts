@@ -76,6 +76,16 @@ function engineeringResourceValues(proposal: ActionProposal): readonly string[] 
     case "git.diff":
     case "git.show_head":
       return ["."];
+    case "git.commit": {
+      // Path-scoped commit: the lease must cover exactly the paths being committed.
+      const paths = Array.isArray(parameters.paths)
+        ? parameters.paths.filter((value): value is string => typeof value === "string")
+        : [];
+      return paths;
+    }
+    case "git.rollback":
+      // A branch-pointer operation spans the whole worktree.
+      return ["."];
     default: {
       // An extension-provided tool must still name what it touches, so the
       // proposal's declared effects become the resource list.

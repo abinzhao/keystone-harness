@@ -11,6 +11,7 @@ import {
   FileCredentialStore,
   ModelProtocolError,
   ModelRouter,
+  ModelToolsUnsupportedError,
   ModelUnavailableError,
   buildActionPrompt,
   createOpenAiCompatibleAdapter,
@@ -25,6 +26,7 @@ import {
   toActionProposals,
   type ModelAdapter,
   type ModelRequest,
+  type ToolDescriptor,
 } from "../src/index.ts";
 
 async function tempDir(): Promise<string> {
@@ -155,6 +157,7 @@ function adapterReturning(text: string, id = "primary"): ModelAdapter {
     async complete(_request: ModelRequest) {
       return {
         text,
+        toolCalls: [],
         usage: { inputTokens: 10, outputTokens: 5 },
         modelName: "scripted-1",
         finishReason: "stop",
@@ -297,6 +300,49 @@ test("OpenAI-compatible adapter sends a well-formed request and never echoes the
         return true;
       },
     );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a request with tools is refused before any network call, not silently dropped", async () => {
+  const dir = await tempDir();
+  try {
+    const credentials = new FileCredentialStore({ credentialsDir: join(dir, "credentials") });
+    await credentials.set("main", "sk-super-secret-key-value");
+    let called = false;
+    const adapter = createOpenAiCompatibleAdapter({
+      descriptor: {
+        ...scriptedModelDescriptor({ id: "cloud", kind: "cloud" }),
+        credentialHandle: "main",
+        endpointHost: "api.example.com",
+      },
+      credentials,
+      baseUrl: "https://api.example.com/v1",
+      fetchImpl: async () => {
+        called = true;
+        return new Response("{}", { status: 200 });
+      },
+    });
+
+    const tools = [{ id: "fs.read_file" }, { id: "fs.write_file" }] as unknown as readonly ToolDescriptor[];
+    await assert.rejects(
+      () =>
+        adapter.complete({
+          messages: [{ role: "user", content: "hi" }],
+          tools,
+          jsonMode: true,
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof ModelToolsUnsupportedError);
+        assert.equal(error.toolCount, 2);
+        assert.match(error.message, /native tool calling/);
+        // The key must never leak into an incompatibility error either.
+        assert.ok(!error.message.includes("sk-super-secret-key-value"));
+        return true;
+      },
+    );
+    assert.equal(called, false, "no network call may be made when tools are refused");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

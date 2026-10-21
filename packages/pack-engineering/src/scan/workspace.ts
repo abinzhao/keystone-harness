@@ -195,6 +195,37 @@ export async function scanWorkspace(
   return snapshot;
 }
 
+/**
+ * List the worktree's dirty and untracked paths, relative to the repo root.
+ *
+ * This is the cheap admission probe behind ADR-0012 Decision F: before a
+ * standard run may start, the runtime compares this set against the task's
+ * write scope and refuses to clobber overlapping uncommitted work. It is
+ * deliberately *not* a full `scanWorkspace` (which digests every file): for
+ * admission we only need which paths are dirty, so we run two porcelain/ls
+ * commands instead of reading the whole tree. A non-Git workspace is refused
+ * here the same way a full scan refuses it.
+ */
+export async function listDirtyPaths(rootPath: string): Promise<readonly string[]> {
+  const root = resolve(rootPath);
+  const topLevelResult = await runGit(root, ["rev-parse", "--show-toplevel"]);
+  if (!topLevelResult.ok) throw new NotAGitRepositoryError(root);
+  const topLevel = topLevelResult.stdout.trim() === "" ? root : topLevelResult.stdout.trim();
+
+  // With `-z`, a rename/copy record is `XY <orig> -> <dest>\0` — a single
+  // record whose path part already names the rewritten destination. The path a
+  // write would touch is the destination, so we split on ` -> `.
+  const status = splitNul((await runGit(topLevel, ["status", "--porcelain", "-z"])).stdout);
+  const dirty = new Set<string>();
+  for (const record of status) {
+    if (record === "") continue;
+    const pathPart = record.slice(3);
+    const arrow = pathPart.indexOf(" -> ");
+    dirty.add(arrow === -1 ? pathPart : pathPart.slice(arrow + 4));
+  }
+  return [...dirty].sort();
+}
+
 function splitNul(value: string): string[] {
   return value.split("\0").filter((entry) => entry !== "");
 }

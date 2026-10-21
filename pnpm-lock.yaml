@@ -45,6 +45,15 @@ importers:
         specifier: workspace:*
         version: link:../verifiers
 
+  packages/desktop:
+    dependencies:
+      '@keystone/kernel':
+        specifier: workspace:*
+        version: link:../kernel
+      '@keystone/models':
+        specifier: workspace:*
+        version: link:../models
+
   packages/extension-localization-placeholders:
     dependencies:
       '@keystone/schemas':
@@ -85,6 +94,12 @@ importers:
       '@keystone/schemas':
         specifier: workspace:*
         version: link:../schemas
+      '@keystone/spawn':
+        specifier: workspace:*
+        version: link:../spawn
+      '@keystone/tools':
+        specifier: workspace:*
+        version: link:../tools
 
   packages/i18n: {}
 

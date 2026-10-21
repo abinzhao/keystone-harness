@@ -13,7 +13,9 @@
 import { translatorFor, type Language, type Translator } from "@keystone/i18n";
 
 import { UsageError } from "./args.ts";
+import { command as ciCommand } from "./commands/ci.ts";
 import { command as doctorCommand } from "./commands/doctor.ts";
+import { command as extensionCommand } from "./commands/extension.ts";
 import { command as modelCommand } from "./commands/model.ts";
 import { command as projectCommand } from "./commands/project.ts";
 import { command as proofCommand } from "./commands/proof.ts";
@@ -31,6 +33,8 @@ export type { Language } from "@keystone/i18n";
 export const commands: readonly CommandModule[] = [
   projectCommand,
   taskCommand,
+  ciCommand,
+  extensionCommand,
   proofCommand,
   replayCommand,
   protocolCommand,

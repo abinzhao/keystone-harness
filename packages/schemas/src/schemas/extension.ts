@@ -22,6 +22,7 @@ import {
   nonEmptyStr,
   objectOf,
   optional,
+  recordOf,
   str,
   type InferSchema,
 } from "../validate.ts";
@@ -80,9 +81,41 @@ const egressRuleSchema = defineSchema(
   }),
 );
 
+/**
+ * An out-of-process extension reached over the local stdio transport (ADR-0009).
+ *
+ * Only `stdio` exists in this build: there is deliberately no HTTP/SSE and no
+ * remote transport. The command is launched through the neutral spawn boundary
+ * with a sanitized environment, so `env` extras are still filtered for secret
+ * material before the child sees them. Declaring this block grants nothing —
+ * it only says *how* the adapter would launch the server, and the kernel still
+ * issues every lease.
+ */
+export const stdioTransportSchema = defineSchema(
+  "keystone.extension.stdioTransport",
+  "1.0.0",
+  objectOf({
+    type: lit("stdio"),
+    /** Bare command name (resolved on PATH) or absolute path; never a shell line. */
+    command: nonEmptyStr(),
+    /** Argument vector, passed as an array so a value cannot become a second command. */
+    args: arrayOf(str(), { maxItems: 128 }),
+    /**
+     * Extra environment entries the server explicitly needs. Every value is
+     * run through the same secret filter as the parent process env, so a
+     * manifest cannot smuggle a long-lived credential into the child.
+     */
+    env: optional(recordOf(str())),
+    /** Working directory, resolved against the package root by the host. */
+    cwd: optional(str()),
+  }),
+);
+
+export type StdioTransport = InferSchema<typeof stdioTransportSchema>;
+
 export const extensionManifestSchema = defineSchema(
   "keystone.extension.manifest",
-  "1.0.0",
+  "1.1.0",
   objectOf({
     /** Human-readable package name, e.g. `keystone-verifier-vitest`. */
     name: str({ pattern: /^[a-z0-9][a-z0-9-_.]{1,63}$/ }),
@@ -137,11 +170,23 @@ export const extensionManifestSchema = defineSchema(
     conflicts: arrayOf(nonEmptyStr(), { maxItems: 32 }),
 
     uninstall: enumOf(UNINSTALL_BEHAVIORS),
-    /** Entry point, interpreted by the extension host for this `kind`. */
-    entry: objectOf({
-      module: nonEmptyStr(),
-      export: nonEmptyStr(),
-    }),
+    /**
+     * Out-of-process transport for a `kind: "protocol"` extension (ADR-0009).
+     * Absent for in-process verifier/tool extensions. When present there is no
+     * bundled TS entry to load or digest.
+     */
+    transport: optional(stdioTransportSchema.validator),
+    /**
+     * In-process entry point, interpreted by the extension host for this `kind`.
+     * Optional: a `protocol` (stdio) extension and a `skill` load no in-process
+     * module, so they ship no entry (1.1.0).
+     */
+    entry: optional(
+      objectOf({
+        module: nonEmptyStr(),
+        export: nonEmptyStr(),
+      }),
+    ),
     /** Free-form notes shown during installation review. */
     description: optional(str({ maxLength: 2000 })),
   }),

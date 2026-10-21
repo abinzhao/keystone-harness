@@ -29,6 +29,11 @@ import { fileURLToPath } from "node:url";
 
 import { catalogFor, DEFAULT_LANGUAGE, type Language } from "@keystone/i18n";
 import {
+  defaultRegistryLocation,
+  ExtensionRegistry,
+  lowRiskActiveExtensions,
+} from "@keystone/extensions";
+import {
   KernelSession,
   listBranches,
   listCheckpoints,
@@ -39,6 +44,7 @@ import {
   type KeystonePaths,
 } from "@keystone/kernel";
 import type { ModelAdapter, ModelRole } from "@keystone/models";
+import { compileContract, detectProjectProfile, listDirtyPaths } from "@keystone/pack-engineering";
 import {
   autonomyEnvelopeSchema,
   newId,
@@ -64,9 +70,20 @@ import {
   type RunTaskResult,
 } from "./keystone-runtime.ts";
 import { modeCapabilities, type RunMode } from "./modes.ts";
+import { resolveStartPolicy } from "./start-policy.ts";
+import {
+  findDirtyOverlap,
+  gradeStartRisk,
+  type StartRiskResult,
+} from "./start-risk.ts";
+import { WorkspaceBusyError } from "./workspace-lock.ts";
 
 const SERVER_DIRECTORY = dirname(fileURLToPath(import.meta.url));
-const PROTOCOL_VERSION = "keystone.run.protocol@1.0.0";
+// 1.1.0 adds the read-only `POST /v1/contract/preview` draft endpoint (ADR-0008,
+// Decision E). 1.2.0 (ADR-0013) adds an additive `risk` object to that preview
+// response and a `startMode` request on `POST /v1/tasks`; both are additive, so
+// a 1.0.0/1.1.0 client keeps working, it just loses the low-risk auto-start.
+const PROTOCOL_VERSION = "keystone.run.protocol@1.2.0";
 const DEFAULT_INTERVENTION_TIMEOUT_MS = 10 * 60_000;
 
 export interface ServeOptions {
@@ -421,6 +438,55 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
     if (workspacePath === "" || request === "") {
       throw new HttpError(400, "workspacePath and request are required");
     }
+    const writePaths = Array.isArray(body["writePaths"])
+      ? (body["writePaths"] as readonly string[])
+      : [];
+    const allowedCommands = Array.isArray(body["allowedCommands"])
+      ? (body["allowedCommands"] as readonly string[])
+      : [];
+
+    // A confirmed start is an explicit user acceptance (the modal's Start
+    // button) or the legacy `acceptContract` flag. The grade decides whether
+    // that signal is required; the client cannot self-attest a safer grade.
+    const confirmedStart = body["startMode"] === "confirmed" || body["acceptContract"] === true;
+
+    // Write tasks are graded server-side (ADR-0013). Read-only tasks name no
+    // write paths and run straight through; a write task is refused on dirty
+    // overlap, or held for confirmation unless it graded `auto_start`.
+    if (writePaths.length > 0) {
+      let graded;
+      try {
+        graded = await gradeSubmission({
+          workspacePath,
+          requestText: request,
+          writePaths,
+          allowedCommands,
+          references: Array.isArray(body["references"])
+            ? (body["references"] as readonly {
+                kind: "file" | "directory" | "issue" | "log" | "url" | "text";
+                value: string;
+              }[])
+            : [],
+          userConfirmAllWrites: body["confirmAllWrites"] === true,
+        });
+      } catch (error) {
+        throw new HttpError(
+          400,
+          `the task could not be started: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      if (graded.risk.decision === "refuse") {
+        throw new HttpError(409, graded.risk.recovery ?? "this task is refused for this working copy");
+      }
+      if (graded.risk.decision === "require_confirmation" && !confirmedStart) {
+        throw new HttpError(
+          409,
+          `this task needs confirmation before it writes (${graded.risk.reasons.join(", ")}). ` +
+            "Preview it, then start with an explicit confirmation.",
+        );
+      }
+    }
+
     const projectId = await projectIdForWorkspace(workspacePath);
 
     let taskId: string | undefined;
@@ -441,14 +507,11 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
         ...(Array.isArray(body["references"])
           ? { references: body["references"] as RunTaskOptions["references"] }
           : {}),
-        autonomy: buildAutonomy(
-          projectId,
-          Array.isArray(body["writePaths"]) ? (body["writePaths"] as readonly string[]) : [],
-          Array.isArray(body["allowedCommands"])
-            ? (body["allowedCommands"] as readonly string[])
-            : [],
-        ),
-        ...(body["acceptContract"] === true ? { acceptContractAutomatically: true } : {}),
+        autonomy: buildAutonomy(projectId, writePaths, allowedCommands),
+        // A confirmed (or auto-started low-risk) run accepts the compiled
+        // contract without an extra round trip; an unconfirmed write never
+        // reaches here — it was refused above.
+        ...(confirmedStart ? { acceptContractAutomatically: true } : {}),
         // The run applies queued pause/stop/revision itself, because it is the
         // session's only writer while it is in flight (ADR-0003).
         control: async () => state.controls.get(taskId ?? "")?.shift(),
@@ -504,6 +567,12 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
     try {
       return { taskId: await created };
     } catch (error) {
+      // A busy workspace is a conflict, not a bad request: the caller pointed at a
+      // valid workspace, it just already has a standard writer. 409 tells the client
+      // to switch to isolated mode rather than retry the same thing.
+      if (error instanceof WorkspaceBusyError) {
+        throw new HttpError(409, error.message);
+      }
       // Creation itself failed (no Git repository, unreadable path, a bad
       // contract). The caller gets the reason, not a task id that will never
       // make progress.
@@ -564,6 +633,11 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
       // GET /v1/capabilities — what this runtime can do, so a client can refuse
       // to pretend it understands more than it does (NFR-COMP-03).
       if (request.method === "GET" && segments[0] === "capabilities") {
+        // Read-only visibility: which low-risk extensions are active. Listing an
+        // extension never grants anything — the kernel still issues every lease
+        // against the user's envelope — so this is safe to expose to a shell.
+        const registry = new ExtensionRegistry(defaultRegistryLocation(paths.home));
+        await registry.load();
         json(response, 200, {
           protocolVersion: PROTOCOL_VERSION,
           mode,
@@ -571,7 +645,76 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
           taskStatuses: TASK_STATUSES,
           evidenceLevels: ["E0", "E1", "E2", "E3", "E4"],
           egress: runtime.describeEgress(),
+          extensions: lowRiskActiveExtensions(registry.list()),
         });
+        return;
+      }
+
+      // POST /v1/contract/preview — draft a readable Outcome Contract WITHOUT
+      // creating a task, a session, a ledger event or any workspace write
+      // (ADR-0008, Decision E). A write task uses this to show the human what it
+      // intends to bind to before `POST /v1/tasks` does anything. It resolves the
+      // project id, runs the read-only profile detection, builds the autonomy
+      // envelope the real run would use, and calls the pure engineering
+      // `compileContract`. The projection is the same one task detail serves, so
+      // what the user reads before confirming is what the run will bind.
+      if (request.method === "POST" && segments[0] === "contract" && segments[1] === "preview") {
+        const body = (await readBody(request)) as Record<string, unknown>;
+        const workspacePath = String(body["workspacePath"] ?? "");
+        const requestText = String(body["request"] ?? "");
+        if (workspacePath === "" || requestText === "") {
+          json(response, 400, { error: "workspacePath and request are required" });
+          return;
+        }
+        const writePaths = Array.isArray(body["writePaths"])
+          ? (body["writePaths"] as readonly unknown[]).map((value) => String(value))
+          : [];
+        const allowedCommands = Array.isArray(body["allowedCommands"])
+          ? (body["allowedCommands"] as readonly unknown[]).map((value) => String(value))
+          : [];
+        const userConfirmAllWrites = body["confirmAllWrites"] === true;
+        try {
+          const graded = await gradeSubmission({
+            workspacePath,
+            requestText,
+            writePaths,
+            allowedCommands,
+            references: Array.isArray(body["references"])
+              ? (body["references"] as readonly {
+                  kind: "file" | "directory" | "issue" | "log" | "url" | "text";
+                  value: string;
+                }[])
+              : [],
+            userConfirmAllWrites,
+          });
+          json(response, 200, {
+            contract: projectContract(graded.contract),
+            // The contract's inferred write scope may be empty on its own; the
+            // boundary the user is actually being asked to grant is the envelope
+            // we built from their write paths. Surface it so the confirmation
+            // modal shows exactly what may change.
+            writePaths: graded.autonomy.writePaths,
+            allowedCommands: graded.autonomy.allowedCommands,
+            questions: graded.questions.map((question) => ({
+              questionId: question.questionId,
+              question: question.question,
+              affects: question.affects,
+              suggestedAnswer: question.suggestedAnswer,
+            })),
+            // The server-authoritative startup grade (ADR-0013). The workbench
+            // renders this: an `auto_start` result still shows the preview,
+            // then begins without an extra click; `require_confirmation` names
+            // its reasons; `refuse` shows the dirty-overlap recovery.
+            risk: projectRisk(graded.risk),
+          });
+        } catch (error) {
+          // An unreadable path, a non-Git workspace or a profile the pack refuses
+          // to read is a client problem: the preview cannot be drafted, so say so
+          // rather than starting a task that would fail the same way.
+          json(response, 400, {
+            error: `the contract could not be previewed: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
         return;
       }
 
@@ -927,6 +1070,24 @@ class HttpError extends Error {
  * machine states the same change set as the one produced locally (DP-01, EX-02).
  */
 
+/** Project the auditable start risk onto the wire (ADR-0013). */
+function projectRisk(risk: StartRiskResult): Record<string, unknown> {
+  return {
+    decision: risk.decision,
+    reasons: risk.reasons,
+    ...(risk.dirtyOverlap.length === 0 ? {} : { dirtyOverlap: risk.dirtyOverlap }),
+    ...(risk.recovery === undefined ? {} : { recovery: risk.recovery }),
+    inputs: {
+      openQuestionCount: risk.audited.openQuestionCount,
+      scopeUnknown: risk.audited.scopeUnknown,
+      maxReversibility: risk.audited.maxReversibility,
+      externalSystems: risk.audited.externalSystems,
+      allowedHosts: risk.audited.allowedHosts,
+      policy: risk.audited.policy,
+    },
+  };
+}
+
 /** HTTP status for a data-management refusal, so the client can react to it. */
 function dataErrorStatus(error: DataError): number {
   switch (error.code) {
@@ -963,4 +1124,83 @@ function buildAutonomy(
     updatedBy: "user",
     widenedBy: [],
   }) as AutonomyEnvelope;
+}
+
+/**
+ * Read-only contract draft + risk grade for one submission (ADR-0013).
+ *
+ * Shared by the preview endpoint and the start path so both derive the grade
+ * from the identical inputs. It creates no session, no task and no ledger
+ * event. The dirty-worktree probe is best-effort: a workspace we cannot read
+ * as Git is refused by the compile step anyway, so an empty overlap here must
+ * never *permit* a task the compile step would reject.
+ */
+async function gradeSubmission(input: {
+  readonly workspacePath: string;
+  readonly requestText: string;
+  readonly writePaths: readonly string[];
+  readonly allowedCommands: readonly string[];
+  readonly references: readonly {
+    readonly kind: "file" | "directory" | "issue" | "log" | "url" | "text";
+    readonly value: string;
+  }[];
+  readonly userConfirmAllWrites: boolean;
+}): Promise<{
+  readonly projectId: string;
+  readonly autonomy: AutonomyEnvelope;
+  readonly contract: OutcomeContract;
+  readonly questions: {
+    readonly questionId: string;
+    readonly question: string;
+    readonly affects: string;
+    readonly suggestedAnswer: string;
+  }[];
+  readonly risk: StartRiskResult;
+}> {
+  const projectId = await projectIdForWorkspace(input.workspacePath);
+  const profile = await detectProjectProfile(input.workspacePath, projectId);
+  const autonomy = buildAutonomy(projectId, input.writePaths, input.allowedCommands);
+  const proposal = compileContract({
+    taskId: newId("task"),
+    projectId,
+    request: input.requestText,
+    profile,
+    autonomy,
+    // The workbench derives one reference per write path so the compiler's
+    // scope matches what the user typed; without it the scope is "unknown" and
+    // every write is conservatively graded scope_expansion.
+    ...(input.references.length > 0 ? { references: input.references } : {}),
+  });
+
+  const writePatterns = proposal.contract.scope.include
+    .filter((entry) => entry.intent === "write")
+    .map((entry) => entry.pattern);
+  const dirtyPaths = await listDirtyPaths(input.workspacePath).catch(() => [] as readonly string[]);
+  const dirtyOverlap = findDirtyOverlap(dirtyPaths, writePatterns);
+  const policy = await resolveStartPolicy(input.workspacePath, input.userConfirmAllWrites);
+
+  const risk = gradeStartRisk({
+    contract: proposal.contract,
+    envelope: autonomy,
+    questions: proposal.questions.map((question) => ({
+      questionId: question.questionId,
+      affects: question.affects,
+    })),
+    userWritePaths: input.writePaths,
+    dirtyOverlap,
+    policy,
+  });
+
+  return {
+    projectId,
+    autonomy,
+    contract: proposal.contract,
+    questions: proposal.questions.map((question) => ({
+      questionId: question.questionId,
+      question: question.question,
+      affects: question.affects,
+      suggestedAnswer: question.suggestedAnswer,
+    })),
+    risk,
+  };
 }

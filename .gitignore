@@ -6,6 +6,9 @@ node_modules/
 dist/
 *.tsbuildinfo
 
+# locally compiled desktop helper (rebuild per macOS architecture; never commit a host-specific binary)
+packages/desktop/bin/keystone-window
+
 # keystone local runtime data (never commit project cognition, evidence, or proofs)
 .keystone/
 *.keystone-tmp

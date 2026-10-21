@@ -5,11 +5,12 @@
  * headlessly. It reimplements none of the kernel's logic: every state change
  * goes through `KernelSession`, and every run goes through `KeystoneRuntime`.
  *
- * Exit-code semantics (stable, so CI can branch on them):
+ * Exit-code semantics (stable, so CI can branch on them) are defined once in
+ * `../exit-codes.ts` and shared with `keystone ci`:
  *   0  the task is `proven`
  *   3  human attention is required (a pending decision, or a contract that
  *      needs confirmation) — the run stopped, it did not fail
- *   1  any other failure
+ *   1  any other non-proven end (failed / stopped / graceful exit)
  *   2  the invocation itself was wrong (bad flag/usage)
  */
 
@@ -61,6 +62,7 @@ import {
   requireString,
   UsageError,
 } from "../args.ts";
+import { exitCodeForTask } from "../exit-codes.ts";
 import { createOutput, type Output } from "../output.ts";
 import {
   budgetFrom,
@@ -83,7 +85,7 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function parseReferences(
+export function parseReferences(
   raw: readonly string[],
 ): { kind: RefKind; value: string }[] {
   return raw.map((entry) => {
@@ -435,15 +437,7 @@ async function runTask(argv: readonly string[], context: CliContext): Promise<nu
     })),
   });
 
-  if (result.status === "proven") return 0;
-  if (
-    result.status === "needs_attention" ||
-    result.status === "awaiting_approval" ||
-    pending.length > 0
-  ) {
-    return 3;
-  }
-  return 1;
+  return exitCodeForTask(result.status, pending.length);
 }
 
 /** Read only the first line of a ledger, to identify a task without loading it. */

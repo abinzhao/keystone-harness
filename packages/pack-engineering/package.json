@@ -1,6 +1,6 @@
 {
   "name": "@keystone/pack-engineering",
-  "version": "0.0.0",
+  "version": "1.0.0-rc.1",
   "private": true,
   "type": "module",
   "description": "Engineering reference scenario pack: Git/workspace scanning and profiling, Windows package-manager spawn-target resolution, and the Outcome-Contract proposal for software-engineering tasks (ADR-0006).",

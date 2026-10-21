@@ -16,7 +16,7 @@ import {
 } from "@keystone/schemas";
 
 import { deleteFileTool, listDirTool, readFileTool, searchTextTool, writeFileTool } from "../src/fs.ts";
-import { gitDiffTool, gitShowHeadTool, gitStatusTool } from "../src/git.ts";
+import { gitCommitTool, gitDiffTool, gitRollbackTool, gitShowHeadTool, gitStatusTool } from "../src/git.ts";
 import { sanitizeEnv } from "../src/guard.ts";
 import { TOOL_IDS, builtinTools, describeTool, getTool, toolDescriptors } from "../src/index.ts";
 import { runCommandTool } from "../src/shell.ts";
@@ -206,6 +206,98 @@ test("search_text finds matches and skips node_modules", async () => {
     assert.equal(result.status, "succeeded");
     assert.match(result.stdout ?? "", /src\/needle\.txt:1:a needle here/);
     assert.doesNotMatch(result.stdout ?? "", /node_modules/);
+  });
+});
+
+test("git commit stages and commits only the scoped paths, leaving other dirty files uncommitted", async () => {
+  await withRepo(async (fixture) => {
+    await writeFile(join(fixture.repo, "src", "app.txt"), "agent changed\n");
+    await writeFile(join(fixture.repo, "src", "new.txt"), "brand new\n");
+    // A user dirty file outside the commit set must stay out of the commit.
+    await writeFile(join(fixture.repo, "README.md"), "# user edit, do not commit\n");
+
+    const lease = makeLease("git.write", ["src/app.txt", "src/new.txt"]);
+    const result = await gitCommitTool.run(
+      { paths: ["src/app.txt", "src/new.txt"], message: "agent work" },
+      makeContext(fixture, lease),
+    );
+    assert.equal(result.status, "succeeded", result.stderr);
+    assert.deepEqual([...result.changedPaths].sort(), ["src/app.txt", "src/new.txt"]);
+
+    const status = (await exec("git", ["status", "--porcelain"], { cwd: fixture.repo })).stdout;
+    // The scoped paths are now committed; the user's README edit is not.
+    assert.doesNotMatch(status, /src\/new\.txt/);
+    assert.doesNotMatch(status, /src\/app\.txt/);
+    assert.match(status, /README\.md/);
+  });
+});
+
+test("git commit refuses an out-of-scope path before staging anything", async () => {
+  await withRepo(async (fixture) => {
+    await writeFile(join(fixture.repo, "src", "app.txt"), "changed\n");
+    const lease = makeLease("git.write", ["src/app.txt"]);
+    await assert.rejects(
+      gitCommitTool.run({ paths: ["README.md"], message: "x" }, makeContext(fixture, lease)),
+      ToolRefusedError,
+    );
+    // Still only the init commit: nothing was staged or committed.
+    const log = (await exec("git", ["log", "--oneline"], { cwd: fixture.repo })).stdout.trim();
+    assert.equal(log.split("\n").length, 1);
+  });
+});
+
+test("git commit refuses a path that was dirty at onboarding (no hunk-split)", async () => {
+  await withRepo(async (fixture) => {
+    await writeFile(join(fixture.repo, "src", "app.txt"), "agent edit on top of user edit\n");
+    const lease = makeLease("git.write", ["src/app.txt"]);
+    const ctx = makeContext(fixture, lease);
+    (ctx as { baselineDirtyPaths?: Set<string> }).baselineDirtyPaths = new Set(["src/app.txt"]);
+    await assert.rejects(
+      gitCommitTool.run({ paths: ["src/app.txt"], message: "x" }, ctx),
+      (error: unknown) =>
+        error instanceof ToolRefusedError && error.code === "preexisting_dirty_overlap",
+    );
+    // No commit happened.
+    const log = (await exec("git", ["log", "--oneline"], { cwd: fixture.repo })).stdout.trim();
+    assert.equal(log.split("\n").length, 1);
+  });
+});
+
+test("git rollback moves the branch back but preserves the working tree and user changes", async () => {
+  await withRepo(async (fixture) => {
+    const before = (await exec("git", ["rev-parse", "HEAD"], { cwd: fixture.repo })).stdout.trim();
+    await writeFile(join(fixture.repo, "src", "app.txt"), "agent change\n");
+    await gitCommitTool.run(
+      { paths: ["src/app.txt"], message: "agent" },
+      makeContext(fixture, makeLease("git.write", ["src/app.txt"])),
+    );
+    // A user dirty file, untouched by the commit.
+    await writeFile(join(fixture.repo, "README.md"), "# user\n");
+
+    const rollback = await gitRollbackTool.run(
+      { target: before, reason: "undo the agent commit" },
+      makeContext(fixture, makeLease("git.write", ["."])),
+    );
+    assert.equal(rollback.status, "succeeded", rollback.stderr);
+
+    const after = (await exec("git", ["rev-parse", "HEAD"], { cwd: fixture.repo })).stdout.trim();
+    assert.equal(after, before);
+    // Soft reset leaves file bytes exactly where they were: agent change staged
+    // but present, and the user's edit untouched.
+    assert.equal(await readFile(join(fixture.repo, "src", "app.txt"), "utf8"), "agent change\n");
+    assert.equal(await readFile(join(fixture.repo, "README.md"), "utf8"), "# user\n");
+  });
+});
+
+test("git rollback refuses without a git.write lease", async () => {
+  await withRepo(async (fixture) => {
+    await assert.rejects(
+      gitRollbackTool.run(
+        { target: "HEAD" },
+        makeContext(fixture, makeLease("git.read", ["."])),
+      ),
+      ToolRefusedError,
+    );
   });
 });
 

@@ -1,6 +1,6 @@
 {
   "name": "keystone-harness",
-  "version": "0.0.0",
+  "version": "1.0.0-rc.1",
   "private": true,
   "type": "module",
   "description": "Evidence-native, local-first engineering agent harness",
@@ -11,10 +11,15 @@
   "packageManager": "pnpm@8.15.9",
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node --test \"packages/*/test/**/*.test.ts\"",
+    "test": "node --test \"packages/*/test/**/*.test.ts\" \"scripts/**/test/**/*.test.ts\"",
     "test:watch": "node --test --watch \"packages/*/test/**/*.test.ts\"",
     "bench": "node packages/runtime/bench/perf.ts",
     "keystone": "node packages/cli/src/bin.ts",
+    "release:check": "node scripts/release/version-check.ts",
+    "release:bump": "node scripts/release/bump-version.ts",
+    "release:sbom": "node scripts/release/sbom.ts --out dist/release/sbom.json",
+    "release:buildinfo": "node scripts/release/build-info.ts --out dist/release/build-info.json",
+    "release:all": "pnpm run release:check && pnpm run release:sbom && pnpm run release:buildinfo",
     "verify": "pnpm run typecheck && pnpm run test"
   },
   "devDependencies": {

@@ -78,6 +78,7 @@ import { createIsolatedWorkspace } from "./isolation.ts";
 import { factsToInvalidate, judgeExperienceUse, learnFromRun } from "./learning.ts";
 import { evaluateDegradation, modeCapabilities, type RunMode } from "./modes.ts";
 import { runVerification, type VerificationOutcome } from "./verification.ts";
+import { WorkspaceWriteAdmission } from "./workspace-lock.ts";
 
 export interface RuntimeOptions {
   readonly paths: KeystonePaths;
@@ -212,6 +213,8 @@ export class KeystoneRuntime {
   private readonly contractProposer: ContractProposer;
   private readonly mode: RunMode;
   private readonly actorId: string;
+  /** Process-local admission: at most one standard writer per canonical workspace. */
+  private readonly writeAdmission = new WorkspaceWriteAdmission();
 
   private constructor(options: RuntimeOptions) {
     this.paths = options.paths;
@@ -263,7 +266,41 @@ export class KeystoneRuntime {
     return { projectId, rootPath: workspacePath, profile, snapshot, facts, firewall };
   }
 
+  /**
+   * Admit a run, then execute it.
+   *
+   * Admission happens before any project attachment or ledger write: a standard
+   * run that cannot take the workspace writer lock is refused outright, with no
+   * orphaned task left behind. The lock is released in `finally`, so a run that
+   * finishes, fails, or is stopped by the user always frees the workspace.
+   */
   async runTask(options: RunTaskOptions): Promise<RunTaskResult> {
+    const projectId = await projectIdForWorkspace(options.workspacePath);
+    const releaseWrite = this.acquireWorkspaceWrite(projectId);
+    try {
+      return await this.executeTask(options, projectId);
+    } finally {
+      releaseWrite();
+    }
+  }
+
+  /**
+   * Take the workspace writer lock for standard runs only.
+   *
+   * Isolated runs edit a throwaway worktree and replay/minimal do no new work, so
+   * they neither hold nor wait on this lock (see ./workspace-lock.ts). A second
+   * standard run on the same canonical workspace is refused here, before any side
+   * effect, and directed to isolated mode.
+   */
+  private acquireWorkspaceWrite(projectId: string): () => void {
+    if (this.mode !== "standard") return () => undefined;
+    return this.writeAdmission.tryAcquire(projectId, nowIso());
+  }
+
+  private async executeTask(
+    options: RunTaskOptions,
+    projectId: string,
+  ): Promise<RunTaskResult> {
     const attachment = await this.attachProject(options.workspacePath);
     const capabilities = modeCapabilities(this.mode);
     // Isolated mode works in a throwaway worktree, so a failed attempt cannot
@@ -284,6 +321,8 @@ export class KeystoneRuntime {
       proposeContract: this.contractProposer,
       resolveAction: resolveEngineeringAction,
     });
+    // Name the holder so a later refusal can point at the task that is running.
+    this.writeAdmission.noteHolder(projectId, session.taskId);
     options.onTaskCreated?.(session.taskId);
 
     const interventions: InterventionRequest[] = [];
@@ -365,6 +404,11 @@ export class KeystoneRuntime {
 
     let fingerprint = attachment.snapshot.fingerprint;
     let snapshotId: string = attachment.snapshot.snapshotId;
+    // Paths that were dirty/untracked at onboarding: a git.commit must refuse to
+    // sweep them into the agent commit (PRD PI-01 line 312; ADR-0007, B1).
+    const baselineDirtyPaths = new Set(
+      attachment.snapshot.entries.filter((entry) => entry.gitStatus !== "").map((entry) => entry.path),
+    );
     let lastProgressKey = "";
     let noProgressStreak = 0;
     let lastFailures: string[] = [];
@@ -572,6 +616,7 @@ export class KeystoneRuntime {
           proposal,
           contract,
           workPath,
+          baselineDirtyPaths,
         );
         if (outcome.intervention !== undefined) {
           interventions.push(outcome.intervention);
@@ -963,9 +1008,14 @@ export class KeystoneRuntime {
       attempt,
     });
 
+    // The builder speaks the text-envelope protocol: the tools are listed in the
+    // prompt above (`availableTools`) and the model returns an action envelope as
+    // JSON text. Native tool calling is not wired up, so `tools` must stay empty —
+    // a non-empty array would make the OpenAI-compatible adapter refuse the call
+    // before the network (ModelToolsUnsupportedError) rather than send the tools.
     const outcome = await this.router.complete("builder", {
       messages: [{ role: "user", content: prompt }],
-      tools: this.tools.map((tool) => tool.descriptor),
+      tools: [],
       jsonMode: true,
     });
 
@@ -977,6 +1027,7 @@ export class KeystoneRuntime {
     proposal: ActionProposal,
     contract: OutcomeContract,
     workPath: string,
+    baselineDirtyPaths: ReadonlySet<string>,
   ): Promise<{
     changedPaths: readonly string[];
     stopReason?: string;
@@ -1027,6 +1078,7 @@ export class KeystoneRuntime {
       branchId: session.branchId,
       paths: this.paths,
       lease: authorization.lease,
+      baselineDirtyPaths,
     } as never);
 
     await session.recordExecution({

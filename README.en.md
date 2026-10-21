@@ -10,7 +10,7 @@ At its center is a minimal trusted kernel that works inside explicit user-set bo
 
 ## Status
 
-**This is a developer-preview, CLI-first release**: aimed at developers who are comfortable driving the kernel from a command line; the ordinary-user desktop shell is not implemented.
+**This is a developer-preview, CLI-first release**: the working tree is the `1.0.0-rc.1` candidate — the whole workspace is uniformly marked as a prerelease candidate, but it is **not** a stable 1.0.0: the root package stays `private`, nothing is published to a registry, and nothing is signed or notarized. A stable 1.0.0 still requires explicit `--allow-1.0` admission once the ROADMAP gates close (ADR-0012). Alongside the CLI, this RC includes an experimental native macOS thin window; it reuses the same Run Protocol rather than creating a second runtime, but it is not yet packaged, signed, or notarized as a distributable `.app`.
 
 Keystone is in early implementation. The **P0 kernel, runtime, and headless CLI exist** and are exercised end to end against real Git repositories:
 
@@ -20,9 +20,10 @@ Keystone is in early implementation. The **P0 kernel, runtime, and headless CLI 
 - Checkpoints, a branchable run graph with branch comparison, recovery assessment, and precise evidence invalidation when the workspace changes.
 - An Experience Firewall that keeps unverified lessons out of future tasks and demotes one as soon as a later task shows it did not help.
 - A governed extension surface (manifest, integrity, conformance kit, registry) with a working reference extension.
+- Governed local out-of-process capability: local `stdio` MCP tools installed through the existing extension flow, plus project/user Agent Skills discovered on disk — both treated as untrusted input, granted no capability by mere presence, with no remote transport or marketplace (ADR-0009).
 - A local Run Protocol server and a four-zone workbench — the same runtime and the same schemas the CLI uses.
 
-**Not yet done (please do not overstate):** the desktop shell (the planned thin Tauri wrapper) is not built; Git write operations (commit / rollback) are not implemented yet — today it is read-only Git tools plus `git worktree` isolation; Windows is implemented and unit-tested at the resolution layer, but the end-to-end suite has not yet been run on a Windows machine. See [ROADMAP.md](./ROADMAP.md) for milestones and entry/exit gates.
+**Not yet done (please do not overstate):** on macOS, the desktop shell now embeds the same-origin loopback proxy in a native Swift/WKWebView window. It supervises `keystone serve`, injects the bearer token server-side, protects `/desktop/*` with a per-start nonce, and provides first-run BYOK, simple/advanced modes, risk-graded Contract preview, and terminal receipts (ADR-0008, ADR-0013). The native helper was built from source and exercised on an Apple M3 Pro, but there is **no** universal/Intel `.app`, Apple Developer ID signing, notarization, or public packaging; unsupported platforms or a missing helper degrade explicitly to the system browser. Git writes are implemented under scoped `git.write` leases, and a target path overlapping pre-existing user edits is refused with commit/stash/isolated recovery guidance (ADR-0007, ADR-0013). Windows remains unit-tested at the resolution layer only; the end-to-end suite has not run on a Windows machine.
 
 Keystone is licensed under the [Apache License 2.0](./LICENSE).
 
@@ -39,7 +40,7 @@ The design rationale lives in the [universal-foundation architecture](./docs/arc
 
 The kernel is not bound to any one vertical. **Engineering is the first — and currently the only — shipped reference vertical.** The same kernel is designed around six shared primitives — Goal/Contract, Context/Memory, Capability, Policy/Lease, Evidence/Receipt, Exception/Human decision — so it can carry personal, research, creation, enterprise, and physical-device/robotics packs. They are all added as adapters + extensions with **zero kernel change**; none is implemented yet — an architecture ambition, not a claim.
 
-The ordinary-user end state is **zero-config progressive disclosure**: mechanics hidden by default, a preview before any irreversible action, a receipt after completion, a pause at exceptions, and on-demand replay. Today's shipped surface is still the **developer surface** (SDK / protocol / debug / eval); the ordinary-user desktop shell is not built.
+The ordinary-user end state is **zero-config progressive disclosure**: mechanics hidden by default; low-risk, clearly scoped, reversible writes without external effects may auto-start after preview when project policy permits; ambiguity, boundary expansion, irreversible/external/high-risk actions, or policy requirements still ask for confirmation; completion leaves a receipt; exceptions pause; replay stays available. The RC's macOS native window and BYOK onboarding cover this main path, but remain an unsigned, unnotarized, unpackaged developer preview.
 
 ## Layout
 
@@ -65,7 +66,10 @@ pnpm install          # link workspace packages
 pnpm run typecheck    # tsc, no build step
 pnpm test             # node:test over packages/*/test
 pnpm run verify       # typecheck + tests
+pnpm run release:all  # offline SBOM + build-info + version/release-readiness check (no publish/sign)
 ```
+
+CI runs install / typecheck / tests on macOS and Linux and emits the offline SBOM and build-info; a separate non-blocking Windows verification path exists but has not yet been confirmed on a real Windows machine. Release assets are written only to the git-ignored `dist/release/`; the current version is the pre-release candidate `1.0.0-rc.1`. Workspace versions move only through the authoritative `pnpm run release:bump <version>` script, and generated artifacts and the lockfile are regenerated by their own generators / `pnpm install` — never hand-edited. No script publishes, signs, or notarizes.
 
 The kernel has **no runtime dependencies**. Packages are executed directly from TypeScript sources; there is no build step. Two constraints follow and are enforced in code review: no non-erasable syntax (`enum`, `namespace`, parameter properties, decorators); relative imports must carry an explicit `.ts` extension.
 
@@ -75,15 +79,40 @@ The kernel has **no runtime dependencies**. Packages are executed directly from 
 node packages/cli/src/bin.ts --help
 node packages/cli/src/bin.ts project inspect .
 node packages/cli/src/bin.ts task run --project . --request "fix the duplicate session refresh"
+node packages/cli/src/bin.ts ci --project . --request "fix the duplicate session refresh" --scripted-fixture fixture.json
 node packages/cli/src/bin.ts proof show <taskId>
 node packages/cli/src/bin.ts replay <taskId>
+node packages/cli/src/bin.ts extension install ./packages/extension-no-debug-statements
+node packages/cli/src/bin.ts extension list
 ```
 
-### Configure a model (any OpenAI-compatible endpoint)
+Extensions are user-governed: `extension install <local path>` verifies the manifest
+digest against the real entry bytes, runs the Conformance Kit, and discloses in plain
+language what it can do, whether data leaves the machine, and whether it is reversible.
+An extension that can reach outside the machine is recorded only with an explicit
+`--yes`, and activation passes through the gate again. There is no remote marketplace —
+installation is local-path only.
 
-Keystone talks the OpenAI Chat Completions shape with no vendor SDK, so the OpenAI API itself, Azure-compatible gateways, OpenRouter, and local runtimes (Ollama / LM Studio / vLLM / llama.cpp / LocalAI) all work. Keys are read from stdin, stored under `~/.keystone/credentials` with owner-only permissions, and never written into the config file.
+For unattended/CI use, prefer `keystone ci`: it never prompts, prints one stable
+JSON object on stdout (including the redacted proof artifact path), and reports
+the result with the same exit codes as `task run` — `0` proven · `3` needs human
+attention (not a failure) · `1` did not prove · `2` usage error. See
+[docs/architecture/cli-automation-surface.md](./docs/architecture/cli-automation-surface.md).
 
-> **Today's model boundary:** only **text completion over an OpenAI-compatible Chat Completions interface** is supported. The native Responses API, native function/tool-calling protocol, Anthropic Messages, and Gemini native endpoints are **not current capabilities** — they are planned. The model only produces action proposals and observations over this interface; working without vendor-specific features is the point of local-first.
+### Configure a model (BYOK)
+
+Keystone speaks each provider's native HTTP surface directly with the platform `fetch` — no vendor SDK. Keys are read from stdin, stored under `~/.keystone/credentials` with owner-only permissions, and never written into the config file.
+
+Four wire protocols are supported (see [ADR-0010](./docs/adr/0010-native-model-capability-negotiation.md)):
+
+| `--protocol` | Surface | Native tools | Structured output |
+|---|---|---|---|
+| `openai-chat` (default) | OpenAI-compatible Chat Completions | no (text envelope) | yes |
+| `openai-responses` | OpenAI Responses | yes | yes |
+| `anthropic-messages` | Anthropic Messages | yes | no (JSON validated by caller) |
+| `gemini-generate` | Gemini GenerateContent | yes | yes |
+
+> **Capability is a contract:** the descriptor only claims what the adapter implements. When a request carries tool descriptors, routing selects only adapters declared with native tools; if none on the route qualify, it fails loudly before any network call rather than silently dropping them. Streaming and multimodal are declared unimplemented in v1. Old configs without a `protocol` field remain readable and default to `openai-chat`. The native wire request/response/tool-call mappings and the capability router are implemented and covered by in-process mock-`fetch` tests; however, the v1 Builder Loop still drives the validated text envelope (`tools: []`), and no live provider call has been verified end to end.
 
 ```bash
 # A hosted, OpenAI-compatible endpoint (BYOK).
@@ -92,6 +121,11 @@ node packages/cli/src/bin.ts model add --id cloud-main --kind cloud \
   --base-url https://api.openai.com/v1 --endpoint-host api.openai.com \
   --credential-handle main
 node packages/cli/src/bin.ts model credential set main   # paste the key on stdin
+
+# A native vendor surface: --protocol fills the default base-url and host.
+node packages/cli/src/bin.ts model add --id anth --kind cloud \
+  --provider anthropic --model claude-x --protocol anthropic-messages \
+  --credential-handle main
 
 # A local endpoint (Ollama example): no credential, no data leaves the machine.
 node packages/cli/src/bin.ts model add --id local-ollama --kind local \
@@ -147,6 +181,14 @@ pnpm run bench                                                  # the performanc
 - [ADR-0003: Event-sourced task ledger](./docs/adr/0003-event-sourced-task-ledger.md)
 - [ADR-0004: TypeScript with zero runtime dependencies](./docs/adr/0004-typescript-zero-runtime-dependencies.md)
 - [ADR-0005: Local-first storage layout](./docs/adr/0005-local-first-storage-layout.md)
+- [ADR-0006: Engineering vocabulary extracted to scenario packs](./docs/adr/0006-engineering-scenario-pack-extraction.md)
+- [ADR-0007: Scoped Git commit lifecycle](./docs/adr/0007-scoped-git-commit-lifecycle.md)
+- [ADR-0008: Desktop shell and contract confirmation](./docs/adr/0008-desktop-shell-and-contract-confirmation.md)
+- [ADR-0009: Governed local MCP and Skills](./docs/adr/0009-governed-local-mcp-and-skills.md)
+- [ADR-0010: Native model capability negotiation](./docs/adr/0010-native-model-capability-negotiation.md)
+- [ADR-0011: ACP mapping and the stdio adapter blocker (blocked; no adapter ships)](./docs/adr/0011-acp-mapping-and-adapter-blocker.md)
+- [ADR-0012: Release candidate boundary and the two-channel readiness gate](./docs/adr/0012-release-candidate-boundary.md)
+- [ADR-0013: Risk-graded startup and dirty-overlap refusal](./docs/adr/0013-risk-graded-startup-and-dirty-overlap.md)
 
 ---
 

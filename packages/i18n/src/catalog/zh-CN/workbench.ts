@@ -270,9 +270,44 @@ export const workbench: Catalog = {
   "Project facts invalidated": "项目事实已失效",
   "Error recorded": "已记录错误",
 
+  // Confirmations and the completion receipt.
+  "{n} of {total} required conditions are not yet satisfied.":
+    "{total} 条必需条件中尚有 {n} 条未满足。",
+  "The task finished, but its proof is not complete.": "任务已结束，但证明尚不完备。",
+  Cost: "消耗",
+  "Required conditions": "必需条件",
+  "Not yet satisfied": "尚未满足",
+  "Delete task history": "删除任务历史",
+  "This permanently removes the local record of task {task} ({status}): {events} events, {checkpoints} checkpoints and {size}. This cannot be undone.":
+    "将永久删除任务 {task}（{status}）的本地记录：{events} 个事件、{checkpoints} 个检查点、{size}。此操作不可撤销。",
+  "This resets the learned experience for {name}: {entries} promoted entries and {candidates} candidates ({size}) are dropped. Task history and your code are untouched; Keystone will simply re-learn next time.":
+    "将重置 {name} 已学到的经验：删除 {entries} 条已晋升经验、{candidates} 条候选（{size}）。任务历史和你的代码不受影响；下次会重新学习。",
+
   // Startup and placeholder copy.
   "/path/to/git/project": "/path/to/git/project",
   "src/**": "src/**",
   "No token in the URL. Open the URL printed by `keystone serve`, which includes the token fragment.":
     "URL 中没有令牌。请打开 `keystone serve` 打印的 URL，其中包含令牌片段。",
+
+  // Risk-graded startup (ADR-0013).
+  "Confirm every write task (never auto-start)": "对所有写任务都要求确认（绝不自动开始）",
+  "Why this needs confirmation": "为什么需要确认",
+  "Open questions — what 'done' means is not yet pinned down.":
+    "存在待澄清问题——尚未确定“完成”的含义。",
+  "Unresolved or wider scope than the paths you named.":
+    "范围未确定，或超出了你指定的路径。",
+  "The envelope permits non-reversible actions.":
+    "权限边界允许不可撤销的操作。",
+  "Side effects can reach the network or external systems.":
+    "副作用可能触达网络或外部系统。",
+  "Destructive commands or an unbounded write scope.":
+    "包含破坏性命令，或写范围无边界。",
+  "Your setting or this project's policy requires confirmation.":
+    "你的设置或本项目策略要求确认。",
+  "Your working tree has uncommitted changes in the files this task would write.":
+    "你的工作区中，本任务将要写入的文件存在未提交改动。",
+  "This task will not start": "该任务不会启动",
+  "This task is refused for this working copy.": "该任务被拒绝在此工作副本上运行。",
+  "Started automatically — graded low-risk (no open questions, scoped writes, no external or irreversible actions). You can pause or stop it any time.":
+    "已自动开始——评级为低风险（无待澄清问题、写范围受限、无外部或不可逆动作）。你可随时暂停或停止。",
 };

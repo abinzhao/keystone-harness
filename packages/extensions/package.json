@@ -1,6 +1,6 @@
 {
   "name": "@keystone/extensions",
-  "version": "0.0.0",
+  "version": "1.0.0-rc.1",
   "private": true,
   "type": "module",
   "license": "Apache-2.0",
@@ -10,6 +10,8 @@
   },
   "dependencies": {
     "@keystone/kernel": "workspace:*",
-    "@keystone/schemas": "workspace:*"
+    "@keystone/schemas": "workspace:*",
+    "@keystone/spawn": "workspace:*",
+    "@keystone/tools": "workspace:*"
   }
 }

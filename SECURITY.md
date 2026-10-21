@@ -4,13 +4,14 @@ Keystone is an evidence-native, local-first engineering Agent Harness. It unders
 
 This document describes the supported versions, the vulnerability disclosure process, and Keystone's threat model and security controls. The product basis for the threat model is [`需求文档.md`](./需求文档.md) Section 11 (Security, Privacy, and Data Boundaries) and Section 13 (Success Metrics).
 
-> The project is currently in the **design phase and has not yet shipped a production runtime**. The supported-version table and response timeframes are provisional commitments that will be calibrated to the actual release cadence when the first stable version is released.
+> The project is currently at **`1.0.0-rc.1` source-tree candidate** status, not a production release. The root package remains private; no public binary is signed or notarized. The supported-version table and response timeframes remain provisional commitments until the first stable release.
 
 ## 1. Supported Versions
 
 | Version | Status | Security Updates |
 |---|---|---|
-| `main` (design phase) | In development, no released version | No binary support; security feedback at the documentation and design level is accepted |
+| `1.0.0-rc.1` source tree | Local release candidate; no published binary | Best-effort security fixes on `main`; no binary distribution promise |
+| `main` | Active development | Security feedback on code, protocol, and design is accepted |
 | First stable version (unreleased) | Planned | Security updates provided after release, with the window declared in the release notes |
 | Stable versions N and N-1 | Planned | At minimum, maintain read or export capability for the current and previous major data formats (PRD 18.3) |
 
@@ -130,13 +131,19 @@ A spawned process group is killed as a whole on timeout on POSIX; on Windows the
 negative-pid group kill is unsupported, so only the direct child is terminated —
 a known limitation, not a guarantee.
 
+### 4.8 Local desktop shell boundary
+
+The macOS RC window is a thin Swift/WKWebView view over a Node loopback proxy. The webview never receives the Run Protocol bearer token; the proxy injects it upstream. Shell-private `/desktop/*` routes require an unguessable per-start nonce minted into an HttpOnly cookie on the first navigation, so merely discovering the ephemeral port is insufficient. The window and runtime are supervised processes and closing the window tears down the proxy, runtime child, and instance lock.
+
+This does **not** establish a hardened multi-user desktop security boundary. A hostile local process running as the same user may inspect process state or user-owned files, and this RC is not signed, notarized, sandboxed, or packaged as an `.app`. Those distribution controls remain stable-release gates.
+
 ## 5. Out of Scope for Security Design
 
 The following are not targets of security vulnerability reports and must not be submitted as vulnerabilities:
 
 - Normal behavior within the capabilities the user has explicitly granted in the project and that complies with the Autonomy Envelope;
 - Issues with the model's own output quality, hallucinations, or answer style (these should go through the feature feedback channel in [`SUPPORT.md`](./SUPPORT.md));
-- The not-yet-released production runtime (no available version currently), though security review comments on the **design** are welcome.
+- Stable-release binary signing/notarization gaps are tracked release blockers, not vulnerabilities in this private RC; exploitable flaws in the source-tree window, nonce gate, credential storage, or supervised process boundary are in scope.
 
 ## 6. Related Documents
 

@@ -90,8 +90,11 @@ export const noDebugStatementsVerifier: Verifier = {
     evidenceLevel: "E1",
     canSatisfyRequiredCondition: false,
     independence: {
+      // A deterministic text scan does not trust the model's text, but it runs
+      // in this process, so it must not claim independence of that process, its
+      // workspace or its data source (the Conformance entry probe refuses that).
       mode: "same_process",
-      independentOf: ["builder_loop_model", "builder_loop_process"],
+      independentOf: ["builder_loop_model"],
     },
     timeoutMs: 10_000,
     requiresCommand: false,

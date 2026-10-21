@@ -19,7 +19,9 @@ import {
   keystoneConfigSchema,
   loadConfig,
   modelConfigEntrySchema,
+  MODEL_PROTOCOLS,
   MODEL_ROLES,
+  presetFor,
   routeFor,
   saveConfig,
   type KeystoneConfig,
@@ -77,7 +79,7 @@ async function runList(argv: readonly string[], context: CliContext): Promise<nu
           }`;
     output.line(`      ${t("credential:")} ${credential}`);
     output.detail(
-      `baseUrl: ${model.baseUrl ?? t("(none)")}; contextTokens: ${model.contextTokens ?? t("(default)")}`,
+      `protocol: ${model.protocol ?? "openai-chat"}; baseUrl: ${model.baseUrl ?? t("(none)")}; contextTokens: ${model.contextTokens ?? t("(default)")}`,
     );
   }
 
@@ -121,6 +123,7 @@ async function runAdd(argv: readonly string[], context: CliContext): Promise<num
       kind: "string",
       provider: "string",
       model: "string",
+      protocol: "string",
       "base-url": "string",
       "endpoint-host": "string",
       "credential-handle": "string",
@@ -143,13 +146,36 @@ async function runAdd(argv: readonly string[], context: CliContext): Promise<num
   const credentialHandle = getString(args, "credential-handle");
   const contextTokens = parsePositiveInt(getString(args, "context-tokens"), "context-tokens");
 
+  // A provider preset fills in the wire protocol, default base URL and host when
+  // the user does not override them (ADR-0010 §2).
+  const protocolRaw = getString(args, "protocol");
+  if (protocolRaw !== undefined && !(MODEL_PROTOCOLS as readonly string[]).includes(protocolRaw)) {
+    throw new UsageError(
+      `--protocol must be one of ${MODEL_PROTOCOLS.join(" | ")}, received "${protocolRaw}"`,
+    );
+  }
+  const protocol = protocolRaw;
+  const preset = protocolRaw === undefined ? undefined : presetFor(protocolRaw);
+  const provider = getString(args, "provider") ?? preset?.provider;
+  if (provider === undefined) {
+    throw new UsageError("--provider is required (or pass --protocol to use a provider preset)");
+  }
+  const baseUrl = getString(args, "base-url") ?? preset?.defaultBaseUrl;
+  const endpointHost = getString(args, "endpoint-host") ?? preset?.endpointHost;
+  if (baseUrl === undefined || endpointHost === undefined) {
+    throw new UsageError(
+      "--base-url and --endpoint-host are required for a custom provider (or pass --protocol)",
+    );
+  }
+
   const entry = modelConfigEntrySchema.parse({
     id: requireString(args, "id"),
     kind,
-    provider: requireString(args, "provider"),
+    provider,
     modelName: requireString(args, "model"),
-    baseUrl: requireString(args, "base-url"),
-    endpointHost: requireString(args, "endpoint-host"),
+    ...(protocol === undefined ? {} : { protocol }),
+    baseUrl,
+    endpointHost,
     ...(credentialHandle === undefined ? {} : { credentialHandle }),
     ...(contextTokens === undefined ? {} : { contextTokens }),
     enabled: true,
@@ -161,11 +187,12 @@ async function runAdd(argv: readonly string[], context: CliContext): Promise<num
   await saveConfig({ configFile: pathsFor(context).configFile }, updated);
 
   output.line(
-    t('Added model "{id}" ({kind} {provider}/{modelName}).', {
+    t('Added model "{id}" ({kind} {provider}/{modelName} via {protocol}).', {
       id: entry.id,
       kind: entry.kind,
       provider: entry.provider,
       modelName: entry.modelName,
+      protocol: entry.protocol ?? "openai-chat",
     }),
   );
   if (entry.kind !== "local") {
@@ -314,7 +341,9 @@ export const command: CommandModule = {
     "  Show configured models, role routing and where data would be sent.",
     "",
     "keystone model add --id <id> --kind <cloud|local> --provider <p> --model <name> \\",
-    "    --base-url <https://host/v1> --endpoint-host <host> [--credential-handle <h>] [--context-tokens <n>]",
+    "    [--protocol <openai-chat|openai-responses|anthropic-messages|gemini-generate>] \\",
+    "    [--base-url <url> --endpoint-host <host>] [--credential-handle <h>] [--context-tokens <n>]",
+    "  --protocol selects the provider wire surface and fills default base URL/host.",
     "",
     "keystone model route <builder|summarizer|planner> <modelId> [<modelId> ...]",
     "  Set the ordered fallback list for a role.",

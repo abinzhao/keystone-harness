@@ -43,6 +43,7 @@ export function createScriptedAdapter(options: ScriptedAdapterOptions): Scripted
       const text = options.respond(request, callIndex);
       return {
         text,
+        toolCalls: [],
         usage: { inputTokens: 0, outputTokens: 0 },
         modelName: options.descriptor.modelName,
         finishReason: "stop",
@@ -82,7 +83,14 @@ export function scriptedModelDescriptor(overrides: Partial<ModelDescriptor> = {}
     provider: "keystone",
     modelName: "scripted-1",
     endpointHost: "local",
-    capabilities: { tools: true, jsonMode: true, streaming: false, contextTokens: 32_000 },
+    protocol: "openai-chat",
+    capabilities: {
+      nativeTools: true,
+      structuredOutput: true,
+      streaming: false,
+      multimodal: false,
+      contextTokens: 32_000,
+    },
     dataEgress: { classes: [], local: true },
     ...overrides,
   } as ModelDescriptor;

@@ -1,0 +1,59 @@
+name: CI
+
+# Trusted matrix: macOS + Linux run the full gate (install / typecheck / test) and
+# produce the offline release artifacts (SBOM + build-info). There is no signing,
+# notarization, publishing, or npm registry step here on purpose.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: Verify (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm via Corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@v4
+        with:
+          # Mirrors engines.node (>=22.18). Tracked in lockstep with CONTRIBUTING.md.
+          node-version: 22
+          cache: pnpm
+
+      - name: Print toolchain
+        run: |
+          node --version
+          pnpm --version
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        run: pnpm run typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Offline CI proof smoke (keystone ci)
+        run: node scripts/ci/smoke-offline-proof.mjs
+
+      - name: Version consistency / release readiness
+        run: pnpm run release:check
+
+      - name: Generate offline SBOM + build-info
+        run: pnpm run release:all
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.os }}
+          path: dist/release/
+          if-no-files-found: error

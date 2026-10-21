@@ -529,6 +529,30 @@
         .skeleton { animation: none; }
       }
 
+      /* Narrow windows (a resized desktop window or split view): the fixed
+         two side columns no longer fit. Collapse to a single column and put the
+         task itself (centre) first, so a narrow reader sees the goal/status
+         before the surrounding lists. The page scrolls naturally instead of
+         forcing horizontal overflow. */
+      @media (max-width: 860px) {
+        .app {
+          height: auto;
+          min-height: 100vh;
+          grid-template-columns: minmax(0, 1fr);
+          grid-template-areas:
+            "topbar"
+            "centre"
+            "left"
+            "right"
+            "bottom";
+        }
+        .zone { overflow: visible; }
+        .topbar { flex-wrap: wrap; row-gap: 6px; }
+        .ctx { min-width: 0; }
+        .bottom form { flex-direction: column; align-items: stretch; }
+        .bottom .grow, .bottom .request { flex: 1 1 auto; min-width: 0; width: 100%; }
+      }
+
       /* --------------------------------------------------------- error/toast */
       .error {
         position: fixed;
@@ -624,6 +648,57 @@
 
       a { color: var(--accent); }
       [hidden] { display: none !important; }
+
+      /* --------------------------------------------- simple mode (default) */
+      /* Ordinary users get one column: a composer on top, status below. The
+         four-zone grid still exists and is one toggle away (ADR-0008, Decision G). */
+      :root[data-mode="simple"] .app {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas:
+          "topbar"
+          "centre"
+          "bottom";
+      }
+      :root[data-mode="simple"] .left,
+      :root[data-mode="simple"] .right { display: none; }
+      :root[data-mode="simple"] .bottom form { display: none; }
+      #simple-composer { max-width: 720px; }
+      .simple-form { display: grid; gap: 12px; margin-top: 6px; }
+      .simple-form .row { display: flex; gap: 8px; align-items: center; }
+      .simple-form .row input { flex: 1; }
+      .radio-row {
+        display: flex; align-items: center; gap: 7px; padding: 7px 10px;
+        border: 1px solid var(--line); border-radius: var(--radius-sm);
+        background: var(--surface-2); cursor: pointer;
+      }
+      .radio-row input { width: auto; margin: 0; }
+
+      /* --------------------------------------------- onboarding overlay */
+      .overlay {
+        position: fixed; inset: 0; z-index: 50; display: flex;
+        align-items: center; justify-content: center;
+        background: rgba(6, 9, 14, 0.55); backdrop-filter: blur(2px);
+        padding: 20px;
+      }
+      .overlay-card {
+        background: var(--surface); border: 1px solid var(--line-2);
+        border-radius: 14px; box-shadow: var(--shadow);
+        width: min(520px, 100%); padding: 22px;
+        display: grid; gap: 14px; max-height: 90vh; overflow: auto;
+      }
+      .overlay-card h2 { margin: 0; font-size: 17px; }
+      .overlay-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+      /* readable contract preview chips */
+      .chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0; }
+      .contract-preview { display: grid; gap: 10px; }
+      .contract-preview h4 {
+        margin: 6px 0 2px; font-size: 11px; text-transform: uppercase;
+        letter-spacing: 0.04em; color: var(--ink-3); font-weight: 600;
+      }
+      .contract-preview ul { margin: 2px 0; padding-left: 18px; }
+      .contract-preview li { margin: 2px 0; }
+      .note.ok { background: var(--ok-soft); border-color: color-mix(in srgb, var(--ok) 35%, transparent); color: var(--ok); }
     </style>
   </head>
   <body>
@@ -644,6 +719,7 @@
           <span id="run-state" class="pill"><span class="dot"></span><span id="run-state-text">idle</span></span>
           <button id="pending" class="pill action" hidden></button>
           <span class="protocol" id="protocol"></span>
+          <button class="btn btn-ghost btn-icon" id="mode-toggle" data-i18n-title="Switch to advanced view" aria-pressed="false"></button>
           <button class="btn btn-ghost btn-icon" id="theme-toggle"></button>
           <button class="btn btn-ghost btn-icon" id="data-button" data-i18n-title="Local data"></button>
           <button class="btn btn-ghost btn-icon" id="refresh" data-i18n-title="Refresh"></button>
@@ -672,8 +748,47 @@
       </aside>
 
       <main class="centre zone">
+        <div id="start-feedback" class="note info" hidden style="margin:0 0 10px"></div>
+        <section id="simple-composer" hidden>
+          <h2 data-i18n="New task">New task</h2>
+          <form class="simple-form" id="simple-form">
+            <div class="field">
+              <label for="simple-workspace" data-i18n="Project folder">Project folder</label>
+              <div class="row">
+                <input id="simple-workspace" placeholder="/path/to/git/project" data-i18n-placeholder="/path/to/git/project" />
+                <button id="simple-pick" class="btn" type="button" data-i18n-title="Choose a folder">⌘</button>
+              </div>
+            </div>
+            <div class="field">
+              <label for="simple-request" data-i18n="What do you want done?">What do you want done?</label>
+              <textarea id="simple-request" rows="3" placeholder="Describe the task…" data-i18n-placeholder="Describe the task…"></textarea>
+            </div>
+            <div class="field">
+              <label class="radio-row">
+                <input type="radio" name="access" value="read" checked />
+                <span data-i18n="Read / analyze only">Read / analyze only</span>
+              </label>
+              <label class="radio-row">
+                <input type="radio" name="access" value="write" />
+                <span data-i18n="Write / modify files">Write / modify files</span>
+              </label>
+            </div>
+            <div class="field" id="simple-write-field" hidden>
+              <label for="simple-write-paths" data-i18n="Write paths (comma separated)">Write paths (comma separated)</label>
+              <input id="simple-write-paths" placeholder="src/**" data-i18n-placeholder="src/**" />
+            </div>
+            <div class="field">
+              <label class="small muted" style="display: flex; align-items: center; gap: 6px">
+                <input type="checkbox" id="simple-confirm-all" style="width: auto" />
+                <span data-i18n="Confirm every write task (never auto-start)">Confirm every write task (never auto-start)</span>
+              </label>
+            </div>
+            <button type="submit" id="simple-start" class="btn btn-primary" data-i18n="Start task">Start task</button>
+          </form>
+        </section>
         <section>
           <h2 data-i18n="Goal and scope">Goal and scope</h2>
+          <div id="receipt"></div>
           <div id="goal"><p class="empty lg"><span class="mark">◎</span><span data-i18n="No task selected.">No task selected.</span></p></div>
         </section>
         <section>
@@ -753,14 +868,42 @@
     <div id="error" class="error" hidden></div>
     <div id="toast" class="toast" hidden></div>
 
-    <div id="modal" class="modal" hidden>
+    <div id="modal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="modal-title">
       <div class="modal-card">
         <div class="modal-head">
           <div class="modal-title" id="modal-title"></div>
-          <button class="btn btn-ghost btn-icon" id="modal-close"></button>
+          <button class="btn btn-ghost btn-icon" id="modal-close" data-i18n-title="Close"></button>
         </div>
         <div class="modal-body" id="modal-body"></div>
         <div class="modal-foot" id="modal-foot"></div>
+      </div>
+    </div>
+
+    <div id="onboarding" class="overlay" hidden role="dialog" aria-modal="true" aria-labelledby="onboarding-title">
+      <div class="overlay-card">
+        <h2 id="onboarding-title" data-i18n="Connect a model">Connect a model</h2>
+        <p class="muted small" data-i18n="Keystone talks to any OpenAI-compatible endpoint. Enter your local server or BYOK endpoint; the key is stored on this machine only.">
+          Keystone talks to any OpenAI-compatible endpoint. Enter your local server or BYOK endpoint; the key is stored on this machine only.
+        </p>
+        <div class="form-grid">
+          <div class="field">
+            <label for="ob-base" data-i18n="Base URL">Base URL</label>
+            <input id="ob-base" placeholder="http://localhost:11434/v1" data-i18n-placeholder="http://localhost:11434/v1" />
+          </div>
+          <div class="field">
+            <label for="ob-model" data-i18n="Model name">Model name</label>
+            <input id="ob-model" placeholder="qwen2.5-coder" data-i18n-placeholder="qwen2.5-coder" />
+          </div>
+          <div class="field">
+            <label for="ob-key" data-i18n="API key">API key</label>
+            <input id="ob-key" type="password" autocomplete="off" placeholder="sk-…" data-i18n-placeholder="sk-…" />
+          </div>
+        </div>
+        <div id="onboarding-status" class="note" hidden></div>
+        <div class="overlay-actions">
+          <button id="ob-test" class="btn" type="button" data-i18n="Test connection">Test connection</button>
+          <button id="ob-save" class="btn btn-primary" type="button" data-i18n="Save & continue">Save & continue</button>
+        </div>
       </div>
     </div>
 
@@ -811,6 +954,8 @@
         play: '<path d="M7 4.5l12 7.5-12 7.5z" fill="currentColor"/>',
         clock: '<circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M12 7.5V12l3 2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>',
         file: '<path d="M6 3h8l4 4v14H6z" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M14 3v4h4" fill="none" stroke="currentColor" stroke-width="1.4"/>',
+        grid: '<rect x="4" y="4" width="7" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="13" y="4" width="7" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="4" y="13" width="7" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="13" y="13" width="7" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/>',
+        sliders: '<path d="M5 6h14M5 12h14M5 18h14" stroke="currentColor" stroke-width="1.4" opacity="0.4"/><circle cx="9" cy="6" r="2.2" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="15" cy="12" r="2.2" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="8" cy="18" r="2.2" fill="none" stroke="currentColor" stroke-width="1.4"/>',
       };
       const icon = (name, size = 14) =>
         `<svg width="${size}" height="${size}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] ?? ""}</svg>`;
@@ -831,6 +976,24 @@
         button.title = tr(theme === "dark" ? "Switch to light theme" : "Switch to dark theme");
       }
 
+      /* ----------------------------------------------- mode (simple default)
+         Ordinary users land in simple mode: one composer, status below. The full
+         four-zone workbench is one toggle away and the choice is remembered
+         (ADR-0008, Decision G). */
+      const MODE_KEY = "keystone.mode";
+      function currentMode() {
+        return localStorage.getItem(MODE_KEY) === "advanced" ? "advanced" : "simple";
+      }
+      function applyMode(mode) {
+        document.documentElement.dataset.mode = mode;
+        const toggle = el("mode-toggle");
+        toggle.innerHTML = icon(mode === "simple" ? "sliders" : "grid", 16);
+        toggle.title = tr(mode === "simple" ? "Switch to advanced view" : "Switch to simple view");
+        toggle.setAttribute("aria-pressed", String(mode === "advanced"));
+        const composer = el("simple-composer");
+        if (composer) composer.hidden = mode !== "simple";
+      }
+
       /* ----------------------------------------------------------------- state */
       const state = {
         taskId: null,
@@ -843,6 +1006,10 @@
         projectFilter: null,
         showAllEvents: false,
         timer: null,
+        /** Set when the page is served by the desktop shell; null when opened directly. */
+        shell: null,
+        /** The element focused before the dialog opened, so it can be restored. */
+        lastFocus: null,
       };
 
       function showError(message) {
@@ -863,14 +1030,12 @@
       }
 
       async function api(path, init = {}) {
-        const response = await fetch(path, {
-          ...init,
-          headers: {
-            "content-type": "application/json",
-            authorization: `Bearer ${token}`,
-            ...(init.headers ?? {}),
-          },
-        });
+        // Under the desktop shell the page holds no token (it is injected upstream
+        // by the same-origin proxy), so the header is only attached when the
+        // workbench was opened directly from `keystone serve` with `#t=…`.
+        const headers = { "content-type": "application/json", ...(init.headers ?? {}) };
+        if (token !== "") headers.authorization = `Bearer ${token}`;
+        const response = await fetch(path, { ...init, headers });
         const body = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(body.error ?? `HTTP ${response.status}`);
         return body;
@@ -1482,6 +1647,77 @@
           : "";
       }
 
+      /**
+       * A human-readable completion receipt for a finished task.
+       *
+       * It is a projection of data the server already returned (status, budget,
+       * proof, changed paths) — it never claims success the proof did not earn.
+       * It only appears once the task has left the working states.
+       */
+      const TERMINAL_STATUSES = new Set([
+        "proven",
+        "exited_gracefully",
+        "failed",
+        "stopped",
+        "unrecoverable",
+      ]);
+      function renderReceipt() {
+        const host = el("receipt");
+        const detail = state.detail;
+        if (detail === null || !TERMINAL_STATUSES.has(detail.status)) {
+          host.innerHTML = "";
+          return;
+        }
+        const proof = state.proof;
+        const budget = detail.budgetUsed;
+        const required = (proof?.conditions ?? []).filter((entry) => entry.required);
+        const unmet = required.filter((entry) => !entry.satisfied);
+        const proven = proof?.outcome === "proven";
+        const verdict = proven
+          ? {
+              klass: "ok",
+              title: tr("Proven"),
+              sub: tr("Every required condition has valid evidence at the required level."),
+            }
+          : {
+              klass: detail.status === "failed" || detail.status === "unrecoverable" ? "bad" : "warn",
+              title: statusLabel(detail.status),
+              sub:
+                unmet.length > 0
+                  ? tr("{n} of {total} required conditions are not yet satisfied.", {
+                      n: unmet.length,
+                      total: required.length,
+                    })
+                  : tr("The task finished, but its proof is not complete."),
+            };
+        const cost = budget
+          ? `<div class="kv"><span class="k">${esc(tr("Cost"))}</span><span class="v">${esc(
+              tr("{tokens} tokens · {retries} retries · {wall}", {
+                tokens: budget.tokens ?? 0,
+                retries: budget.retries ?? 0,
+                wall: fmtDuration(budget.wallClockMs),
+              }),
+            )}</span></div>`
+          : "";
+        host.innerHTML =
+          `<div class="verdict ${verdict.klass}">${icon(proven ? "proof" : "alert", 18)}` +
+          `<div><div class="verdict-title">${esc(verdict.title)}</div>` +
+          `<div class="verdict-sub">${esc(verdict.sub)}</div></div></div>` +
+          `<div class="card" style="margin-top:8px">` +
+          `<div class="kv"><span class="k">${esc(tr("Changed files"))}</span><span class="v">${proof?.changes?.changedFileCount ?? 0}</span></div>` +
+          `<div class="kv"><span class="k">${esc(tr("In scope"))}</span><span class="v">${proof?.changes?.withinScope ? tr("yes") : tr("no")}</span></div>` +
+          `<div class="kv"><span class="k">${esc(tr("Required conditions"))}</span><span class="v">${required.length - unmet.length} / ${required.length} ${proven ? "✓" : ""}</span></div>` +
+          `<div class="kv"><span class="k">${esc(tr("Reproduce steps"))}</span><span class="v">${(proof?.reproduceCommands ?? []).length}</span></div>` +
+          cost +
+          `</div>` +
+          (unmet.length
+            ? `<div class="small muted" style="margin-top:8px">${esc(tr("Not yet satisfied"))}</div>` +
+              `<ul class="list small">${unmet
+                .map((entry) => `<li>${esc(entry.description ?? entry.conditionId ?? "?")}</li>`)
+                .join("")}</ul>`
+            : "");
+      }
+
       function renderActions() {
         const status = state.detail?.status ?? null;
         const running = state.run?.status === "running";
@@ -1519,6 +1755,10 @@
           showError(String(error.message ?? error));
           return;
         }
+        // If the user selected another task while this load was in flight, drop
+        // the stale projection rather than overwriting the surface they are now
+        // looking at.
+        if (state.taskId !== taskId) return;
         // A successful load clears a transient error from an earlier poll.
         showError("");
         renderAll();
@@ -1526,6 +1766,7 @@
 
       function renderAll() {
         renderTitles();
+        renderReceipt();
         renderGoal();
         renderConditions();
         renderTrace();
@@ -1546,13 +1787,18 @@
 
       /** Poll the selected task while it is live, so the surface tracks the run. */
       async function pollSelected() {
-        if (state.taskId === null) return;
+        const taskId = state.taskId;
+        if (taskId === null) return;
         try {
           const [detail, run, tail] = await Promise.all([
-            api(`/v1/tasks/${state.taskId}`),
-            api(`/v1/tasks/${state.taskId}/run`).catch(() => null),
-            api(`/v1/tasks/${state.taskId}/events?since=${state.lastSeq}`).catch(() => ({ events: [] })),
+            api(`/v1/tasks/${taskId}`),
+            api(`/v1/tasks/${taskId}/run`).catch(() => null),
+            api(`/v1/tasks/${taskId}/events?since=${state.lastSeq}`).catch(() => ({ events: [] })),
           ]);
+          // A selection change mid-flight means this whole response belongs to a
+          // task the user no longer wants; discard it instead of clobbering the
+          // fresh projection.
+          if (state.taskId !== taskId) return;
           state.detail = detail;
           state.run = run;
           if ((tail.events ?? []).length > 0) {
@@ -1560,27 +1806,78 @@
             state.lastSeq = state.events.reduce((max, event) => Math.max(max, event.seq ?? 0), state.lastSeq);
             // Proof is a projection of evidence, which the new events may have
             // changed; re-reading it keeps the verdict honest rather than stale.
-            state.proof = await api(`/v1/tasks/${state.taskId}/proof`).catch(() => state.proof);
-            state.checkpoints = (await api(`/v1/tasks/${state.taskId}/checkpoints`).catch(() => ({ checkpoints: state.checkpoints }))).checkpoints;
+            state.proof = await api(`/v1/tasks/${taskId}/proof`).catch(() => state.proof);
+            state.checkpoints = (await api(`/v1/tasks/${taskId}/checkpoints`).catch(() => ({ checkpoints: state.checkpoints }))).checkpoints;
             renderAll();
             if (run?.status !== "running") await refreshTasks();
           }
         } catch (error) {
+          if (state.taskId !== taskId) return;
           showError(String(error.message ?? error));
         }
       }
 
       /* --------------------------------------------------------------- modals */
+      const FOCUSABLE = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
+
+      function focusableInModal() {
+        return [...el("modal").querySelectorAll(FOCUSABLE)].filter(
+          (node) => !node.disabled && node.offsetParent !== null,
+        );
+      }
+
       function openModal(title, bodyHtml, footNodes = []) {
+        // Remember what was focused so closing returns focus to where the user was.
+        if (state.lastFocus === null) state.lastFocus = document.activeElement;
         el("modal-title").textContent = title;
         el("modal-body").innerHTML = bodyHtml;
         const foot = el("modal-foot");
         foot.innerHTML = "";
         for (const node of footNodes) foot.appendChild(node);
         el("modal").hidden = false;
+        // Move focus into the dialog: prefer the close control, then the first
+        // actionable foot button, so a keyboard user is inside the dialog at once.
+        const targets = focusableInModal();
+        const preferred =
+          [...footNodes].find((node) => !node.disabled) ??
+          el("modal-close") ??
+          targets[0];
+        (preferred ?? targets[0])?.focus?.();
       }
       function closeModal() {
+        if (el("modal").hidden) return;
         el("modal").hidden = true;
+        // Restore focus to the element that opened the dialog, if it is still valid.
+        const restore = state.lastFocus;
+        state.lastFocus = null;
+        if (restore && typeof restore.focus === "function" && document.contains(restore)) {
+          restore.focus();
+        } else {
+          el("run-button")?.focus?.();
+        }
+      }
+
+      /**
+       * Keep Tab inside the dialog while it is open. Without this, focus escapes
+       * to the dimmed surface behind it, which is invisible to a keyboard user.
+       */
+      function trapModalFocus(event) {
+        if (el("modal").hidden || event.key !== "Tab") return;
+        const nodes = focusableInModal();
+        if (nodes.length === 0) {
+          event.preventDefault();
+          el("modal-close").focus();
+          return;
+        }
+        const first = nodes[0];
+        const last = nodes[nodes.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
       }
 
       function button(label, className, onClick) {
@@ -1589,6 +1886,32 @@
         node.textContent = label;
         node.addEventListener("click", onClick);
         return node;
+      }
+
+      /**
+       * A two-button confirmation for an irreversible action.
+       *
+       * The destructive call only runs after the user says so; focus starts on
+       * the safe (cancel) button so a careless Enter does not destroy data.
+       */
+      function confirmAction(title, bodyHtml, confirmLabel, danger = true) {
+        return new Promise((resolve) => {
+          let settled = false;
+          const done = (ok) => {
+            if (settled) return;
+            settled = true;
+            closeModal();
+            resolve(ok);
+          };
+          const cancel = button(tr("Cancel"), "btn", () => done(false));
+          const confirm = button(
+            confirmLabel,
+            danger ? "btn btn-danger" : "btn btn-primary",
+            () => done(true),
+          );
+          openModal(title, bodyHtml, [cancel, confirm]);
+          cancel.focus();
+        });
       }
 
       async function showDiff() {
@@ -1669,7 +1992,11 @@
                   String(project.facts),
                   `${project.experience.entries} / ${project.experience.candidates}`,
                   fmtBytes(project.bytes),
-                  `<button class="btn btn-sm" data-clear="${esc(project.projectId)}">${esc(tr("Clear experience"))}</button>`,
+                  `<button class="btn btn-sm" data-clear="${esc(project.projectId)}"` +
+                    ` data-name="${esc(project.name ?? project.projectId)}"` +
+                    ` data-entries="${project.experience.entries}"` +
+                    ` data-candidates="${project.experience.candidates}"` +
+                    ` data-size="${fmtBytes(project.bytes)}">${esc(tr("Clear experience"))}</button>`,
                 ],
                 "",
               ),
@@ -1683,7 +2010,10 @@
                   String(task.events),
                   String(task.checkpoints),
                   fmtBytes(task.bytes),
-                  `<button class="btn btn-sm btn-danger" data-delete="${esc(task.taskId)}">${esc(tr("Delete"))}</button>`,
+                  `<button class="btn btn-sm btn-danger" data-delete="${esc(task.taskId)}"` +
+                    ` data-events="${task.events}"` +
+                    ` data-checkpoints="${task.checkpoints}"` +
+                    ` data-size="${fmtBytes(task.bytes)}" data-status="${esc(task.status ?? "")}">${esc(tr("Delete"))}</button>`,
                 ],
                 "",
               ),
@@ -1704,6 +2034,22 @@
 
           for (const node of el("modal-body").querySelectorAll("[data-clear]")) {
             node.addEventListener("click", async () => {
+              const ok = await confirmAction(
+                tr("Clear experience"),
+                `<div class="note warn">${icon("alert")}<span>${esc(
+                  tr(
+                    "This resets the learned experience for {name}: {entries} promoted entries and {candidates} candidates ({size}) are dropped. Task history and your code are untouched; Keystone will simply re-learn next time.",
+                    {
+                      name: node.dataset.name,
+                      entries: node.dataset.entries,
+                      candidates: node.dataset.candidates,
+                      size: node.dataset.size,
+                    },
+                  ),
+                )}</span></div>`,
+                tr("Clear experience"),
+              );
+              if (!ok) return;
               try {
                 const result = await api(`/v1/projects/${node.dataset.clear}/experience/clear`, { method: "POST" });
                 toast(tr("Cleared {n} experience entries.", { n: result.cleared.entries }));
@@ -1715,6 +2061,23 @@
           }
           for (const node of el("modal-body").querySelectorAll("[data-delete]")) {
             node.addEventListener("click", async () => {
+              const ok = await confirmAction(
+                tr("Delete task history"),
+                `<div class="note bad">${icon("alert")}<span>${esc(
+                  tr(
+                    "This permanently removes the local record of task {task} ({status}): {events} events, {checkpoints} checkpoints and {size}. This cannot be undone.",
+                    {
+                      task: shortId(node.dataset.delete, 18),
+                      status: node.dataset.status,
+                      events: node.dataset.events,
+                      checkpoints: node.dataset.checkpoints,
+                      size: node.dataset.size,
+                    },
+                  ),
+                )}</span></div>`,
+                tr("Delete"),
+              );
+              if (!ok) return;
               try {
                 const result = await api(`/v1/tasks/${node.dataset.delete}`, { method: "DELETE" });
                 toast(tr("Deleted task history ({n} events).", { n: result.removed.events }));
@@ -1760,8 +2123,227 @@
           }));
       }
 
+      /* ----------------------------- contract preview + write gate (ADR-0008 F)
+         A write task first drafts a readable Outcome Contract (no side effect)
+         and waits for an explicit confirmation. A read-only task starts straight
+         away — asking permission to read would be theatre. */
+      function contractPreviewHtml(contract, questions, writePaths) {
+        const chips = (arr) =>
+          (arr ?? []).length
+            ? `<div class="chip-row">${arr.map((p) => `<span class="chip">${esc(p)}</span>`).join("")}</div>`
+            : `<span class="muted small">${esc(tr("none"))}</span>`;
+        const conditions = (contract.completionConditions ?? [])
+          .map(
+            (c) =>
+              `<li>${esc(c.description)} <span class="muted small">[${esc(c.verifier ?? "?")} · ${esc(c.minEvidenceLevel ?? "?")}${c.required ? "" : " · optional"}]</span></li>`,
+          )
+          .join("");
+        const budget = contract.budget ?? {};
+        const openQuestions = (questions ?? []).length
+          ? `<h4>${esc(tr("Open questions"))}</h4><ul>${questions
+              .map(
+                (q) =>
+                  `<li>${esc(q.question)} <span class="muted small">— ${esc(q.suggestedAnswer ?? "")}</span></li>`,
+              )
+              .join("")}</ul>`
+          : "";
+        return `<div class="contract-preview">` +
+          `<div class="note warn">${icon("alert")}<span>${esc(tr("This task can write to your repository. Review the scope below; it is what Keystone will bind to before it changes anything."))}</span></div>` +
+          `<div><h4>${esc(tr("Goal"))}</h4><p>${esc(contract.goal ?? "")}</p></div>` +
+          `<div><h4>${esc(tr("Write scope"))}</h4>${chips(writePaths ?? contract.writeScope)}</div>` +
+          `<div><h4>${esc(tr("Read scope"))}</h4>${chips(contract.readScope)}</div>` +
+          `<div><h4>${esc(tr("Completion conditions"))}</h4><ul>${conditions}</ul></div>` +
+          `<div><h4>${esc(tr("Budget"))}</h4><p class="muted small">${esc(tr("{tokens} tokens · {retries} retries", { tokens: budget.maxTokens ?? "?", retries: budget.maxRetries ?? "?" }))}</p></div>` +
+          openQuestions +
+          `</div>`;
+      }
+
+      /* ----------------------------- risk labels (ADR-0012)
+         The server names a start decision and the reasons behind it; the page
+         only renders them. The model and the page cannot invent a reason, so
+         this map is presentation-only. */
+      const RISK_LABELS = {
+        ambiguity: "Open questions — what 'done' means is not yet pinned down.",
+        scope_expansion: "Unresolved or wider scope than the paths you named.",
+        irreversible: "The envelope permits non-reversible actions.",
+        external_action: "Side effects can reach the network or external systems.",
+        high_risk: "Destructive commands or an unbounded write scope.",
+        policy_required: "Your setting or this project's policy requires confirmation.",
+        dirty_overlap: "Your working tree has uncommitted changes in the files this task would write.",
+      };
+      function riskReasonHtml(risk) {
+        const reasons = risk?.reasons ?? [];
+        if (!reasons.length) return "";
+        return `<h4>${esc(tr("Why this needs confirmation"))}</h4><ul>` +
+          reasons.map((code) => `<li>${esc(tr(RISK_LABELS[code] ?? code))}</li>`).join("") +
+          `</ul>`;
+      }
+
+      /* A persistent, dismissible banner above the composer for start feedback.
+         A toast expires; the auto-start / refusal notice must stay legible until
+         the user acts on it (async-ui: the result of an async start must be
+         attributable to the action that produced it). */
+      function showStartFeedback(kind, message) {
+        const box = el("start-feedback");
+        box.className = `note ${kind}`;
+        box.innerHTML = "";
+        box.appendChild(document.createTextNode(message));
+        box.hidden = false;
+      }
+      function clearStartFeedback() {
+        el("start-feedback").hidden = true;
+      }
+
+      /** Read the user's "confirm every write task" preference (simple checkbox,
+          mirrored from localStorage so advanced/simple modes agree). */
+      function confirmAllWritesSetting() {
+        const node = el("simple-confirm-all");
+        if (node) return node.checked;
+        return localStorage.getItem("keystone.confirmAllWrites") === "1";
+      }
+
+      /**
+       * Start a task with the risk-graded gate (ADR-0012).
+       *
+       * Read-only tasks start straight. A write task first drafts the preview
+       * and reads the server's grade:
+       *  - refuse (dirty overlap) → show recovery, never start;
+       *  - auto_start            → the preview is shown, then it begins without a
+       *                            second confirmation click, with a visible banner;
+       *  - require_confirmation  → show the preview + reasons, start on confirm.
+       * Returns the started task record, or null when the user cancelled or it
+       * was refused.
+       */
+      async function startTaskWithGate({ workspacePath, request, writePaths }) {
+        clearStartFeedback();
+        const base = {
+          workspacePath,
+          request,
+          references: referencesFromWritePaths(writePaths),
+          writePaths,
+          allowedCommands: ["node", "npm", "pnpm", "npx"],
+          confirmAllWrites: confirmAllWritesSetting(),
+        };
+        if (writePaths.length === 0) {
+          // Read-only: reading and analysis change nothing, so a confirm dialog
+          // would be theatre (ADR-0008 F).
+          return await api("/v1/tasks", {
+            method: "POST",
+            body: JSON.stringify({ ...base, startMode: "confirmed" }),
+          });
+        }
+
+        const preview = await api("/v1/contract/preview", {
+          method: "POST",
+          body: JSON.stringify(base),
+        });
+        const risk = preview.risk ?? { decision: "require_confirmation", reasons: ["policy_required"] };
+        const previewHtml =
+          contractPreviewHtml(preview.contract, preview.questions, preview.writePaths) + riskReasonHtml(risk);
+
+        if (risk.decision === "refuse") {
+          openModal(
+            tr("This task will not start"),
+            previewHtml +
+              (risk.recovery
+                ? `<div class="note bad" style="margin-top:8px">${icon("alert")}<span>${esc(risk.recovery)}</span></div>`
+                : ""),
+            [button(tr("Close"), "btn", closeModal)],
+          );
+          showStartFeedback("bad", risk.recovery ?? tr("This task is refused for this working copy."));
+          return null;
+        }
+
+        if (risk.decision === "auto_start") {
+          // Preview already rendered above conceptually; to keep it legible we
+          // start immediately (no second click) and then surface a persistent,
+          // undoable banner. The full contract appears in the receipt once the
+          // task is selected.
+          const started = await api("/v1/tasks", {
+            method: "POST",
+            body: JSON.stringify({ ...base, startMode: "auto" }),
+          });
+          showStartFeedback(
+            "info",
+            tr("Started automatically — graded low-risk (no open questions, scoped writes, no external or irreversible actions). You can pause or stop it any time."),
+          );
+          return started;
+        }
+
+        // require_confirmation: focus starts on Cancel; the confirm label names
+        // the act, and the reasons above explain why.
+        const accepted = await confirmAction(
+          tr("Confirm the scope of this task"),
+          previewHtml,
+          tr("Start task (I accept this scope)"),
+          false,
+        );
+        if (!accepted) return null;
+        return await api("/v1/tasks", {
+          method: "POST",
+          body: JSON.stringify({ ...base, startMode: "confirmed" }),
+        });
+      }
+
+      /* ------------------------------------------------------- onboarding */
+      function showOnboarding() {
+        const overlay = el("onboarding");
+        overlay.hidden = false;
+        const status = el("onboarding-status");
+        const setStatus = (kind, msg) => {
+          status.hidden = false;
+          status.className = `note ${kind}`;
+          status.textContent = msg;
+        };
+        el("ob-test").onclick = async () => {
+          el("ob-test").disabled = true;
+          setStatus("info", tr("Testing connection…"));
+          try {
+            const result = await api("/desktop/config/test", {
+              method: "POST",
+              body: JSON.stringify({ baseUrl: el("ob-base").value, apiKey: el("ob-key").value }),
+            });
+            if (result.ok) setStatus("ok", tr("Connection successful."));
+            else setStatus("bad", result.error ?? tr("Connection failed."));
+          } catch (error) {
+            setStatus("bad", String(error.message ?? error));
+          } finally {
+            el("ob-test").disabled = false;
+          }
+        };
+        el("ob-save").onclick = async () => {
+          el("ob-save").disabled = true;
+          setStatus("info", tr("Saving and restarting the runtime…"));
+          try {
+            await api("/desktop/config/save", {
+              method: "POST",
+              body: JSON.stringify({
+                baseUrl: el("ob-base").value,
+                apiKey: el("ob-key").value,
+                modelName: el("ob-model").value,
+              }),
+            });
+            // The shell restarted the runtime child; wait until it reports a
+            // configured model, then reload so the workbench talks to the new one.
+            for (let attempt = 0; attempt < 40; attempt += 1) {
+              await new Promise((resolve) => setTimeout(resolve, 500));
+              const boot = await api("/desktop/bootstrap").catch(() => null);
+              if (boot?.hasModel) {
+                location.reload();
+                return;
+              }
+            }
+            location.reload();
+          } catch (error) {
+            setStatus("bad", String(error.message ?? error));
+            el("ob-save").disabled = false;
+          }
+        };
+      }
+
       async function main() {
         applyTheme(currentTheme());
+        applyMode(currentMode());
         el("brand-mark").innerHTML = icon("logo", 24);
         el("modal-close").innerHTML = icon("close", 16);
         el("refresh").innerHTML = icon("refresh", 16);
@@ -1783,11 +2365,24 @@
         }
         applyStaticI18n();
 
-        if (token === "") {
+        // Are we inside the desktop shell? The shell injects auth upstream, so a
+        // missing `#t=` token is expected there. Direct `keystone serve` usage, on
+        // the other hand, must carry the token fragment — that is the only thing
+        // standing between a stray local page and a runtime that can run commands.
+        state.shell = await api("/desktop/bootstrap").catch(() => null);
+        if (!state.shell && token === "") {
           showError(tr("No token in the URL. Open the URL printed by `keystone serve`, which includes the token fragment."));
           return;
         }
+        if (state.shell && state.shell.hasModel === false) {
+          showOnboarding();
+        }
 
+        el("mode-toggle").addEventListener("click", () => {
+          const next = currentMode() === "simple" ? "advanced" : "simple";
+          localStorage.setItem(MODE_KEY, next);
+          applyMode(next);
+        });
         el("theme-toggle").addEventListener("click", () => {
           const next = currentTheme() === "dark" ? "light" : "dark";
           localStorage.setItem(THEME_KEY, next);
@@ -1803,7 +2398,8 @@
           if (event.target === el("modal")) closeModal();
         });
         document.addEventListener("keydown", (event) => {
-          if (event.key === "Escape") closeModal();
+          trapModalFocus(event);
+          if (event.key === "Escape" && !el("modal").hidden) closeModal();
         });
         el("trace-all").addEventListener("change", (event) => {
           state.showAllEvents = event.target.checked;
@@ -1844,17 +2440,12 @@
           showError("");
           try {
             const writePaths = el("write-paths").value.split(",").map((value) => value.trim()).filter((value) => value !== "");
-            const accepted = await api("/v1/tasks", {
-              method: "POST",
-              body: JSON.stringify({
-                workspacePath: el("workspace").value,
-                request: el("request").value,
-                references: referencesFromWritePaths(writePaths),
-                writePaths,
-                allowedCommands: ["node", "npm", "pnpm", "npx"],
-                acceptContract: true,
-              }),
+            const accepted = await startTaskWithGate({
+              workspacePath: el("workspace").value,
+              request: el("request").value,
+              writePaths,
             });
+            if (!accepted) return;
             toast(tr("Task started."));
             await selectTask(accepted.taskId);
             await refreshTasks();
@@ -1865,10 +2456,72 @@
           }
         });
 
-        state.timer = setInterval(() => {
+        /* Simple-mode composer: read/write toggle, native folder pick, gated submit. */
+        el("simple-form").addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const submit = el("simple-start");
+          submit.disabled = true;
+          showError("");
+          try {
+            const access = document.querySelector('input[name="access"]:checked')?.value ?? "read";
+            const writePaths = access === "write"
+              ? el("simple-write-paths").value.split(",").map((value) => value.trim()).filter((value) => value !== "")
+              : [];
+            const accepted = await startTaskWithGate({
+              workspacePath: el("simple-workspace").value,
+              request: el("simple-request").value,
+              writePaths,
+            });
+            if (!accepted) return;
+            // Keep the advanced form consistent so toggling modes mid-task shows the same run.
+            el("workspace").value = el("simple-workspace").value;
+            el("request").value = el("simple-request").value;
+            el("write-paths").value = writePaths.join(", ");
+            toast(tr("Task started."));
+            await selectTask(accepted.taskId);
+            await refreshTasks();
+          } catch (error) {
+            showError(String(error.message ?? error));
+          } finally {
+            submit.disabled = false;
+          }
+        });
+        document.querySelectorAll('input[name="access"]').forEach((radio) => {
+          radio.addEventListener("change", () => {
+            el("simple-write-field").hidden = radio.value !== "write" || !radio.checked;
+          });
+        });
+        // "Confirm every write task": a presentation preference sent with each
+        // submission. It only ever tightens (forces confirmation); the safety
+        // reasons are decided server-side regardless.
+        const confirmAllNode = el("simple-confirm-all");
+        confirmAllNode.checked = localStorage.getItem("keystone.confirmAllWrites") === "1";
+        confirmAllNode.addEventListener("change", () => {
+          localStorage.setItem("keystone.confirmAllWrites", confirmAllNode.checked ? "1" : "0");
+        });
+        el("simple-pick").addEventListener("click", async () => {
+          // Shell-only native chooser. Without a shell (direct serve) the button is
+          // harmless: the user types a path.
+          try {
+            const result = await fetch("/desktop/pick-folder", { method: "POST" }).then((r) => r.json());
+            if (result.path) el("simple-workspace").value = result.path;
+            else if (!result.supported) toast(result.error ?? tr("Folder picker unavailable."));
+          } catch {
+            /* no shell: typing a path always works */
+          }
+        });
+
+        /** A poll tick: skipped while the tab is hidden, so we do not fetch against
+         *  a surface the user cannot see, and catch up immediately when it returns. */
+        const tick = () => {
+          if (document.hidden) return;
           void refreshTasks().catch(() => undefined);
           void pollSelected();
-        }, 2000);
+        };
+        state.timer = setInterval(tick, 2000);
+        document.addEventListener("visibilitychange", () => {
+          if (!document.hidden) tick();
+        });
         window.addEventListener("beforeunload", () => clearInterval(state.timer));
       }
 

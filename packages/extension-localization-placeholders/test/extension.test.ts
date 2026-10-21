@@ -290,7 +290,7 @@ test("conformance passes on the real entry and the shape probe gates activation"
   assert.ok(shape?.passed, "the real entry must pass the generic shape probe");
 
   // The loaded entry is, by construction, a well-formed verifier.
-  const loaded = await loadEntry(manifest.entry.module, manifest.entry.export);
+  const loaded = await loadEntry(manifest.entry!.module, manifest.entry!.export);
   assert.equal(inspectVerifierEntry(loaded).passed, true);
 
   // Activation still requires conformance, then it opens.
