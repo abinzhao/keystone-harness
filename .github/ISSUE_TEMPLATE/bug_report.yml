@@ -1,0 +1,86 @@
+name: Bug report
+description: Report a reproducible problem in the source tree, CLI, protocol, or workbench
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, private source, personal data, or vulnerability details. Security reports follow `SECURITY.md`.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest commands, inputs, and repository state that reproduce the problem.
+      placeholder: |
+        1. Run ...
+        2. Configure ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Keystone version or commit
+      placeholder: 1.0.0-rc.1 or commit SHA
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, Node.js version, and pnpm version.
+      placeholder: macOS 15, Node.js 22.22.0, pnpm 8.15.9
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected surface
+      options:
+        - CLI
+        - Kernel or schemas
+        - Runtime or Run Protocol
+        - Workbench
+        - Desktop preview
+        - Model adapter
+        - Tools or verifiers
+        - Extensions
+        - Documentation or release tooling
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Include relevant error output, task status, or proof metadata after removing sensitive data.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues for the same problem.
+          required: true
+        - label: I removed credentials, private source, personal data, and vulnerability details.
+          required: true

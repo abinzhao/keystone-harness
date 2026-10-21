@@ -1,7 +1,7 @@
 # ADR-0011: ACP (Agent Client Protocol) Mapping and the Stdio-Adapter Blocker
 
 - **Status**: Proposed — **BLOCKED, no adapter ships** (2026-10-20)
-- **Decision basis**: ACP v1 public schema (agentclientprotocol.com/protocol/schema, fetched 2026-10-20); kernel invariants 1–2 (AGENTS.md §2); PRD trust commitments, completion rules, provenance rules; ADR-0002 (kernel is sole state authority); `packages/schemas` Contract/Lease/Evidence/Proof; `keystone protocol export`.
+- **Decision basis**: ACP v1 public schema (agentclientprotocol.com/protocol/schema, fetched 2026-10-20); the public kernel invariants; ADR-0002; `packages/schemas` Contract/Lease/Evidence/Proof; `keystone protocol export`.
 - **Scope of this ADR**: a mapping table of Keystone concepts onto current public ACP, the precise silent-loss points, and the conditions under which an adapter may ever be built. **No ACP transport code is added.**
 
 ## Context
@@ -28,7 +28,7 @@ ACP v1 is newline-delimited JSON-RPC over stdio. The lifecycle is `initialize �
 
 ## The blocker (two independent reasons)
 
-1. **Authority inversion (kernel invariants 1–2).** Keystone's kernel is the *only* write authority: `KernelSession` is the sole write entry point, and only kernel events change state, permissions, and completion. In ACP, the **host client** issues tool approvals and ends the turn. Making Keystone an ACP agent hands permission-issuance and turn-completion to the IDE — the exact inversion AGENTS.md §2 forbids. An adapter today would have to either route approvals out to the client (breaking invariant) or ignore ACP's permission flow (and then it is not really interoperable).
+1. **Authority inversion (kernel invariants 1–2).** Keystone's kernel is the *only* write authority: `KernelSession` is the sole write entry point, and only kernel events change state, permissions, and completion. In ACP, the **host client** issues tool approvals and ends the turn. Making Keystone an ACP agent hands permission-issuance and turn-completion to the IDE. An adapter today would have to either route approvals out to the client (breaking the invariant) or ignore ACP's permission flow (and then it is not really interoperable).
 
 2. **No first-class slots ⇒ silent loss.** ACP has no place for contract-gated completion, lease scoping, evidence-level gating, or a proof verdict. The only escape hatch is `_meta`, which the spec declares non-authoritative. Stuffing Contract/Lease/Evidence/Proof there means a standard client silently drops all of it — a run that stopped at `needs_attention` or `failed` would look like a normal chat turn. That is precisely the "silent loss" this ADR forbids.
 
@@ -36,7 +36,7 @@ ACP v1 is newline-delimited JSON-RPC over stdio. The lifecycle is `initialize �
 
 **Do not ship an ACP stdio adapter now.** No transport, no session bridge, no permission forwarding. The authoritative machine interfaces remain the ones already built and lossless:
 
-- `keystone protocol export` — the versioned JSON Schemas a foreign client can negotiate against (cannot drift from the kernel, PRD NFR-COMP-05);
+- `keystone protocol export` — the versioned JSON Schemas a foreign client can negotiate against; they are generated from the same validators the runtime uses;
 - `keystone ci` — the stable JSON result + exit-code contract (docs/architecture/cli-automation-surface.md), where the verdict *is* the machine-readable payload and the redacted proof artifact is a real file.
 
 These expose Keystone's semantics *authoritatively*; an ACP layer, if ever built, must be a **read-only projection plus a request forwarder** over that surface — never a permission issuer and never a completion authority.
@@ -54,4 +54,4 @@ Until ACP itself gains (or a negotiated extension defines) first-class slots for
 
 - **Ship a minimal adapter that maps Keystone onto `plan` + `request_permission` + a final message.** Silently loses Contract/Lease/Evidence/Proof and inverts the permission authority — rejected by invariant.
 - **Encode Keystone semantics in `_meta`.** The spec says clients must not interpret it; it would be dropped in practice, which is silent loss.
-- **Treat ACP as the new authority and relax the kernel to accept client approvals.** Directly violates ADR-0002 and AGENTS.md §2; not negotiable.
+- **Treat ACP as the new authority and relax the kernel to accept client approvals.** Directly violates ADR-0002; not negotiable.

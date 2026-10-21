@@ -3,7 +3,7 @@
   "version": "1.0.0-rc.1",
   "private": true,
   "type": "module",
-  "description": "Evidence-native, local-first engineering agent harness",
+  "description": "Local-first runtime for engineering agents with lease-gated execution and evidence-based completion",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=22.18.0"

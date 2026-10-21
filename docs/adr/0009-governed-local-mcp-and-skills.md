@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (2026-10-20)
 - **Date**: 2026-10-20
-- **Decision basis**: `需求文档.md` PL-01 / PL-02 (local-path install, manifests are declarations not grants), 9.1 (kernel invariants), 9.4 (provenance & trust), 9.7 (extensions cannot self-escalate), 11.1–11.6 (leases, side effects, egress); ADR-0002 (kernel is sole state authority), ADR-0006 (scenario policy injected, never imported), ADR-0004 (TypeScript, zero runtime dependencies); existing `packages/extensions` (manifest/registry/conformance), `packages/spawn` (neutral launch), `packages/tools` (lease-checked tool boundary).
+- **Decision basis**: local-path installation, declarative manifests, provenance propagation, default-deny leases, ADR-0002, ADR-0004, ADR-0006, and the existing extension/spawn/tool boundaries.
 
 ## Context
 

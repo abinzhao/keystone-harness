@@ -59,8 +59,11 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement at
-[INSERT CONTACT METHOD].
+reported privately to the project maintainers. The repository does not yet have
+a dedicated private conduct-reporting channel. Do not put incident details or
+personal information in a public issue. Instead, open a minimal
+[contact-channel request](https://github.com/abinzhao/keystone-harness/issues/new?labels=conduct&title=Request%20a%20private%20conduct%20reporting%20channel)
+and wait for a maintainer to arrange private contact.
 All complaints will be reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the
@@ -127,31 +130,3 @@ https://www.contributor-covenant.org/translations.
 
 [homepage]: https://www.contributor-covenant.org
 [Mozilla CoC]: https://github.com/mozilla/diversity
-
----
-
-# Notes (Enforcement, Reporting, and Scope)
-
-The following notes supplement the Contributor Covenant 2.1 text above and are intended to put it into practice. If the two conflict, the Contributor Covenant 2.1 text takes precedence.
-
-## Applicable Scope
-
-This Code of Conduct applies to all project community spaces, including but not limited to: the code repository (Issues, Pull Requests, Discussions, code reviews), instant messaging and mailing lists, online meetings, and online or offline events where an individual attends in an official capacity on behalf of the project.
-
-## Enforcers
-
-The community enforcers are the project Maintainers and authorized Committers; for role definitions, see [`GOVERNANCE.md`](./GOVERNANCE.md). Enforcers are responsible for interpreting and enforcing this Code, and, when necessary, taking fair and proportionate corrective action against behavior deemed inappropriate, threatening, offensive, or harmful. Enforcers have the right to remove, edit, or reject comments, commits, code, documentation, and Issues that do not comply with this Code, and will communicate the reasons for their decisions when appropriate.
-
-## Reporting
-
-If you experience or witness abuse, harassment, or other unacceptable behavior, please report it privately through the following channel:
-
-- Email: `conduct@example.com` (**placeholder value; replace with a real contact email before release**)
-
-> ⚠️ The email above is an obvious placeholder and is not a real contact method. Before formally accepting external contributions, the project must replace it with a real reporting channel and update both this section and the `[INSERT CONTACT METHOD]` in the English text above.
-
-When reporting, provide as much as possible: the time it occurred, the location (specific repository/channel/event), the people involved, a description of the behavior, and any available evidence. All reports will be reviewed and investigated promptly and fairly; enforcers are obligated to respect the privacy and security of the reporter and will not disclose their identity without the reporter's consent.
-
-## Enforcement Guidelines
-
-Enforcers determine the consequences in accordance with the Contributor Covenant 2.1 Community Impact Guidelines (Correction / Warning / Temporary Ban / Permanent Ban), consistent with the English text above. For security-related reports, also refer to the private disclosure process in [`SECURITY.md`](./SECURITY.md); do not disclose them via a public Issue.

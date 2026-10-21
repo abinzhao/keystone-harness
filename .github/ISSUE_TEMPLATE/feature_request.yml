@@ -1,0 +1,74 @@
+name: Feature request
+description: Propose a scoped capability or compatibility improvement
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Explain the user problem before proposing an implementation. Requests that change kernel authority, schemas, protocol semantics, extension privileges, or compatibility will require an ADR.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or integration problem cannot be solved with the current interfaces?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe observable behavior and how completion can be verified.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include current workarounds and why they are insufficient.
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Primary surface
+      options:
+        - CLI
+        - Kernel or schemas
+        - Runtime or Run Protocol
+        - Workbench or desktop preview
+        - Model adapter
+        - Tools or verifiers
+        - Extensions or scenario packs
+        - Documentation or release tooling
+    validations:
+      required: true
+  - type: checkboxes
+    id: impact
+    attributes:
+      label: Trust and compatibility impact
+      description: Select every area the request may affect.
+      options:
+        - label: Authoritative state or task transitions
+        - label: Capability Lease or permission scope
+        - label: Evidence, proof, or completion decisions
+        - label: Schema or protocol compatibility
+        - label: Credentials, network access, or data egress
+        - label: None of the above
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance evidence
+      description: What tests, measurements, or artifacts would prove this is complete?
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and the roadmap.
+          required: true
+        - label: This issue contains no credentials, private source, personal data, or vulnerability details.
+          required: true

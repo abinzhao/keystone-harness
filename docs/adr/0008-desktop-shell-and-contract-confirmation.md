@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (2026-10-20)
 - **Date**: 2026-10-20
-- **Decision basis**: `需求文档.md` ST-03 (single Run Protocol boundary), 1.4 (no second semantics), 9.1 / 9.4 (trust, extension rules), 11.3 (credentials), HI-03/HI-04 (user decisions, envelope widening), OT-02/OT-03 (Outcome Contract); ADR-0002 (kernel is sole state authority), ADR-0003 (event ledger), ADR-0004 (TypeScript, zero runtime dependencies); existing `packages/runtime/src/server.ts` (`keystone.run.protocol`), `packages/models/src/{config,credentials}.ts`.
+- **Decision basis**: one Run Protocol boundary, no second state authority, credential isolation, recorded user decisions, ADR-0002, ADR-0003, ADR-0004, and the existing runtime/model configuration APIs.
 
 ## Context
 
@@ -13,7 +13,7 @@ The CLI can already `keystone serve`, which binds the Run Protocol to loopback a
 3. A simple default view that hides the four-zone advanced surface, but keeps it one toggle away.
 4. A guarantee that a task which can **write** anything first shows the compiled Outcome Contract and waits for an explicit confirmation; a read-only task may run immediately.
 
-The hard constraint (repo invariant 3, 5; PRD ST-03) is that the desktop shell must not become a second runtime, a second source of truth, or a privileged extension. It composes the existing kernel/runtime; it never re-implements contract compilation, state folding, or permission issuance.
+The hard constraint is that the desktop shell must not become a second runtime, a second source of truth, or a privileged extension. It composes the existing kernel/runtime; it never re-implements contract compilation, state folding, or permission issuance.
 
 ## Decisions
 
@@ -81,7 +81,7 @@ This source-tree RC includes the reproducible Swift source and build command plu
 
 - The shell cannot change authoritative state: it only proxies, manages config files through existing APIs, and restarts its child. It never opens a `KernelSession` (kernel invariant 1, 2).
 - No extension grants itself permission: onboarding writes a model **reference** and a credential the user supplied; widening the autonomy envelope still happens only through a recorded user decision at runtime (invariant 5).
-- Secrets propagate correctly: the secret lives in a 0600 file, is read only to make a model call, and is never projected to the UI (PRD 11.3; invariant 4).
+- Secrets propagate correctly: the secret lives in a 0600 file, is read only to make a model call, and is never projected to the UI.
 - The protocol stays the single boundary; the shell-private routes are documented as out-of-protocol and read-only except the deliberately audited config save.
 
 ## Out of scope for this slice

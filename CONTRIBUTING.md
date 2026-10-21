@@ -1,112 +1,119 @@
-# Contributing Guide (CONTRIBUTING)
+# Contributing to Keystone
 
-Thank you for your willingness to contribute to Keystone. Keystone is an evidence-native, local-first engineering Agent Harness. Before you begin, please read this document, [`AGENTS.md`](./AGENTS.md) (kernel invariants and code conventions), [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md), and [`SECURITY.md`](./SECURITY.md).
+Keystone accepts focused fixes, tests, documentation, evaluation cases, and extensions. The project is still a release candidate, so compatibility and trust-boundary changes receive stricter review than ordinary implementation changes.
 
-> The project is currently shipping its first pre-release candidate, **`1.0.0-rc.1`**: a developer-preview, CLI-first build. It is **not** a stable 1.0.0 — the root package stays private, nothing is published, and a stable release still needs explicit admission after the ROADMAP acceptance gates close (see [ADR-0012](./docs/adr/0012-release-candidate-boundary.md)). Some processes (such as the initial-release scorecard) will be implemented progressively as milestones advance (see [`ROADMAP.md`](./ROADMAP.md)).
+Before contributing, read the [architecture overview](./docs/architecture/overview.md), [Code of Conduct](./CODE_OF_CONDUCT.md), and [security policy](./SECURITY.md).
 
-## 1. Development Environment Requirements
+## Development Setup
 
-| Item | Requirement |
-|---|---|
-| Node.js | `>= 22.18` (uses Node native type stripping and `node:test`) |
-| Package manager | `pnpm` 8 |
-| Platform | Initial support for macOS; local Git repository |
-| Language | TypeScript, zero runtime dependencies |
+Requirements:
 
-No build-time transpilation dependencies are introduced: code is run and tested using Node native type stripping.
+- Node.js `>=22.18.0`
+- pnpm `8.15.9`
+- Git
 
-## 2. Local Commands
+Install and verify the workspace:
 
 ```bash
-# Install dependencies
 pnpm install
-
-# Type check (produces no build artifacts)
-pnpm run typecheck
-
-# Run tests (node:test)
-pnpm test
+pnpm run verify
+pnpm run release:check
 ```
 
-> If the above scripts are not yet defined before the corresponding milestone lands, defer to the actual script names in the repository-root `package.json` and update this document accordingly in the PR.
+The repository runs TypeScript directly with Node native type stripping. There is no transpilation or application build step.
 
-### CI and local release assets
-
-CI (`.github/workflows/ci.yml`) runs the same gate on macOS and Linux: `pnpm install --frozen-lockfile`, `pnpm run typecheck`, `pnpm test`, the release check, and it generates the offline release artifacts as CI artifacts. A separate `windows-verify.yml` runs the install/typecheck/test gate on `windows-latest`; it is intentionally **non-blocking** because the suite has not yet been validated on a real Windows machine — treat it as an advisory signal, not as proof that Windows works end to end.
-
-Release tooling lives in `scripts/release/` and is dependency-free (Node built-ins only):
+Useful commands:
 
 ```bash
-pnpm run release:check       # version consistency + release-readiness report (non-zero on mismatch)
-pnpm run release:sbom        # offline SBOM -> dist/release/sbom.json (deterministic, no timestamp)
-pnpm run release:buildinfo   # build info -> dist/release/build-info.json
-pnpm run release:all         # check + sbom + buildinfo
-pnpm run release:bump <v>    # authoritative workspace version move, e.g. 1.0.0-rc.1 (then rerun release:all)
+pnpm run typecheck       # TypeScript validation
+pnpm test                # node:test suite
+pnpm run bench           # local performance baseline
+pnpm run release:all     # local release check, SBOM, and build information
 ```
 
-These scripts **never** tag, publish, sign, or notarize. The current workspace is the pre-release candidate `1.0.0-rc.1`; the readiness checker runs two channels — a prerelease passes as a local RC artifact build, while a plain `1.0.0` is refused unless passed `--allow-1.0`, and the 1.0.0 release gates are not yet met. Version moves go **only** through `release:bump`; never hand-edit `package.json` versions, generated artifacts, or the lockfile — regenerate artifacts with `release:sbom` / `release:buildinfo` and the lockfile with `pnpm install`. Generated files land in `dist/`, which is git-ignored.
+Release commands generate local files under `dist/`. They do not publish, tag, sign, notarize, commit, or push.
 
-## 3. Extension Points That Can Be Contributed Independently
+## Architecture Rules
 
-Contributors **do not need to understand the entire kernel** in order to contribute independently. The following extension points come from PRD 18.2; each type of contribution has a minimal interface, examples, test fixtures, and a conformance gate.
+The following rules protect the runtime's trust boundary:
 
-| Extension point | Minimal interface | Conformance gate |
-|---|---|---|
-| Model adapter | Implement a stable interface for model invocation, declaring purpose, capabilities, and data egress scope; does not touch task state or long-term credentials | Pass the model interface conformance tests; must not read or write authoritative state; must not hold long-term credentials |
-| Tool and MCP adapter | Declare required capabilities, resources, side effects, network access, and credentials; all side effects are executed through a Capability Lease | Pass the tool interface conformance tests; verify that side effects are reachable only within the Lease scope |
-| Project Analyzer | Produce Project Facts with provenance, applicable snapshot, trust level, and invalidation conditions | Pass the analyzer conformance tests; outputs must be traceable to their provenance and invalidation conditions |
-| Workspace Runtime | Implement the workspace snapshot, isolation, and lifecycle interfaces; support checkpoints and state replay | Pass the workspace conformance tests; authoritative state must be consistent after replay |
-| Verifier | Declare the Evidence types it can produce, evidence level, independence, and invalidation conditions; does not modify completion decisions | Pass the verifier conformance tests; must not create or relax completion conditions; must not modify evidence results |
-| Agent Skill | Integrate as a reusable capability package; its content is treated as untrusted input | Pass the Skill conformance tests; does not automatically gain project permissions by virtue of its installation source |
-| Protocol adapter (ACP / A2A / other) | Declare capability negotiation and semantic mapping; semantics that cannot be expressed must be explicitly degraded or rejected | Pass the protocol conformance tests; must not change Contract, Lease, Provenance, Evidence, or completion semantics; silently dropping semantics is forbidden |
-| Evaluation tasks, fault injection, and security cases | Follow the public evaluation task format, runner, and metric definitions (PRD 18.1, 13.2) | Reproducible; cover the specified scenarios; security cases cover the six phases of configuration, extension, execution, persistence, action, and recovery |
+1. Models and extensions propose actions; they do not change authoritative state, issue permissions, accept evidence, or decide completion.
+2. Every authoritative state change goes through `KernelSession` and an append-only kernel event.
+3. Every side effect passes through the execution boundary with a valid Capability Lease.
+4. Provenance, trust, and invalidation metadata remain attached when context or evidence is transformed.
+5. Extensions may add restrictions but cannot grant authority or replace kernel completion logic.
 
-**Common gate**: every extension must declare an Extension Manifest (name, version, publisher, integrity, required capabilities, input/output Schema, data classification, producible Observation/Evidence types, replayability, idempotency, dependencies, and uninstall behavior), and may be activated only after passing integrity checks, dependency resolution, conformance tests, risk disclosure, and user confirmation (PRD 8.11 PL-01/PL-02, 9.7).
+Package dependencies point toward lower layers:
 
-## 4. Commit Message Conventions
-
-Use [Conventional Commits](https://www.conventionalcommits.org/):
-
-```
-<type>(<scope>): <description>
-
-[body: why this change is made]
-
-Signed-off-by: Your Name <you@example.com>
+```text
+cli -> runtime -> {kernel, models, tools, verifiers, extensions, pack-engineering}
+kernel -> schemas
+tools/verifiers -> kernel, schemas, spawn
+pack-engineering -> kernel, schemas
 ```
 
-Common `type` values: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `perf`, `build`, `ci`.
-For `scope`, prefer the affected package or domain, for example `kernel`, `schemas`, `runtime`, `verifiers`, `cli`, `docs`.
+`@keystone/kernel` must not import execution packages or scenario packs. Scenario-specific contract and capability policy is injected by the runtime.
 
-- A single commit focuses on one thing and is traceable to a requirement or completion criterion.
-- Mark breaking changes explicitly in the commit body with `BREAKING CHANGE:`, and follow ADR + major version + migration guide (PRD 18.3).
-- Do not mix in unrelated formatting or refactoring.
+## Code Conventions
 
-## 5. DCO and CLA
+- Use TypeScript supported by Node native type stripping.
+- Do not use `enum`, `namespace`, decorators, or constructor parameter properties.
+- Include the `.ts` extension in relative imports.
+- Keep production runtime dependencies at zero.
+- Use the runtime validators as the single source for inferred TypeScript types and generated JSON Schema.
+- Follow existing naming, error handling, and test patterns.
+- Keep changes scoped; do not mix unrelated formatting or refactoring.
+- Explain boundaries and non-obvious reasons in comments. Do not narrate the code.
+- Do not edit generated files, third-party code, build output, or the lockfile by hand.
 
-- This project uses the **DCO (Developer Certificate of Origin)**: add a `Signed-off-by` line to each commit via `git commit -s`, certifying that you have the right to submit the content and agreeing to the DCO (https://developercertificate.org/).
-- **CLA note**: To keep licensing and governance clear, the project uses Apache-2.0 and requires contributions to be signed off via DCO. If a formal CLA is introduced in the future, it will be described in a separate document and announcement, and its applicability to existing DCO contributions will be made explicit. **Until a CLA is in place, DCO is the effective means of signing off.**
+## Tests
 
-## 6. Branch and PR Workflow
+Add the smallest test that proves the changed behavior. Changes to state, permissions, evidence, recovery, or completion must cover the relevant invariant and a refusal or invalidation path where applicable.
 
-1. Branch a feature branch off the latest main branch; suggested naming: `feat/<short-description>`, `fix/<short-description>`, `docs/<short-description>`.
-2. Keep the workspace clean; do not overwrite, revert, or reformat others' changes.
-3. Pass type checking and tests locally before committing.
-4. Open a PR; the PR description must include:
-   - The purpose of the change and the requirement/completion criterion it traces to;
-   - The impact scope (which packages are involved, and whether kernel invariants, Schema, or protocol are touched);
-   - How it was verified and the results (commands and conclusions);
-   - Unverified items and remaining risks.
-5. Changes involving the kernel, Schema, protocol, or security semantics must be linked to the corresponding ADR or documentation update.
-6. Enter review after passing CI (type checking, tests, conformance).
+Run the focused test first, then the full gate:
 
-## 7. Code Review Requirements
+```bash
+node --test packages/<package>/test/<file>.test.ts
+pnpm run verify
+```
 
-- Merge only after approval by at least one maintainer/committer (for governance roles, see [`GOVERNANCE.md`](./GOVERNANCE.md)).
-- Review focus: whether kernel invariants are correctly maintained; whether package boundaries and code conventions are followed (`enum`/`namespace`/parameter properties forbidden, relative imports include `.ts`); whether reproducible verification evidence is included; whether unrelated changes are introduced.
-- Security-related changes must also satisfy the control requirements in [`SECURITY.md`](./SECURITY.md); a high task completion rate cannot substitute for a security determination.
-- Review comments are based on technical facts; for disagreements, an ADR discussion may be requested.
+Do not make a failing implementation pass by deleting tests, weakening assertions, swallowing errors, or replacing meaningful integration with an unrepresentative mock.
 
-## 8. Code of Conduct
+## Architecture and Compatibility Changes
 
-By participating in this project you agree to abide by [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md). If you experience inappropriate behavior, report it as described in that document.
+Open an ADR before changing any of the following:
+
+- kernel invariants or state transitions;
+- Contract, Lease, Provenance, Evidence, or Proof semantics;
+- schema or protocol compatibility;
+- extension installation, activation, isolation, or authority;
+- security or credential boundaries;
+- a stable interface in a breaking way.
+
+ADRs live under `docs/adr/NNNN-*.md` and describe context, options, decision, invariant impact, compatibility, migration, and rollback. Breaking changes also require a major version and migration guidance.
+
+## Pull Requests
+
+1. Create a focused branch from the current `main`.
+2. Keep each commit limited to one reviewable purpose.
+3. Use [Conventional Commits](https://www.conventionalcommits.org/).
+4. Sign commits with the [Developer Certificate of Origin](https://developercertificate.org/) using `git commit -s`.
+5. Complete the pull-request template, including verification results and unverified risks.
+6. Ensure CI is green before requesting review.
+
+Commit example:
+
+```text
+fix(kernel): reject expired capability leases
+
+Explain why the change is needed and how the invariant is preserved.
+
+Signed-off-by: Your Name <name@domain.invalid>
+```
+
+Documentation-only changes do not need artificial code tests, but they must pass link checks, `git diff --check`, and any repository checks affected by changed commands or package metadata.
+
+## Reporting Problems
+
+- Use a [GitHub issue](https://github.com/abinzhao/keystone-harness/issues) for reproducible defects, scoped feature proposals, or documentation corrections.
+- Do not include vulnerability details or sensitive conduct reports in public issues. The current private-reporting limitations are documented in [SECURITY.md](./SECURITY.md) and [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md).

@@ -2,11 +2,11 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-19
-- **Decision basis**: `需求文档.md` Sections 7.2, 8.4 (EX-04), 8.5 (VF-06), 9.3, 12.1, 12.4, 12.6
+- **Decision basis**: deterministic replay, integrity-checked recovery, branchable runs, precise evidence invalidation, and bounded storage
 
 ## Context
 
-The PRD requires: consistent state replay (NFR-REL-05), verifying workspace and evidence integrity before recovery (NFR-REL-02), deriving run branches from checkpoints (EX-04), precise evidence invalidation (VF-06), and content addressing with tiered retention for large tool outputs (12.4). These requirements cannot be satisfied simultaneously by "a mutable row-oriented database table + overwrite writes".
+Keystone requires consistent state replay, workspace and evidence integrity checks before recovery, run branches derived from checkpoints, precise evidence invalidation, and content-addressed retention for large tool outputs. These requirements cannot be satisfied simultaneously by "a mutable row-oriented database table + overwrite writes".
 
 ## Decision
 
@@ -20,9 +20,9 @@ The PRD requires: consistent state replay (NFR-REL-05), verifying workspace and 
 ## Consequences
 
 - Recovery, replay, branch comparison and evidence invalidation are all derived from the ledger, with no need for an additional subsystem.
-- Disk cost grows with the task; mitigated by content-addressed deduplication + a retention policy (12.4).
-- The event Schema must be versioned (NFR-COMP-01); a new Runtime must be able to read old data, and must provide a read-only export when migration is not possible (NFR-COMP-02).
-- In-place modification of historical events is not allowed; a revision (OT-03) produces new events and a new Contract version.
+- Disk cost grows with the task; content-addressed deduplication and retention policy limit that growth.
+- The event Schema must be versioned. A new Runtime must be able to read old data and provide a read-only export when migration is not possible.
+- In-place modification of historical events is not allowed; a revision produces new events and a new Contract version.
 
 ## Rejected Alternatives
 

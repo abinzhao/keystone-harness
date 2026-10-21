@@ -2,7 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-20
-- **Decision basis**: AGENTS.md §2 (kernel invariants), §3 (package boundaries), §6 (document invariants first); PRD ST-01, NFR-REL-04, NFR-COMP-02/05, 11.3, 11.4, 18.3
+- **Decision basis**: the kernel invariants, package boundaries, credential isolation, data-egress rules, and compatibility policy in the public architecture and governance documents
 - **Relates to**: ADR-0001 (evidence-native loop), ADR-0004 (zero runtime deps), ADR-0008 (desktop shell / BYOK onboarding)
 
 ## Context
@@ -28,7 +28,7 @@ v1 capability layer necessary:
 The kernel invariant this must respect is narrow and absolute: **adapters propose,
 they never authorise.** An adapter maps provider-native request/response shapes to
 and from Keystone's neutral envelope; it holds no task state, no authority, no
-long-lived secret, and never writes authoritative state (AGENTS.md §2 I1–I5).
+long-lived secret, and never writes authoritative state.
 
 ## Decision
 

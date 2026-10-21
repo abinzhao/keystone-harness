@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security reporting policy
+    url: https://github.com/abinzhao/keystone-harness/blob/main/SECURITY.md
+    about: Read this before sharing security information. Do not disclose vulnerability details in a public issue.
+  - name: Support guide
+    url: https://github.com/abinzhao/keystone-harness/blob/main/SUPPORT.md
+    about: Check supported requests and the diagnostic information maintainers need.

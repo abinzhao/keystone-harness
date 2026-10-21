@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (amended 2026-10-20, M1 — action capability/resource resolution and spawn-target home)
 - **Date**: 2026-10-20
-- **Decision basis**: [2026-10-20 universal foundation](../architecture/2026-10-20-keystone-universal-foundation.md) §1, §5, §8, §9; AGENTS.md §2 (kernel invariants), §3 (package boundaries)
+- **Decision basis**: the kernel invariants and package boundaries in the [architecture overview](../architecture/overview.md)
 - **Relates to**: ADR-0001 (evidence-native loop), ADR-0002 (kernel is sole state authority), ADR-0004 (zero runtime deps), ADR-0005 (local-first storage)
 
 ## Context
@@ -11,7 +11,7 @@ The universal-foundation architecture states the kernel contains **no engineerin
 
 | Module | Engineering vocabulary it carried |
 |---|---|
-| `src/project/scan.ts` | Git work-tree detection (`git rev-parse`, `ls-files`, `status --porcelain`), `node_modules`/`dist`/`coverage` exclusions, `package.json` script discovery, `pnpm`/`yarn`/`npm` lockfile detection, TypeScript/Python/Go extension language guessing, `AGENTS.md`/`CLAUDE.md`/`.cursor/rules` detection |
+| `src/project/scan.ts` | Git work-tree detection (`git rev-parse`, `ls-files`, `status --porcelain`), `node_modules`/`dist`/`coverage` exclusions, `package.json` script discovery, `pnpm`/`yarn`/`npm` lockfile detection, TypeScript/Python/Go extension language guessing, and project-rule-file detection |
 | `src/exec/spawn-target.ts` | Windows `.cmd`/`.bat` shim resolution for `npm`/`pnpm`/`yarn`/`npx`/`corepack`, `cmd.exe` argument escaping (cross-spawn algorithm) |
 | `src/contract/compile.ts` | Engineering contract-proposal heuristics: `node_modules/**`/`dist/**`/`*.lock` write-scope exclusions, test/typecheck/lint verifier emission from `package.json` scripts, preserve-behaviour/test keywords |
 
@@ -49,14 +49,14 @@ This phase relocates code; it does **not** genericize the schema. The injected p
 
 - `@keystone/kernel` no longer references git, package managers, lockfiles, Windows `.cmd` shims, engineering scope exclusions, *or* any intent→capability / tool→resource mapping. Its surface shrinks; it stays replayable standalone.
 - Engineering behaviour is observable-identical: the same scans, the same profiles, the same resolved spawn targets, the same proposed contracts, and the same action→capability/resource resolutions are produced, now from the pack (or `@keystone/spawn`).
-- A future non-engineering pack (research, personal, …) can supply its own `ContractProposer`, its own `ActionCapabilityResolver`, its own context detector, and its own verifiers with **zero kernel change** — which is the ROADMAP "Universal-foundation layering" exit gate.
+- A future non-engineering pack can supply its own `ContractProposer`, `ActionCapabilityResolver`, context detector, and verifiers with **zero kernel change**.
 - Cost: the composition root (runtime) now owns wiring the engineering proposer **and** the engineering action resolver; `KernelSession.create` (and, for a reopened session that continues to act, `KernelSession.open`) accepts optional `proposeContract` and `resolveAction`. There is exactly one production caller (the runtime), which wires both. Resumed/replay-only paths need neither and are unchanged.
 - `@keystone/tools` and `@keystone/verifiers` depend on the zero-dependency `@keystone/spawn` for cross-platform launching; they no longer depend on the engineering pack at all.
 
 ## Rejected alternatives
 
 - **Keep the code in the kernel and mark it `@deprecated`:** leaves engineering vocabulary in the trusted package and still exports it — does not satisfy the exit gate.
-- **Let the kernel import `@keystone/pack-engineering`:** creates a `kernel → pack → kernel` cycle, breaks the one-way dependency rule (AGENTS.md §3), and makes the kernel un-replayable standalone (I7).
+- **Let the kernel import `@keystone/pack-engineering`:** creates a `kernel → pack → kernel` cycle, breaks the one-way dependency rule, and makes the kernel un-replayable standalone.
 - **Genericize the schema now** (`ProjectProfile` → `ContextProfile`, parameterized verifier kinds): demands schema-version bumps and renames the task explicitly defers; buys nothing until a second pack exists.
 - **Keep the intent→capability/tool→resource mapping in the kernel** (read from a config table, or leave it hard-coded): keeps engineering vocabulary in the trusted, replayable package and lets a second scenario change capabilities only by editing the kernel — defeats the exit gate. An injected resolver seam keeps the kernel neutral while preserving default-deny.
 - **Leave `resolveSpawnTarget` in `pack-engineering`**: forces the generic `tools`/`verifiers` boundaries to depend on an engineering scenario pack just to launch a process; a neutral zero-dependency `@keystone/spawn` removes the inversion at no schema or state cost.

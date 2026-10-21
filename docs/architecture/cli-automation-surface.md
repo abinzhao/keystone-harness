@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (2026-10-20)
 - **Scope**: `packages/cli/src/exit-codes.ts`, `packages/cli/src/commands/ci.ts`, `packages/cli/src/commands/task.ts`
-- **Decision basis**: PRD 12.3 (readable, non-stack output), PRD EX-05 (degraded / offline execution), PRD HI-01 (non-interactive runs stop at `needs_attention`), kernel invariant 1 (the model cannot decide completion), ADR-0002.
+- **Decision basis**: machine-readable output, explicit degraded/offline execution, non-interactive runs stopping at `needs_attention`, the rule that models cannot decide completion, and ADR-0002.
 
 ## Why a documented exit-code contract
 

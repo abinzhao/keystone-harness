@@ -1,0 +1,42 @@
+name: Documentation correction
+description: Report inaccurate, missing, stale, or unclear public documentation
+title: "[Docs]: "
+labels:
+  - documentation
+body:
+  - type: input
+    id: location
+    attributes:
+      label: Document
+      description: Link to the file and section.
+      placeholder: docs/architecture/overview.md#execution-boundary
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is inaccurate, stale, missing, or unclear?
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Source or evidence
+      description: Point to current code, commands, package metadata, or an accepted ADR that establishes the correct behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: proposed
+    attributes:
+      label: Suggested wording
+      description: Optional concise replacement text.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I checked the current source tree rather than relying only on an older document.
+          required: true
+        - label: This issue contains no credentials, private source, personal data, or vulnerability details.
+          required: true

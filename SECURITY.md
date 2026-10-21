@@ -1,153 +1,102 @@
-# Security Policy and Threat Model (SECURITY)
+# Security Policy
 
-Keystone is an evidence-native, local-first engineering Agent Harness. It understands projects on the local machine, executes engineering tasks with side effects, and judges completion using replayable evidence. Security is therefore not an add-on but a core invariant of the product: **a high task completion rate cannot substitute for a security determination** (PRD 11.6).
+Keystone executes tools against local projects, so security boundaries are part of the runtime contract. A high task-success rate does not compensate for a permission, provenance, or evidence-integrity failure.
 
-This document describes the supported versions, the vulnerability disclosure process, and Keystone's threat model and security controls. The product basis for the threat model is [`需求文档.md`](./需求文档.md) Section 11 (Security, Privacy, and Data Boundaries) and Section 13 (Success Metrics).
+## Supported Versions
 
-> The project is currently at **`1.0.0-rc.1` source-tree candidate** status, not a production release. The root package remains private; no public binary is signed or notarized. The supported-version table and response timeframes remain provisional commitments until the first stable release.
-
-## 1. Supported Versions
-
-| Version | Status | Security Updates |
+| Version | Status | Security maintenance |
 |---|---|---|
-| `1.0.0-rc.1` source tree | Local release candidate; no published binary | Best-effort security fixes on `main`; no binary distribution promise |
-| `main` | Active development | Security feedback on code, protocol, and design is accepted |
-| First stable version (unreleased) | Planned | Security updates provided after release, with the window declared in the release notes |
-| Stable versions N and N-1 | Planned | At minimum, maintain read or export capability for the current and previous major data formats (PRD 18.3) |
+| `main` | Active development | Best-effort source fixes |
+| `1.0.0-rc.1` source tree | Current release candidate; no published binary | Best-effort source fixes |
+| Stable release | Not yet available | Policy will be declared with the release |
 
-When a stable version is released, it must provide: reproducible build information, a dependency and software bill of materials (SBOM), signed installers, and macOS notarization results (PRD 18.4).
+No signed or notarized binary is currently distributed.
 
-## 2. Private Disclosure Channel
+## Reporting a Vulnerability
 
-**Do not disclose security vulnerabilities through public Issues, Pull Requests, Discussions, or social media.**
+Private vulnerability reporting is not yet configured for this repository. Do not put exploit details, credentials, private source, or personal data in a public issue.
 
-Please report through the following private channels:
+Until a private channel is enabled:
 
-- Email: `security@example.com` (**placeholder value, to be replaced with a real security mailbox before release**)
-- Backup channel: `security@example.com` (**placeholder value, to be replaced before release**)
+1. Open a minimal [security-channel request](https://github.com/abinzhao/keystone-harness/issues/new?labels=security&title=Request%20a%20private%20security%20reporting%20channel) that contains no vulnerability details.
+2. State only that you need a private reporting channel and how a maintainer can reach you through your GitHub profile.
+3. Wait for a maintainer to arrange a private channel before sharing technical details.
 
-> ⚠️ All of the above are obvious placeholders. Before formally accepting external security reports, the project must replace them with a usable private disclosure channel (such as a dedicated security mailbox or a private report form) and update this section accordingly.
+The absence of a configured private channel is a known release-readiness gap. Maintainers must enable and document private vulnerability reporting before a stable release.
 
-Reports should include as much of the following as possible: affected version/commit, reproduction steps, impact scope, possible attack paths, and (if applicable) suggested mitigations. Do not make details public before a patch is released.
+## Security Boundaries
 
-## 3. Response Timeframe Commitments
+### Authority
 
-The following are **target** response timeframes (business days), to be calibrated as the project matures:
+- Model output, repository content, tool descriptions, web content, issues, and command output are untrusted inputs.
+- Only kernel events change authoritative task state.
+- Models and extensions cannot widen scope, issue leases, accept evidence, or mark a task complete.
+- Extensions may add restrictions or confirmation requirements, but cannot add their own allow rules.
 
-| Stage | Target timeframe |
-|---|---|
-| Acknowledge receipt of report | Within 3 business days |
-| Initial assessment and severity classification | Within 7 business days |
-| Fix or mitigation plan and schedule | Provide a plan within 30 business days for severe issues |
-| Fix release and acknowledgment (with reporter's consent) | Follow the assessment plan |
+### Side Effects
 
-We respect the reporter's privacy; we will not disclose their identity without consent. Whether to publicly acknowledge is at the reporter's discretion.
+- Filesystem, command, Git, credential, and network operations require a scoped Capability Lease.
+- Lease validation covers the subject, capability, resource, parameters, budget, and validity period.
+- Out-of-scope operations are denied before reaching the side-effect boundary.
+- High-impact external writes such as payments, email delivery, and production deployment are outside the current release scope.
 
-## 4. Threat Model Overview
+### Provenance and Evidence
 
-Keystone's core trust stance (PRD 2, 11):
+- Context, summaries, caches, model output, tool output, evidence, and experience retain provenance and trust metadata.
+- Reusing or summarising untrusted input does not raise its trust level.
+- A task reaches `proven` only through the proof graph; a model's completion claim is not evidence.
+- Workspace, contract, producer, or dependency changes invalidate affected evidence.
 
-- The model can only propose actions and candidate experience; it **must not unilaterally relax goals, expand permissions, or declare completion**.
-- Only kernel events can change authoritative state; all side effects must go through a Capability Lease.
-- Provenance and trust levels must propagate across summaries, caches, memory, Skills, sub-Agents, shared artifacts, and Proof; untrusted content must not be "laundered" through reuse.
-- File writes, commands, network access, credentials, and external system operations that are not explicitly permitted within the current task scope are **denied by default** (PRD 11.1).
+### Credentials and Data Egress
 
-### 4.1 Harness Lifecycle Security (PRD 11.6)
+- Long-term credentials are not included in model context, logs, evidence, or proof exports.
+- Credential configuration uses handles; secrets are read from stdin and stored separately with owner-readable permissions where the platform supports them.
+- Cloud model requests are constrained to the configured endpoint host.
+- Local runtime data is stored under `~/.keystone/` by default and can be redirected with `KEYSTONE_HOME`.
+- "Local-first" does not mean "offline": configuring a cloud model permits data to leave the machine through that model endpoint.
 
-Security requirements cover the following six stages; the required controls for each stage are as follows:
+### Command Execution
 
-| Stage | Required controls |
-|---|---|
-| Configuration | Configuration sources, sensitive fields, degradation options, and policy changes are auditable |
-| Capability Extension | Integrity, publisher, Manifest, dependencies, permissions, and conformance testing |
-| Execution | Prompt Injection, tool poisoning, path escape, and data egress controls |
-| State Persistence | Provenance propagation, candidate isolation, memory poisoning, and cross-session trigger protection |
-| Action Control | Capability Lease, idempotency, reversibility, human confirmation, and receipts |
-| Incident Recovery | Contamination tracking, state repair, credential revocation, evidence retention, and trusted recovery |
+Commands are represented as an executable plus an argument array. POSIX execution does not use a shell.
 
-Security evaluation must check four dimensions simultaneously: **task utility, attack success, contamination persistence, and detection and recovery integrity** (PRD 11.6, 13.2).
+Windows package-manager launchers are `.cmd` shims and require `cmd.exe`. `@keystone/spawn` limits this path to known launchers or explicit batch files and escapes arguments before invocation. Native executables continue to launch directly.
 
-### 4.2 Tools and Content Are Untrusted (PRD 11.2)
+On POSIX, timeouts terminate the process group. Windows currently terminates only the direct child; this is a documented limitation.
 
-Trust model: tool descriptions, repository content, web content, Issue text, and command output **may all contain malicious instructions**.
+### Desktop Preview
 
-- Such content **does not constitute** authorization to modify task goals, permissions, or completion conditions.
-- Untrusted state must propagate across summaries, caches, long-term memory, Skills, sub-Agents, shared artifacts, and Proof.
-- When a subsequent benign task references contaminated content, the system still judges by the **original provenance**, and does not "launder" the provenance just because it is reused across sessions.
-- Skills and MCP content are treated as untrusted capability inputs and do not automatically gain project permissions by virtue of their installation source (PRD 9.7).
+The macOS preview window loads a supervised loopback proxy:
 
-### 4.3 Credential Protection (PRD 11.3)
+- the webview does not receive the Run Protocol bearer token;
+- the proxy injects the token upstream;
+- private desktop routes require a per-start nonce;
+- closing the window tears down the proxy and runtime child.
 
-- Long-term credentials are **not shown to the model**.
-- Task execution only obtains short-term capabilities matching the current action.
-- The Shell does not directly hold long-term credentials.
-- A Capability Lease contains only the short-term handles, resource scope, and validity period required for the current action.
-- Extensions can only access credentials declared in the Manifest and approved by the user.
-- Credentials **must not** enter the model context, logs, Evidence, or export packages.
+This is not a hardened multi-user boundary. A process running as the same operating-system user may inspect user-owned process state and files. The preview is not signed, notarized, sandboxed, or distributed as an application bundle.
 
-### 4.4 Data Sovereignty and Egress (PRD 11.4)
+### Extensions and Supply Chain
 
-- Project understanding, task state, run graphs, caches, and evidence are stored locally by default.
-- When using a cloud model, the system sends only the content explicitly listed in the current Context Plan.
-- Before sending, it displays the model provider, the scope of data sent this time, source types, sensitivity levels, and estimated Tokens.
-- It supports a fully offline mode using local models.
-- The local mode, cloud model mode, and remote Workspace mode must be clearly distinguished, and **"local-first" must not be used to conceal actual egress behavior**.
+Extensions declare identity, version, integrity, capabilities, schemas, data handling, dependencies, replay properties, and uninstall behavior. Installation validates the entry bytes, runs conformance checks, and presents risk before activation.
 
-### 4.5 Extensions and Supply Chain (PRD 11.7)
+An extension update does not automatically inherit the previous version's trust. Project-local Skills and MCP servers are untrusted until reviewed and activated; their location alone grants no permission.
 
-- An extension's installation source, version, hash, and publisher information must be viewable.
-- An extension update **does not automatically inherit** all the trust and Autonomy Credit of the previous version.
-- Configuration, Hooks, Skills, and plugin declarations in a project repository must not expand capabilities before the user trusts the workspace.
-- Extensions may add denial and confirmation rules, but **must not unilaterally add Allow rules or disable security modes**.
-- Upon discovering a malicious or incompatible extension, the system supports isolation, rollback, impact analysis, and cleanup of derived state.
+## In Scope
 
-### 4.6 High-Risk External Actions (PRD 11.5)
+Examples include:
 
-The initial release **does not perform** payments, email sending, production deployments, and other external write operations that are difficult to undo. When supported in the future, these must have idempotency identifiers, before-and-after state, server-side receipts, and compensation paths.
+- a path or command escaping a valid lease;
+- unauthorized network or credential access;
+- a way for model or extension output to change authoritative state;
+- evidence accepted for the wrong task, contract, producer, or workspace;
+- ledger, proof, or replay integrity failures;
+- a desktop token or nonce bypass;
+- extension integrity or activation bypasses.
 
-### 4.7 Platform Execution Boundary (PRD 11.1, EX-02)
+Model answer quality, expected behavior inside an explicitly granted capability, and known absence of packaging/signing are not vulnerabilities by themselves.
 
-Command execution is one of the highest-risk surfaces, so it has one deliberate
-rule: an executable name and its arguments arrive **separately** and are handed
-to `spawn` with no shell, so a value that came from a repository or a model can
-never turn into a pipeline, redirection or second command (PRD EX-02).
+## Related Documents
 
-On Windows the package-manager launchers (`npm`, `pnpm`, `yarn`, `npx`) are
-`.cmd` shims rather than executables. Since Node 18.20 / 20.12 / 21.7
-(CVE-2024-27980) such a shim cannot be spawned directly, so — and only for these
-launchers — they are run through `cmd.exe`. That is the one place a shell
-re-enters the model, and it is compensated for rather than waved through:
-
-- The command processor is invoked explicitly with `/d /s /c`; the arguments
-  are escaped for `cmd.exe` before being handed over, using the cross-spawn
-  algorithm (MIT, based on https://qntm.org/cmd), and Node is told not to quote
-  them a second time.
-- Only a bare, known launcher name or an explicit `.cmd`/`.bat` path is wrapped;
-  native executables (`node`, `git`, and real `.exe`/`.com` files) are still
-  launched directly, with no shell.
-- On POSIX the path is unchanged: no shell is involved at all.
-
-A spawned process group is killed as a whole on timeout on POSIX; on Windows the
-negative-pid group kill is unsupported, so only the direct child is terminated —
-a known limitation, not a guarantee.
-
-### 4.8 Local desktop shell boundary
-
-The macOS RC window is a thin Swift/WKWebView view over a Node loopback proxy. The webview never receives the Run Protocol bearer token; the proxy injects it upstream. Shell-private `/desktop/*` routes require an unguessable per-start nonce minted into an HttpOnly cookie on the first navigation, so merely discovering the ephemeral port is insufficient. The window and runtime are supervised processes and closing the window tears down the proxy, runtime child, and instance lock.
-
-This does **not** establish a hardened multi-user desktop security boundary. A hostile local process running as the same user may inspect process state or user-owned files, and this RC is not signed, notarized, sandboxed, or packaged as an `.app`. Those distribution controls remain stable-release gates.
-
-## 5. Out of Scope for Security Design
-
-The following are not targets of security vulnerability reports and must not be submitted as vulnerabilities:
-
-- Normal behavior within the capabilities the user has explicitly granted in the project and that complies with the Autonomy Envelope;
-- Issues with the model's own output quality, hallucinations, or answer style (these should go through the feature feedback channel in [`SUPPORT.md`](./SUPPORT.md));
-- Stable-release binary signing/notarization gaps are tracked release blockers, not vulnerabilities in this private RC; exploitable flaws in the source-tree window, nonce gate, credential storage, or supervised process boundary are in scope.
-
-## 6. Related Documents
-
-- Product requirements (security sections): [`需求文档.md`](./需求文档.md) §11, §13
-- Kernel invariants (security-related invariants): [`AGENTS.md`](./AGENTS.md)
-- Governance and ADR: [`GOVERNANCE.md`](./GOVERNANCE.md)
-- Code of Conduct: [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md)
+- [Architecture overview](./docs/architecture/overview.md)
+- [Contributing guide](./CONTRIBUTING.md)
+- [Governance](./GOVERNANCE.md)
+- [Code of Conduct](./CODE_OF_CONDUCT.md)

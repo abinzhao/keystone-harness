@@ -2,13 +2,13 @@
 
 - **Status**: Accepted (2026-10-20)
 - **Date**: 2026-10-20
-- **Decision basis**: `需求文档.md` 9.1 / 9.4 (trust, extension rules), HI-03/HI-04 (user decisions, envelope widening), OT-02/OT-03 (Outcome Contract), ST-03 (single Run Protocol boundary), PI-01 (no guessed scope); ADR-0002 (kernel is sole state authority), ADR-0003 (event ledger), ADR-0007 (scoped commit lifecycle, B1 baseline-dirty rule), ADR-0008 (Decision E read-only preview, Decision F binary write gate); AGENTS.md §2 invariants 1, 3, 5.
+- **Decision basis**: the public trust and extension invariants, recorded user decisions, no guessed scope, ADR-0002, ADR-0003, ADR-0007, and ADR-0008.
 
 ## Context
 
 ADR-0008 Decision F drew one binary line: a **read-only** task starts immediately, a **write** task always shows the compiled contract and waits for an explicit confirmation. That is safe but blunt. An ordinary user who types *"add a unit test for `src/lease/resolve.ts`"* — a narrow, reversible, in-scope write with no open question — is shown a modal and asked to confirm a scope they already typed. The friction is pure theatre exactly where the blast radius is smallest.
 
-We want low-risk write tasks to start **after** the preview, without an extra confirmation click, while keeping a human in the loop for anything that is genuinely uncertain or dangerous. The hard constraint (AGENTS.md §2; ADR-0008) is unchanged: **the model cannot propose this decision, the client cannot attest it, and an envelope can never be widened by it.** The grader must be a pure function of already-recorded inputs, owned by the runtime, and re-applied authoritatively when the task actually starts.
+We want low-risk write tasks to start **after** the preview, without an extra confirmation click, while keeping a human in the loop for anything that is genuinely uncertain or dangerous. The hard constraint from ADR-0008 is unchanged: **the model cannot propose this decision, the client cannot attest it, and an envelope can never be widened by it.** The grader must be a pure function of already-recorded inputs, owned by the runtime, and re-applied authoritatively when the task actually starts.
 
 A second, separate hazard surfaced while integrating v1 on top of a **dirty** working tree. If a task's write scope overlaps files the user already has uncommitted changes in, letting the agent edit those files mixes two lines of work into one diff: the user's in-progress edit and the agent's change become unrecoverable as separate artefacts, and ADR-0007 B1 only protects the *commit* step (it refuses to sweep baseline-dirty paths into the agent commit). It does not stop the agent from clobbering the user's edits mid-flight. Admission must therefore refuse to start on overlapping dirty paths and tell the user exactly how to recover.
 

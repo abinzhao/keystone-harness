@@ -1,7 +1,7 @@
 # ADR-0012: Release Candidate Boundary and the Two-Channel Readiness Gate
 
 - **Status**: Accepted (2026-10-20)
-- **Decision basis**: Semantic Versioning 2.0; AGENTS.md §4 (never hand-edit generated files or lockfiles; change the authoritative source or rerun the generator); `scripts/release/version-check.ts`; PRD acceptance gates and the leadership gate in [`ROADMAP.md`](../ROADMAP.md); ADR-0008 (no packaging/signing/notarization), ADR-0011 (ACP adapter blocked).
+- **Decision basis**: Semantic Versioning 2.0; the generated-file policy in [`CONTRIBUTING.md`](../../CONTRIBUTING.md); `scripts/release/version-check.ts`; the stable-release gates in [`ROADMAP.md`](../../ROADMAP.md); ADR-0008 (no packaging/signing/notarization), ADR-0011 (ACP adapter blocked).
 - **Scope of this ADR**: why the workspace moves to `1.0.0-rc.1`, exactly what an RC does and does not authorize, and why a stable `1.0.0` still needs an explicit, separate admission decision. **No artifact is published, tagged, signed, or notarized by this decision.**
 
 ## Context

@@ -2,11 +2,11 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-19
-- **Decision basis**: `需求文档.md` Sections 1.4, 8.10 (ST-02), 9.6, 11.3, 11.4, 12.4
+- **Decision basis**: local ownership of runtime data, isolated credentials, explicit cloud egress, safe cleanup, and content-addressed storage
 
 ## Context
 
-The PRD requires that project cognition, task state, run graphs, caches and evidence be stored locally by default; that when a cloud model is used only the content listed in the current Context Plan be sent; that a fully local offline mode be supported; and that before cleaning data the scope of impact be displayed and the contents of the code repository not be deleted.
+Project cognition, task state, run graphs, caches, and evidence are stored locally by default. A cloud model receives only content selected by the current Context Plan; a fully local offline mode remains available; and data cleanup must display its impact without deleting repository content.
 
 Therefore the storage location and directory semantics are part of the security boundary, and must be determined before the code.
 
@@ -39,19 +39,19 @@ Therefore the storage location and directory semantics are part of the security 
 
 Rules:
 
-- **The ledger is the sole source of truth**; `index/`, `cache/` and `proofs/` are all rebuildable (NFR-REL-06).
-- **Credentials are isolated from model context**: the contents of `credentials/` must not appear in event payloads, artifacts, Proofs or logs (PRD 11.3). What the kernel provides is a short-term handle, not the key itself.
-- **Atomic writes**: all persisted writes go through `writeFileAtomic` (temp file + fsync + rename), guaranteeing "either fully visible or completely invisible" (NFR-REL-08).
+- **The ledger is the sole source of truth**; `index/`, `cache/` and `proofs/` are all rebuildable.
+- **Credentials are isolated from model context**: the contents of `credentials/` must not appear in event payloads, artifacts, Proofs, or logs. The kernel receives a short-term handle, not the key itself.
+- **Atomic writes**: all persisted writes go through `writeFileAtomic` (temp file + fsync + rename), guaranteeing "either fully visible or completely invisible".
 - **Workspace snapshots** store only hashes and metadata in `artifacts/`, and do not copy the user's source code.
-- Deleting `~/.keystone/projects/*` or `cache/` does not affect the code repository (ST-02).
-- Read-only tasks can run in parallel, but must be bound to a read snapshot; by default only one write task is allowed per workspace (PRD 9.6).
+- Deleting `~/.keystone/projects/*` or `cache/` does not affect the code repository.
+- Read-only tasks can run in parallel, but must be bound to a read snapshot; by default only one write task is allowed per workspace.
 
 ## Consequences
 
 - The data sovereignty boundary is clear, and users can delete or migrate `~/.keystone` as a whole.
-- Multiple projects and multiple tasks are isolated by ID under the same root directory, and switching tasks does not cross-contaminate (UI-02).
+- Multiple projects and tasks are isolated by ID under the same root directory, and switching tasks does not cross-contaminate.
 - File locks need to be implemented to avoid concurrent write tasks in the same workspace.
-- A future remote Workspace mode needs to clearly distinguish "local data" from "outbound data", and must not use "local-first" to mask actual outbound behavior (11.4).
+- A future remote Workspace mode must clearly distinguish local data from outbound data and must not use "local-first" to mask egress.
 
 ## Rejected Alternatives
 

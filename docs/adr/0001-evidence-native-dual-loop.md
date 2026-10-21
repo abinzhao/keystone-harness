@@ -2,7 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-19
-- **Decision basis**: `需求文档.md` Sections 1.3, 2, 7.2, 8.5, 9.1
+- **Decision basis**: the trust and completion invariants now summarized in the [architecture overview](../architecture/overview.md)
 
 ## Context
 
@@ -32,10 +32,10 @@ From this, five invariants are established:
 - Requires an event-sourced ledger, deterministic state folding, and a provenance propagation mechanism; the implementation cost is higher than "directly calling the model to modify files".
 - Recovery, replay, branch comparison and evidence invalidation can be implemented precisely, rather than approximated.
 - Extensions can only add restrictions or request confirmation, and cannot grant permissions or replace completion rules; the kernel can therefore remain stable.
-- The model is replaceable: changing the model does not change goals, permissions, state or completion conditions (corresponding to NFR-REL-04).
+- The model is replaceable: changing the model does not change goals, permissions, state or completion conditions.
 
 ## Rejected Alternatives
 
 - **Using the chat session as the memory boundary**: cannot express cross-task project cognition, nor perform precise invalidation.
-- **Using the model's self-report or chain-of-thought as proof**: not replayable and not independently verifiable, violating the explicit exclusions of PRD 4.4.
+- **Using the model's self-report or chain-of-thought as proof**: not replayable and not independently verifiable.
 - **Everything is a Plugin**: would let extensions replace the state machine, permission issuance, evidence integrity and completion adjudication, causing the kernel to lose control.

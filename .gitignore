@@ -13,6 +13,10 @@ packages/desktop/bin/keystone-window
 .keystone/
 *.keystone-tmp
 
+# internal project documents (kept locally, not part of the public repository)
+/AGENTS.md
+/需求文档.md
+
 # logs and diagnostics
 *.log
 logs/

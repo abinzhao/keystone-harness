@@ -2,13 +2,13 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-19
-- **Decision basis**: `需求文档.md` Sections 1.4, 8.2 (OT-04), 11.4, 12.5, 12.6
+- **Decision basis**: public versioned schemas, a local/offline runtime, Node-ecosystem extension protocols, and a minimal dependency surface
 
 ## Context
 
-The PRD requires: Schemas are public and versioned, derived code is generated from authoritative Schemas (NFR-COMP-05), the extension SDK targets models/tools/verifiers/protocol adapters, support for Node-ecosystem-friendly protocols such as MCP and ACP, local-first and offline-capable, and a Minimal Runtime that still works when all third-party extensions are unavailable (12.6).
+Schemas are public and versioned; derived representations come from the authoritative validators; the extension SDK targets models, tools, verifiers, and protocol adapters; the runtime supports Node-ecosystem protocols such as MCP and ACP; and the Minimal Runtime remains usable without third-party extensions.
 
-At the same time, this project is an **early-stage open-source project developed by a single person**; the deeper the dependency tree, the higher the supply-chain risk (PRD 11.7) and maintenance cost.
+At the same time, this is a small early-stage open-source project. A deeper dependency tree increases supply-chain risk and maintenance cost.
 
 ## Decision
 
@@ -29,6 +29,6 @@ At the same time, this project is an **early-stage open-source project developed
 
 ## Rejected Alternatives
 
-- **Introducing `zod` / `ajv` for validation**: would bind the Schema source of truth to a third-party library's DSL and version, conflicting with NFR-COMP-05 "derived code is generated from authoritative Schemas".
+- **Introducing `zod` / `ajv` for validation**: would bind the Schema source of truth to a third-party library's DSL and version instead of Keystone's validators.
 - **Introducing `vitest` / `jest`**: more powerful but with a huge dependency tree; `node:test` is sufficient to cover kernel unit and integration tests. If coverage or snapshot capabilities are needed in the future, re-evaluate then.
 - **A Rust kernel**: better performance and process isolation, but would require extra bridging for the Schema/SDK/protocol ecosystem, significantly slowing development. It has been retained as an option for pushing down future hot modules such as "indexing and sandboxing".
