@@ -7,9 +7,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 
-import { appendEvent, buildEvent, chainTip, resolveKeystonePaths } from "@keystone/kernel";
-import { newId, type ProjectId, type RunEvent, type TaskId } from "@keystone/schemas";
+import { appendEvent, buildEvent, chainTip, ExperienceFirewall, resolveKeystonePaths } from "@keystone/kernel";
+import { newId, nowIso, provenanceRefSchema, type ProjectId, type RunEvent, type TaskId } from "@keystone/schemas";
 import * as data from "../src/data.ts";
+import { withExperienceMaintenance } from "../src/experience-actions.ts";
 
 async function fixture(t: { after(fn: () => Promise<void>): void }) {
   const base = await realpath(await mkdtemp(join(tmpdir(), "keystone-data-management-")));
@@ -111,11 +112,32 @@ test("experience clearing refuses frozen or user-confirmed rules and never remov
 
 test("ordinary experience can be cleared when only a different project has an active task", async (t) => {
   const f = await fixture(t);
-  await task(f.paths);
+  const active = await task(f.paths);
+  const activeBefore = await readFile(f.paths.ledgerFile(active.taskId));
   const projectId = newId("proj") as ProjectId;
-  await put(f.paths.experienceEntriesFile(projectId), '{"frozen":false,"promotedBy":"independent_verification"}\n');
+  await withExperienceMaintenance(f.paths, projectId, "seed project experience", async (session) => {
+    const firewall = new ExperienceFirewall(f.paths, projectId, async (event) => {
+      assert.equal(event.type, "experience.candidate_created");
+      if (event.type === "experience.candidate_created") await session.recordExperienceCandidate(event.value);
+    });
+    await firewall.proposeCandidate({
+      projectId, sourceTaskIds: [session.taskId], category: "localization_path",
+      statement: "auth session changes may belong under src/auth",
+      applicability: { paths: ["src/auth"], symbols: [], languages: [],
+        packageManagers: [], toolVersions: [], taskShapes: [] },
+      provenance: provenanceRefSchema.parse({
+        provenanceId: newId("prov"), sourceKind: "model", trustLevel: "observed",
+        locator: "fixture localization", derivedFrom: [], invalidatedBy: [], observedAt: nowIso(),
+      }),
+      supportingEvidenceIds: [],
+    });
+  });
   await put(f.paths.factsFile(projectId), "{}\n");
-  assert.equal((await data.clearProjectExperience(f.paths, projectId)).entries, 1);
+  assert.deepEqual(await data.clearProjectExperience(f.paths, projectId), {
+    projectId, candidates: 1, entries: 0, evaluations: 0,
+  });
+  assert.equal(await readFile(f.paths.experienceCandidatesFile(projectId), "utf8").catch(() => ""), "");
+  assert.deepEqual(await readFile(f.paths.ledgerFile(active.taskId)), activeBefore);
   assert.equal(await readFile(f.paths.factsFile(projectId), "utf8"), "{}\n");
 });
 

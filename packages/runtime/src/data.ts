@@ -19,8 +19,10 @@
 import { lstat, readFile, readdir, realpath, rm } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import { foldTaskState, readJsonLines, readLedger, type KeystonePaths } from "@keystone/kernel";
-import { isTerminal, projectProfileSchema, type TaskState } from "@keystone/schemas";
+import { foldTaskState, KernelSession, readJsonLines, readLedger, type KeystonePaths } from "@keystone/kernel";
+import { experienceCandidateSchema, experienceEntrySchema, experienceEvaluationSchema,
+  isTerminal, projectProfileSchema, type TaskState } from "@keystone/schemas";
+import { rejectExperienceCandidateWithConsent, withExperienceMaintenance } from "./experience-actions.ts";
 
 /** Ids come from a URL; they must be validated before they become a file path. */
 const TASK_ID = /^task_[0-9A-Za-z]+$/;
@@ -351,12 +353,11 @@ export interface ClearedExperience {
 }
 
 /**
- * Clear a project's experience cache: candidates, promoted entries and their
- * evaluations.
+ * Revoke a project's unprotected experience before dropping its projections.
  *
- * Only idle, unprotected experience can be dropped wholesale. Frozen and
- * user-confirmed entries require explicit kernel revocation, not a cache reset.
- * Facts are never cleared here.
+ * Audit events remain authoritative. Quarantined candidates require bound user
+ * consent and kernel rejection; active entries require kernel demotion.
+ * Frozen/user-confirmed records, facts and source task ledgers remain protected.
  */
 export async function clearProjectExperience(
   paths: KeystonePaths,
@@ -367,21 +368,79 @@ export async function clearProjectExperience(
   }
   await listStoreFiles(paths, paths.projectDir(projectId as never));
   await assertInactiveTasks(paths, { projectId });
-  for (const file of [paths.experienceCandidatesFile(projectId as never), paths.experienceEntriesFile(projectId as never), paths.experienceEvaluationsFile(projectId as never)]) {
+  const files = [paths.experienceCandidatesFile(projectId as never),
+    paths.experienceEntriesFile(projectId as never), paths.experienceEvaluationsFile(projectId as never)] as const;
+  const readRecords = async (file: string) => {
     let records;
     try { records = await readJsonLines<unknown>(file); }
     catch { throw new DataError("protected_data", "experience is unreadable; recover it before clearing"); }
-    if (records.tornTail) throw new DataError("protected_data", "experience is incomplete; recover it before clearing");
+    if (records.tornTail && await readFile(file, "utf8") !== "") {
+      throw new DataError("protected_data", "experience is incomplete; recover it before clearing");
+    }
     if (records.items.some(containsProtectedRule)) throw new DataError("protected_data", "frozen or user-confirmed experience cannot be cleared as cache");
+    return records.items;
+  };
+  // Check both the existing projection and the authoritative rebuild: losing a
+  // protected row must not turn a refused clear into an allowed one.
+  for (const file of files) await readRecords(file);
+  await listStoreFiles(paths, paths.tasksDir);
+  try {
+    await KernelSession.rebuildProjectExperience({ paths, projectId });
+  } catch {
+    throw new DataError("protected_data", "experience source cannot be verified; recover it before clearing");
+  }
+  const candidateRecords = await readRecords(files[0]);
+  const entryRecords = await readRecords(files[1]);
+  const evaluationRecords = await readRecords(files[2]);
+  let candidates;
+  let entries;
+  try {
+    candidates = candidateRecords.map((record) => experienceCandidateSchema.parse(record));
+    entries = entryRecords.map((record) => experienceEntrySchema.parse(record));
+    evaluationRecords.forEach((record) => experienceEvaluationSchema.parse(record));
+    if (candidates.some((candidate) => candidate.projectId !== projectId) ||
+        entries.some((entry) => entry.projectId !== projectId)) {
+      throw new Error("foreign experience");
+    }
+  } catch (error) {
+    if (error instanceof DataError) throw error;
+    throw new DataError("protected_data", "experience records cannot be validated; recover them before clearing");
   }
   const cleared: ClearedExperience = {
     projectId,
-    candidates: await countLines(paths.experienceCandidatesFile(projectId as never)),
-    entries: await countLines(paths.experienceEntriesFile(projectId as never)),
-    evaluations: await countLines(paths.experienceEvaluationsFile(projectId as never)),
+    candidates: candidateRecords.length,
+    entries: entryRecords.length,
+    evaluations: evaluationRecords.length,
   };
-  await rm(paths.experienceCandidatesFile(projectId as never), { force: true });
-  await rm(paths.experienceEntriesFile(projectId as never), { force: true });
-  await rm(paths.experienceEvaluationsFile(projectId as never), { force: true });
+  await assertInactiveTasks(paths, { projectId });
+  try {
+    if (candidates.some((candidate) => candidate.status === "quarantined") ||
+        entries.some((entry) => entry.status === "active")) {
+      await withExperienceMaintenance(paths, projectId, "User requested project experience clear", async (session) => {
+        for (const candidate of candidates) {
+          if (candidate.status !== "quarantined") continue;
+          await rejectExperienceCandidateWithConsent(session, candidate.candidateId, "user cleared project experience");
+        }
+        for (const entry of entries) {
+          if (entry.status !== "active") continue;
+          await session.recordExperienceDemotion({
+            entryId: entry.entryId, reason: "user_requested",
+            detail: "user cleared project experience", affectedTaskIds: [],
+          });
+        }
+      });
+      await KernelSession.rebuildProjectExperience({ paths, projectId });
+      const remainingCandidates = (await readRecords(files[0])).map((record) => experienceCandidateSchema.parse(record));
+      const remainingEntries = (await readRecords(files[1])).map((record) => experienceEntrySchema.parse(record));
+      if (remainingCandidates.some((candidate) => candidate.status === "quarantined") ||
+          remainingEntries.some((entry) => entry.status === "active")) {
+        throw new DataError("protected_data", "experience revocation could not be established from kernel events");
+      }
+    }
+    for (const file of files) await rm(file, { force: true });
+  } catch (error) {
+    if (error instanceof DataError) throw error;
+    throw new DataError("io_error", "experience clear was interrupted; committed revocations remain durable, retry after recovery");
+  }
   return cleared;
 }

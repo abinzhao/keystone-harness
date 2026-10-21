@@ -65,6 +65,7 @@ function evidenceFile(paths: KeystonePaths, taskId: string): string {
 export async function recordEvidence(
   paths: KeystonePaths,
   input: RecordEvidenceInput,
+  commit?: (record: EvidenceRecord) => Promise<void>,
 ): Promise<EvidenceRecord> {
   // Sorted conditions keep the hash stable regardless of caller ordering.
   const conditionIds = [...input.conditionIds].sort();
@@ -106,6 +107,7 @@ export async function recordEvidence(
 
   // ensureDir is handled by appendLineDurable, so the task directory does not
   // need to exist beforehand.
+  await commit?.(record);
   await appendLineDurable(evidenceFile(paths, input.taskId), canonicalJson(record));
   return record;
 }

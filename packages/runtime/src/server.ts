@@ -31,6 +31,10 @@ import { catalogFor, DEFAULT_LANGUAGE, isLanguage, type Language } from "@keysto
 import {
   defaultRegistryLocation,
   ExtensionRegistry,
+  ExtensionLifecycleService,
+  extensionDecisionResource,
+  HarnessLabService,
+  LocalPackageError,
   lowRiskActiveExtensions,
 } from "@keystone/extensions";
 import {
@@ -58,6 +62,7 @@ import {
   type Budget,
   type Capability,
   type InterventionRequest,
+  type InputAttachment,
   type OutcomeContract,
   type Scope,
   type UserDecision,
@@ -69,6 +74,7 @@ import { changedPathsForTask, taskWorktreeDiff } from "./diff.ts";
 import {
   KeystoneRuntime,
   type RunControlRequest,
+  type RunDraftTaskOptions,
   type RunTaskOptions,
   type RunTaskResult,
 } from "./keystone-runtime.ts";
@@ -87,13 +93,22 @@ import { SettingsError, SettingsStore } from "./settings.ts";
 import { observeWorkspace } from "./workspace-observation.ts";
 import { humanFileBoundary } from "./human-files.ts";
 import { runHumanCommand } from "./human-commands.ts";
+import { cognitionView } from "./cognition.ts";
+import { changeExperience } from "./experience-actions.ts";
+import { compareContinuousBranches, continuousBranchViews, forkContinuousBranch } from "./continuous-branches.ts";
+import { createLocalCollaboration } from "./collaboration/index.ts";
+import { ProcessorService, routeInputProcessors, type InputProcessorRegistration } from "./input-processors.ts";
+import { compareBaselineCandidate } from "./baseline-verification.ts";
+import { checkReleaseReadiness, STABLE_GATES } from "../../../scripts/release/readiness.ts";
 
 const SERVER_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 // 1.1.0 adds the read-only `POST /v1/contract/preview` draft endpoint (ADR-0008,
 // Decision E). 1.2.0 (ADR-0013) adds an additive `risk` object to that preview
 // response and a `startMode` request on `POST /v1/tasks`; both are additive, so
 // a 1.0.0/1.1.0 client keeps working, it just loses the low-risk auto-start.
-const PROTOCOL_VERSION = "keystone.run.protocol@1.3.0";
+// 1.5.0 adds draft continuation, local input processing and observation-only
+// historical comparison without changing existing request or response shapes.
+const PROTOCOL_VERSION = "keystone.run.protocol@1.5.0";
 const DEFAULT_INTERVENTION_TIMEOUT_MS = 10 * 60_000;
 
 export interface ServeOptions {
@@ -110,6 +125,7 @@ export interface ServeOptions {
    * test or embedder that does not care still gets a working page.
    */
   readonly language?: Language;
+  readonly inputProcessors?: readonly InputProcessorRegistration[];
   /**
    * How long a run waits for an answer to an intervention before giving up.
    *
@@ -295,6 +311,8 @@ async function taskDetail(paths: KeystonePaths, taskId: string): Promise<unknown
     degradation: state.degradation ?? null,
     proofGraphHash: state.proofGraphHash ?? null,
     proofInvalidated: state.proofInvalidated ?? null,
+    request: created?.payload["request"] ?? "",
+    references: created?.payload["references"] ?? [],
     ledger: {
       events: ledger.events.length,
       integrityOk: ledger.integrity.ok,
@@ -453,6 +471,10 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
   let projects = new ProjectRegistry(paths);
   let attachments = new AttachmentStore(paths);
   let settings = new SettingsStore(paths);
+  let extensions = new ExtensionLifecycleService(defaultRegistryLocation(paths.home));
+  let lab = new HarnessLabService({ reportsDirectory: join(paths.home, "lab", "reports") });
+  let collaboration = createLocalCollaboration({ paths: () => paths, projects: () => projects.list() });
+  let processors = new ProcessorService({ paths, extensions, processors: options.inputProcessors });
   let managingData = false;
   let storeRequests = 0;
   const assets = new Map<string, string>();
@@ -469,6 +491,7 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
 
   const createRuntime = () => KeystoneRuntime.create({
     paths,
+    extensions,
     models: options.models ?? [],
     ...(options.routes === undefined ? {} : { routes: options.routes }),
     ...(options.mode === undefined ? {} : { mode: options.mode }),
@@ -494,15 +517,42 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
   await applyConfiguredModels();
 
   /** Start a run and answer immediately; decisions arrive over HTTP. */
-  const startRun = async (body: Record<string, unknown>): Promise<{ taskId: string }> => {
+  const startRun = async (body: Record<string, unknown>, draftTaskId?: string): Promise<{ taskId: string }> => {
     let workspacePath = String(body["workspacePath"] ?? "");
-    const request = String(body["request"] ?? "");
-    if (workspacePath === "" || request === "") {
-      throw new HttpError(400, "workspacePath and request are required");
-    }
-    try { workspacePath = (await projects.register({ rootPath: workspacePath })).rootPath; }
-    catch (error) {
-      throw new HttpError(400, `the task could not be created: ${error instanceof Error ? error.message : "workspace is unavailable"}`);
+    let requestText = String(body["request"] ?? "");
+    let originalAttachments: readonly InputAttachment[] | undefined;
+    if (draftTaskId === undefined) {
+      if (workspacePath === "" || requestText === "") {
+        throw new HttpError(400, "workspacePath and request are required");
+      }
+      try { workspacePath = (await projects.register({ rootPath: workspacePath })).rootPath; }
+      catch (error) {
+        throw new HttpError(400, `the task could not be created: ${error instanceof Error ? error.message : "workspace is unavailable"}`);
+      }
+    } else {
+      const draft = await KernelSession.open({ paths, taskId: draftTaskId as never });
+      if (draft.state().status !== "draft") throw new HttpError(409, `task cannot start from ${draft.state().status}`);
+      const created = draft.events().find((event) => event.type === "task.created");
+      const recordedRequest = created?.payload["request"];
+      if (typeof recordedRequest !== "string" || recordedRequest.length === 0) {
+        throw new HttpError(409, "draft request is unavailable");
+      }
+      if (requestText !== "" && requestText !== recordedRequest) {
+        throw new HttpError(409, "draft request is immutable; revise only after the local task starts");
+      }
+      const project = await projects.get(draft.projectId);
+      if (!project || project.status !== "available" || project.archived) {
+        throw new HttpError(409, "draft project is unavailable");
+      }
+      if (workspacePath !== "" && workspacePath !== project.rootPath) {
+        throw new HttpError(409, "draft workspace is immutable");
+      }
+      if (Array.isArray(body["attachmentIds"]) && body["attachmentIds"].length > 0) {
+        throw new HttpError(409, "draft inputs are immutable; start a new task to add attachments");
+      }
+      workspacePath = project.rootPath;
+      requestText = recordedRequest;
+      originalAttachments = (created?.payload["attachments"] ?? []) as readonly InputAttachment[];
     }
     const writePaths = Array.isArray(body["writePaths"])
       ? (body["writePaths"] as readonly string[])
@@ -524,7 +574,7 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
       try {
         graded = await gradeSubmission({
           workspacePath,
-          requestText: request,
+          requestText,
           writePaths,
           allowedCommands,
           references: Array.isArray(body["references"])
@@ -555,7 +605,8 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
     }
 
     const projectId = await projectIdForWorkspace(workspacePath);
-    const selected = await attachments.select(projectId, Array.isArray(body["attachmentIds"]) ? body["attachmentIds"].map(String) : []);
+    const selected = await attachments.select(projectId, originalAttachments?.map((entry) => entry.attachmentId) ??
+      (Array.isArray(body["attachmentIds"]) ? body["attachmentIds"].map(String) : []));
     const configuration = await applyConfiguredModels();
     const builder = runtime.describeEgress().find((entry) => entry.role === "builder");
     if (selected.some((entry) => entry.kind === "image") && !builder?.multimodal) throw new HttpError(409, "the selected builder does not support image input");
@@ -575,21 +626,14 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
       announce = { resolve, reject };
     });
 
-    const completion = runtime
-      .runTask({
+    const runOptions: RunDraftTaskOptions = {
         workspacePath,
-        request,
-        attachments: selected,
-        attachmentParts: await attachments.parts(selected, Math.min(24_000, (configuration.config.defaults?.maxTokens ?? 300_000) * 2)),
         configurationSnapshot: {
           revision: configuration.revision,
           modelIds: runtime.describeEgress().map((entry) => entry.modelId),
           ...(builder === undefined ? {} : { builderModelId: builder.modelId }),
         },
         signal: aborter.signal,
-        ...(Array.isArray(body["references"])
-          ? { references: body["references"] as RunTaskOptions["references"] }
-          : {}),
         autonomy: buildAutonomy(projectId, writePaths, allowedCommands, configuration.config.defaults),
         // A confirmed (or auto-started low-risk) run accepts the compiled
         // contract without an extra round trip; an unconfirmed write never
@@ -624,7 +668,19 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
             timer.unref();
           });
         },
-      })
+      };
+    const completion = (draftTaskId === undefined
+      ? runtime.runTask({
+          ...runOptions,
+          request: requestText,
+          attachments: selected,
+          attachmentParts: await attachments.parts(selected,
+            Math.min(24_000, (configuration.config.defaults?.maxTokens ?? 300_000) * 2)),
+          ...(Array.isArray(body["references"])
+            ? { references: body["references"] as RunTaskOptions["references"] }
+            : {}),
+        })
+      : runtime.runDraftTask(draftTaskId, runOptions))
       .then((result) => {
         if (taskId !== undefined) {
           state.aborters.delete(taskId);
@@ -755,10 +811,15 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
       if (isManagement && segments[1] === "migrate") {
         const result = await migrateData(paths, await readBody(request) as Parameters<typeof migrateData>[1]);
         if (!result.preview && result.verified && result.newHome !== undefined) {
+          await collaboration.dispose();
           paths = resolveKeystonePaths(result.newHome);
           projects = new ProjectRegistry(paths);
           attachments = new AttachmentStore(paths);
           settings = new SettingsStore(paths);
+          extensions = new ExtensionLifecycleService(defaultRegistryLocation(paths.home));
+          lab = new HarnessLabService({ reportsDirectory: join(paths.home, "lab", "reports") });
+          collaboration = createLocalCollaboration({ paths: () => paths, projects: () => projects.list() });
+          processors = new ProcessorService({ paths, extensions, processors: options.inputProcessors });
           runtime = await createRuntime();
           await applyConfiguredModels();
           state.runs.clear(); state.interventions.clear(); state.controls.clear();
@@ -801,6 +862,36 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
         }
       }
       if (segments[0] === "projects") {
+        if (segments.length === 3 && segments[2] === "cognition") {
+          const project = await projects.get(segments[1]!);
+          if (!project) throw new HttpError(404, "project not found");
+          if (request.method === "POST") {
+            if (project.status !== "available") throw new HttpError(409, "project workspace is unavailable");
+            await runtime.attachProject(project.rootPath);
+          } else if (request.method !== "GET") throw new HttpError(405, "unsupported cognition operation");
+          json(response, 200, await cognitionView(paths, project.workspaceId)); return;
+        }
+        if (segments.length === 4 && segments[2] === "facts" && request.method === "PATCH") {
+          const project = await projects.get(segments[1]!);
+          if (!project) throw new HttpError(404, "project not found");
+          const body = await readBody(request) as Record<string, unknown>;
+          if (typeof body["expectedHash"] !== "string") throw new HttpError(400, "expectedHash is required");
+          const fact = await KernelSession.editProjectFact({ paths, projectId: project.workspaceId,
+            factId: segments[3]!, expectedHash: body["expectedHash"],
+            ...(typeof body["statement"] === "string" ? { statement: body["statement"] } : {}),
+            ...(typeof body["frozen"] === "boolean" ? { frozen: body["frozen"] } : {}),
+            ...(body["invalidated"] === true ? { invalidated: true } : {}) });
+          json(response, 200, { fact: { ...fact, hash: contentHash(fact) } }); return;
+        }
+        if (segments.length === 4 && segments[2] === "experience" && segments[3] !== "clear" && request.method === "POST") {
+          const project = await projects.get(segments[1]!);
+          if (!project || project.status !== "available") throw new HttpError(409, "project unavailable");
+          const body = await readBody(request) as Record<string, unknown>;
+          if (!["confirm", "revoke"].includes(String(body["action"]))) throw new HttpError(400, "unknown experience action");
+          json(response, 200, await changeExperience(paths, project, segments[3]!, {
+            action: body["action"] as "confirm" | "revoke",
+            ...(typeof body["reason"] === "string" ? { reason: body["reason"] } : {}) })); return;
+        }
         if (segments.length === 1 && request.method === "GET") {
           json(response, 200, { projects: await projects.list() }); return;
         }
@@ -850,6 +941,87 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
             return;
           }
         }
+      }
+
+      if (segments[0] === "extensions") {
+        if (segments.length === 1 && request.method === "GET") {
+          json(response, 200, { extensions: await extensions.list(), supportedKinds: ["tool", "verifier", "skill", "protocol"] }); return;
+        }
+        if (segments.length === 2 && segments[1] === "review" && request.method === "POST") {
+          const body = await readBody(request) as Record<string, unknown>;
+          json(response, 200, await extensions.review(String(body["directory"] ?? body["path"] ?? ""))); return;
+        }
+        if (segments.length === 2 && segments[1] === "install" && request.method === "POST") {
+          const body = await readBody(request) as Record<string, unknown>;
+          json(response, 200, await extensions.install(String(body["directory"] ?? body["path"] ?? ""),
+            String(body["reviewHash"] ?? ""), body["confirmed"] === true)); return;
+        }
+        if (segments.length === 3 && request.method === "POST") {
+          const body = await readBody(request) as Record<string, unknown>;
+          const name = segments[1]!, action = segments[2]!;
+          if (body["confirmed"] !== true) throw new HttpError(400, "explicit extension action confirmation required");
+          if (action === "disable") { json(response, 200, await extensions.disable(name)); return; }
+          if (action === "uninstall") { json(response, 200, await extensions.uninstall(name)); return; }
+          const entry = (await extensions.list()).find((item) => item.manifest.name === name);
+          if (!entry) throw new HttpError(404, "extension not found");
+          const hash = String(body["reviewHash"] ?? "");
+          const decision = userDecisionSchema.parse({ decisionId: newId("dec"),
+            taskId: newId("task"), branchId: newId("branch"), at: nowIso(), recordedBy: "user",
+            decision: "allow", rationale: `authenticated workbench ${action} confirmation`,
+            appliesTo: { capability: "extension.activate", resources: [
+              extensionDecisionResource(entry.manifest, hash, action === "probe" ? "probe" : "activate")],
+              expiresAt: new Date(Date.now() + 60000).toISOString() } });
+          if (action === "probe") {
+            json(response, 200, await extensions.probe(name, { reviewHash: hash, decision })); return;
+          }
+          if (action === "activate") {
+            json(response, 200, await extensions.activate(name, { reviewHash: hash, decision })); return;
+          }
+        }
+      }
+      if (segments[0] === "lab") {
+        if (request.method === "GET") { json(response, 200, { reports: await lab.list() }); return; }
+        if (request.method === "POST") {
+          const body = await readBody(request) as Record<string, unknown>;
+          if (body["confirmed"] !== true) throw new HttpError(400, "explicit isolated Lab confirmation required");
+          const directory = String(body["directory"] ?? body["path"] ?? "");
+          const review = await extensions.review(directory);
+          if (body["reviewHash"] !== review.reviewHash) throw new HttpError(409, "Lab review changed");
+          const decision = userDecisionSchema.parse({ decisionId: newId("dec"), taskId: newId("task"),
+            branchId: newId("branch"), at: nowIso(), decision: "allow", recordedBy: "user",
+            rationale: "authenticated isolated conformance probe confirmation",
+            appliesTo: { capability: "extension.activate", resources: [
+              extensionDecisionResource(review.read.manifest, review.reviewHash, "probe")] } });
+          json(response, 200, await lab.run(directory, { reviewHash: review.reviewHash, decision })); return;
+        }
+      }
+      if (segments[0] === "collaboration") {
+        const address = server.address();
+        const currentPort = typeof address === "object" && address !== null ? address.port : 0;
+        if ((request.headers.origin !== undefined &&
+          ![`http://127.0.0.1:${currentPort}`, `http://localhost:${currentPort}`].includes(request.headers.origin)) ||
+          request.headers["sec-fetch-site"] === "cross-site") throw new HttpError(403, "local collaboration origin required");
+        const result = await collaboration.service.handle(request.method ?? "GET", url.pathname,
+          request.method === "GET" ? undefined : await readBody(request), { authenticated: true, source: "local_ui" });
+        json(response, result.status, result.body); return;
+      }
+      if (segments[0] === "input-processors") {
+        const aborter = new AbortController();
+        request.once("aborted", () => aborter.abort());
+        response.once("close", () => { if (!response.writableEnded) aborter.abort(); });
+        const result = await routeInputProcessors(processors, { method: request.method ?? "GET",
+          pathname: url.pathname, body: request.method === "GET" ? undefined : await readBody(request),
+          signal: aborter.signal, ...(url.searchParams.get("projectId") === null
+            ? {} : { projectId: url.searchParams.get("projectId")! }) });
+        if (result) { if (!response.destroyed) json(response, result.status, result.body); return; }
+      }
+      if (segments[0] === "release" && segments[1] === "readiness" && request.method === "GET") {
+        const directory = join(paths.home, "release");
+        const input = await readFile(join(directory, "readiness-input.json"), "utf8").catch(() => undefined);
+        json(response, 200, input ? await checkReleaseReadiness(JSON.parse(input), { root: directory }) :
+          { localReady: false, stableReady: false, channel: "rc",
+            gates: STABLE_GATES.map((gateId) => ({ gateId, status: "missing", reason: "No verified release evidence supplied." })) });
+        return;
       }
 
       // GET /v1/capabilities — what this runtime can do, so a client can refuse
@@ -948,6 +1120,95 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
 
       if (segments[0] === "tasks" && segments[1] !== undefined) {
         const taskId = segments[1];
+        if (segments[2] === "start" && request.method === "POST") {
+          if (state.runs.get(taskId)?.status === "running") throw new HttpError(409, "task is already running");
+          const body = await readBody(request) as Record<string, unknown>;
+          json(response, 202, await startRun(body, taskId));
+          return;
+        }
+        if (segments[2] === "verify-comparison" && request.method === "POST") {
+          if (state.runs.get(taskId)?.status === "running") {
+            throw new HttpError(409, "pause or finish the source task before historical comparison");
+          }
+          const body = await readBody(request) as Record<string, unknown>;
+          if (body["confirmed"] !== true) {
+            throw new HttpError(409, "explicit baseline comparison confirmation required");
+          }
+          const aborter = new AbortController();
+          request.once("aborted", () => aborter.abort());
+          response.once("close", () => { if (!response.writableEnded) aborter.abort(); });
+          try {
+            const report = await compareBaselineCandidate(paths, taskId, {
+              confirmed: true,
+              ...(body["maxWallClockMs"] === undefined ? {} : { maxWallClockMs: Number(body["maxWallClockMs"]) }),
+              ...(body["timeoutMs"] === undefined ? {} : { timeoutMs: Number(body["timeoutMs"]) }),
+              signal: aborter.signal,
+            });
+            if (!response.destroyed) json(response, 200, report);
+          } catch (error) {
+            throw new HttpError(409, aborter.signal.aborted
+              ? "baseline comparison cancelled; source task and workspace were not changed"
+              : error instanceof Error ? error.message : "baseline comparison refused");
+          }
+          return;
+        }
+        if (segments[2] === "branches" && request.method === "GET") {
+          json(response, 200, { branches: await continuousBranchViews(paths, taskId) }); return;
+        }
+        if (segments[2] === "branches" && request.method === "POST") {
+          if (state.runs.get(taskId)?.status === "running") throw new HttpError(409, "pause the source task before forking");
+          const body = await readBody(request) as Record<string, unknown>;
+          try { json(response, 200, await forkContinuousBranch(paths, taskId, {
+            checkpointId: String(body["checkpointId"] ?? ""), label: String(body["label"] ?? ""),
+            ...(typeof body["reason"] === "string" ? { reason: body["reason"] } : {}) })); }
+          catch (error) { throw new HttpError(409, error instanceof Error ? error.message : "fork refused"); }
+          return;
+        }
+        if (segments[2] === "compare" && request.method === "GET") {
+          try { json(response, 200, await compareContinuousBranches(paths, taskId,
+            url.searchParams.get("left") ?? "", url.searchParams.get("right") ?? "")); }
+          catch (error) { throw new HttpError(400, error instanceof Error ? error.message : "comparison refused"); }
+          return;
+        }
+        if (segments[2] === "resume" && request.method === "POST") {
+          if (state.runs.get(taskId)?.status === "running") throw new HttpError(409, "task is already running");
+          const body = await readBody(request) as Record<string, unknown>;
+          await applyConfiguredModels();
+          const aborter = new AbortController();
+          let announced = false;
+          let announce: (value: unknown) => void = () => undefined;
+          let rejectStart: (reason: unknown) => void = () => undefined;
+          const ready = new Promise((resolve, reject) => { announce = resolve; rejectStart = reject; });
+          const continuation = runtime.resumeTask(taskId, {
+            signal: aborter.signal, control: async () => state.controls.get(taskId)?.shift(),
+            onTaskCreated: () => {
+              state.aborters.set(taskId, aborter);
+              state.runs.set(taskId, { taskId, status: "running", startedAt: nowIso(), interventions: [] });
+              announced = true; announce({ taskId, status: "running" });
+            },
+            onIntervention: async (intervention) => {
+              state.interventions.set(intervention.interventionId, intervention);
+              state.runs.get(taskId)?.interventions.push(intervention);
+              return new Promise<UserDecision | undefined>((resolve) => {
+                const timer = setTimeout(() => { state.pending.delete(intervention.interventionId); resolve(undefined); }, interventionTimeoutMs);
+                timer.unref();
+                state.pending.set(intervention.interventionId, (decision) => { clearTimeout(timer); resolve(decision); });
+              });
+            },
+          }, typeof body["branchId"] === "string" ? body["branchId"] : undefined).then((result) => {
+            state.aborters.delete(taskId);
+            state.runs.set(taskId, { taskId, status: "finished", result,
+              startedAt: state.runs.get(taskId)?.startedAt ?? nowIso(),
+              interventions: state.runs.get(taskId)?.interventions ?? [] });
+          }).catch((error) => {
+            state.aborters.delete(taskId);
+            if (!announced) rejectStart(new HttpError(409, error instanceof Error ? error.message : "resume refused"));
+            else state.runs.set(taskId, { taskId, status: "failed", error: error instanceof Error ? error.message : "resume failed",
+              startedAt: state.runs.get(taskId)?.startedAt ?? nowIso(), interventions: [] });
+          });
+          void continuation;
+          json(response, 202, await ready); return;
+        }
         if (request.method === "GET" && segments[2] === "artifacts" && segments[3] !== undefined) {
           const artifactId = artifactIdValidator.parse(segments[3]);
           const session = await KernelSession.open({ paths, taskId: taskId as never });
@@ -1261,6 +1522,7 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
         json(response, error.status, { error: error.message });
         return;
       }
+      if (error instanceof LocalPackageError) { json(response, 400, { error: error.message }); return; }
       if (error instanceof SettingsError || error instanceof AttachmentError || error instanceof ProjectServiceError || error instanceof FileServiceError) {
         json(response, error.status, { error: error.message }); return;
       }
@@ -1293,6 +1555,7 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
     token,
     protocolVersion: PROTOCOL_VERSION,
     async close(): Promise<void> {
+      await collaboration.dispose();
       for (const [taskId] of state.aborters) queueControl(state, taskId, { kind: "stop", reason: "server closed" });
       for (const resolve of state.pending.values()) resolve(undefined);
       state.pending.clear();

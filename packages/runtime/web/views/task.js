@@ -1,4 +1,4 @@
-import { button, node, tr, text, esc, kv, note, jsonDetails, statusTone, bytes } from "../components/dom.js";
+import { button, node, tr, kv, note, jsonDetails, statusTone, bytes } from "../components/dom.js";
 import { post, taskPath } from "../client/api.js";
 
 const STAGES = ["understanding", "planning", "authorizing", "modifying", "verifying", "delivering"];
@@ -16,39 +16,54 @@ const EVENTS = {
 };
 
 export function proofIsCurrent(state) {
-  return state.connection === "connected" && state.proof?.outcome === "proven" && !state.detail?.proofInvalidated;
+  return state.connection === "connected" && state.proof?.outcome === "proven" && !state.detail?.proofInvalidated
+    && state.detail?.ledger?.integrityOk !== false && (!state.proof.taskId || state.proof.taskId === state.taskId);
 }
 
 export function renderOverview(host, state) {
   const detail = state.detail;
   if (!detail) {
     host.replaceChildren(node("div", { class: "empty" }, [
-      node("h2", { text: tr(state.loading ? "Loading task" : "A workspace for verifiable work") }),
-      node("p", { text: tr("Select a project, describe an outcome, then review changes and independent evidence.") }),
+      node("p", { text: tr(state.loading ? "Loading task" : "Select a project, describe an outcome, then review changes and independent evidence.") }),
     ]));
     return;
   }
   const contract = detail.contract;
-  host.innerHTML = `<div class="stack">
-    <div><span class="eyebrow">${text("Goal and scope")}</span><h3>${esc(contract?.goal ?? tr("No contract yet."))}</h3></div>
-    <div class="row"><span class="pill ${statusTone(detail.status)}">${text(detail.status)}</span><span class="chip">${text("contract v{version}", { version: contract?.version ?? "?" })}</span><span class="chip">${text(detail.replay?.consistent ? "replay consistent" : "replay inconsistent")}</span></div>
-    <div class="stage-list">${STAGES.map((stage) => `<span class="${stage === detail.stage ? "active" : ""}">${text(`stage-${stage}`)}</span>`).join("")}</div>
-    <div><h2>${text("Write scope")}</h2><div class="row">${(contract?.writeScope ?? []).map((value) => `<code class="chip">${esc(value)}</code>`).join("") || text("(nothing writable)")}</div></div>
-    <div><h2>${text("Read scope")}</h2><div class="row">${(contract?.readScope ?? []).map((value) => `<code class="chip">${esc(value)}</code>`).join("") || text("none")}</div></div>
-    <div><h2>${text("Completion conditions")}</h2><div id="overview-conditions"></div></div>
-    <div><h2>${text("Invariants")}</h2><ul>${(contract?.invariants ?? []).map((value) => `<li>${esc(value.description)}</li>`).join("")}</ul></div>
-  </div>`;
-  const verdicts = new Map((state.proof?.conditions ?? []).map((entry) => [entry.conditionId, entry]));
-  for (const condition of contract?.completionConditions ?? []) {
-    const result = verdicts.get(condition.conditionId);
-    const wrap = node("details", { class: "condition" });
-    wrap.append(node("summary", {}, [
-      node("span", { class: `pill ${result?.satisfied && state.connection === "connected" ? "ok" : "warn"}`, text: tr(state.connection !== "connected" ? "Stale" : result?.satisfied ? "satisfied" : result?.reasonCode ?? "not evaluated") }),
-      node("span", { text: condition.description }),
-    ]));
-    wrap.append(node("p", { class: "muted", text: `${tr(condition.required ? "required" : "auxiliary")} · ${condition.minEvidenceLevel} · ${condition.verifier} · ${tr(condition.requiresIndependence ? "independent: yes" : "independent: no")}` }));
-    wrap.append(jsonDetails("Condition and admission", { condition, result: result ?? null }));
-    host.querySelector("#overview-conditions").append(wrap);
+  const open = new Set([...host.querySelectorAll("details")].filter((item) => item.open).map((item) => item.dataset.key));
+  const conditions = node("div", { id: "overview-conditions" });
+  const summary = node("article", { class: "task-summary stack" }, [
+    node("div", { class: "goal-summary" }, [
+      node("span", { class: "eyebrow", text: tr("Goal and scope") }), node("h2", { text: contract?.goal ?? tr("No contract yet.") }),
+    ]),
+    node("div", { class: "row" }, [
+      node("span", { class: `pill ${statusTone(detail.status)}`, text: tr(detail.status) }),
+      node("span", { class: "chip", text: tr("contract v{version}", { version: contract?.version ?? "?" }) }),
+      node("span", { class: "chip", text: tr(detail.replay?.consistent ? "replay consistent" : "replay inconsistent") }),
+    ]),
+    node("div", { class: "stage-list" }, STAGES.map((stage) => node("span", { class: stage === detail.stage ? "active" : "", text: tr(`stage-${stage}`) }))),
+    node("div", {}, [node("h3", { text: tr("Completion conditions") }), conditions]),
+  ]);
+  host.replaceChildren(summary);
+  renderConditions(conditions, state);
+  const boundaries = node("details", { class: "task-boundaries" }, [node("summary", { text: tr("Scope and invariants") })]);
+  boundaries.dataset.key = "boundaries";
+  for (const [key, label] of [["writeScope", "Write scope"], ["readScope", "Read scope"]]) {
+    boundaries.append(node("h4", { text: tr(label) }), node("div", { class: "row" },
+      contract?.[key]?.length ? contract[key].map((value) => node("code", { class: "chip", text: value })) : tr(key === "writeScope" ? "(nothing writable)" : "none")));
+  }
+  boundaries.append(node("h4", { text: tr("Invariants") }), node("ul", {}, (contract?.invariants ?? []).map((value) => node("li", { text: value.description }))));
+  host.append(boundaries);
+  const recent = (state.events ?? []).filter((event) => ["action.executed", "action.rejected", "verification.failed", "evidence.recorded", "error.recorded"].includes(event.type)).slice(-4);
+  if (recent.length) {
+    const activity = node("div", { class: "task-activity" }, [node("h3", { text: tr("Recent activity") })]);
+    for (const event of recent) {
+      const value = event.payload ?? {};
+      activity.append(node("div", { class: "activity-row" }, [
+        node("span", { class: "activity-dot", "aria-hidden": "true" }),
+        node("div", {}, [node("strong", { text: tr(EVENTS[event.type] ?? event.type) }), node("p", { class: "muted", text: value.summary ?? value.reason ?? value.message ?? value.status ?? "" })]),
+      ]));
+    }
+    host.append(activity);
   }
   if (detail.ledger?.integrityOk === false) host.prepend(note(tr("Ledger integrity check failed: {reason}", { reason: detail.ledger.integrityReason }), "bad"));
   if (detail.degradation) host.prepend(note(tr("Degraded to {mode}: {reason}", detail.degradation), "warn"));
@@ -67,6 +82,68 @@ export function renderOverview(host, state) {
     host.append(jsonDetails("Attachment source and hashes", detail.attachments));
   }
   if (detail.configurationSnapshot) host.append(jsonDetails("Task configuration snapshot", detail.configurationSnapshot));
+  for (const item of host.querySelectorAll("details")) if (open.has(item.dataset.key)) item.open = true;
+}
+
+function verdictLabel(state, result) {
+  if (state.connection !== "connected") return "Stale";
+  if (state.detail?.proofInvalidated || state.detail?.ledger?.integrityOk === false) return "Current proof invalidated";
+  return result?.satisfied ? "satisfied" : result?.reasonCode ?? "not evaluated";
+}
+
+function renderConditions(host, state, evidence = false) {
+  const verdicts = new Map((state.proof?.conditions ?? []).map((entry) => [entry.conditionId, entry]));
+  const records = new Map((state.detail?.evidence ?? []).map((entry) => [entry.evidenceId, entry]));
+  const conditions = state.detail?.contract?.completionConditions ?? state.proof?.conditions ?? [];
+  for (const condition of conditions) {
+    const result = verdicts.get(condition.conditionId);
+    const label = verdictLabel(state, result);
+    const wrap = node("details", { class: "condition" });
+    wrap.dataset.key = condition.conditionId;
+    wrap.append(node("summary", {}, [
+      node("span", { class: `pill ${label === "satisfied" ? "ok" : "warn"}`, text: tr(label) }),
+      node("span", { text: condition.description ?? condition.conditionId }),
+    ]));
+    wrap.append(node("p", { class: "muted", text: [
+      tr(condition.required ? "required" : "auxiliary"), condition.minEvidenceLevel, condition.verifier,
+      tr(condition.requiresIndependence ? "independent: yes" : "independent: no"),
+    ].filter(Boolean).join(" · ") }), jsonDetails("Condition and admission", { condition, result: result ?? null }));
+    if (evidence) {
+      for (const id of result?.evidenceIds ?? []) {
+        const record = records.get(id);
+        const observation = state.events.find((entry) => entry.type === "evidence.recorded" && entry.payload?.evidenceId === id)?.payload;
+        wrap.append(node("details", { class: "evidence-observation" }, [
+          node("summary", { text: record ? `${record.summary ?? id} · ${record.level} · ${record.producer} · ${tr(record.status)}` : id }),
+          jsonDetails("Observation and provenance", observation ?? record ?? { evidenceId: id, available: false }),
+        ]));
+        if (!record && !observation) wrap.append(note("The original observation is not available in this projection.", "warn"));
+      }
+      if (!result?.evidenceIds?.length) wrap.append(note("No admitted evidence for this condition."));
+    }
+    host.append(wrap);
+  }
+  if (!conditions.length) host.append(note("No completion conditions returned."));
+}
+
+export function renderProofView(host, state, { exportProof } = {}) {
+  const open = new Set([...host.querySelectorAll("details")].filter((item) => item.open).map((item) => item.dataset.key));
+  host.replaceChildren(node("div", { class: "service-heading" }, [
+    node("div", {}, [node("h2", { text: tr("Proof") }), node("p", { class: "muted", text: tr("Follow each completion condition to its admitted evidence and original observation.") })]),
+    ...(exportProof && state.proof ? [button("Export proof", exportProof)] : []),
+  ]));
+  const current = proofIsCurrent(state);
+  host.append(note(current ? "Safe to deliver" : state.connection !== "connected" ? "Stale proof; reconnect to verify" : state.detail?.proofInvalidated ? "Current proof invalidated" : "Not provable yet", current ? "ok" : "warn"));
+  if (state.detail?.ledger?.integrityOk === false) host.append(note("Ledger integrity check failed.", "bad"));
+  if (state.detail?.proofInvalidated?.reason) host.append(note(state.detail.proofInvalidated.reason, "warn"));
+  if (!state.proof) { host.append(note("No proof yet.")); return; }
+  host.append(node("p", { class: "muted", text: `${tr("Generated")}: ${state.proof.generatedAt ?? tr("Unknown")}` }));
+  renderConditions(host, state, true);
+  for (const [key, label] of [["unverified", "Unverified"], ["residualRisks", "Residual risks"]]) {
+    if (state.proof[key]?.length) host.append(node("h3", { text: tr(label) }), node("ul", {}, state.proof[key].map((value) => node("li", { text: value }))));
+  }
+  if (state.proof.reproduceCommands?.length) host.append(node("h3", { text: tr("Reproduce commands") }), node("pre", { text: state.proof.reproduceCommands.join("\n") }));
+  host.append(jsonDetails("Proof and provenance", state.proof));
+  for (const item of host.querySelectorAll("details")) if (open.has(item.dataset.key)) item.open = true;
 }
 
 export function renderTrace(host, state, preferences) {

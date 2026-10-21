@@ -156,6 +156,50 @@ function stubProposer(input: ContractProposalInput): ContractProposal {
   return { contract, questions: [] };
 }
 
+test("a reopened draft can receive local policy wiring without changing its created request", async () => {
+  const home = await tempHome();
+  try {
+    const paths = resolveKeystonePaths(home);
+    const projectId = newId("proj") as ProjectId;
+    const created = await KernelSession.create({
+      paths,
+      projectId,
+      request: "independently inspect imported changes",
+      references: [{ kind: "text", value: "untrusted imported candidate" }],
+      requestedBy: "user",
+    });
+
+    const defining = await KernelSession.open({ paths, taskId: created.taskId });
+    await defining.submit();
+    await assert.rejects(
+      defining.compile({
+        profile: profileFor(projectId),
+        autonomy: autonomyFor(projectId, ["src/**"]),
+      }),
+      (error: unknown) => error instanceof KernelError && error.code === "no_contract_proposer",
+    );
+
+    const continued = await (KernelSession.open as unknown as (input: Record<string, unknown>) => Promise<KernelSession>)({
+      paths,
+      taskId: created.taskId,
+      actorId: "runtime",
+      proposeContract: stubProposer,
+      resolveAction: testActionResolver,
+    });
+    const proposal = await continued.compile({
+      profile: profileFor(projectId),
+      autonomy: autonomyFor(projectId, ["src/**"]),
+    });
+    assert.equal(proposal.contract.goal, "independently inspect imported changes");
+    assert.deepEqual(
+      continued.events().find((event) => event.type === "task.created")?.payload["references"],
+      [{ kind: "text", value: "untrusted imported candidate" }],
+    );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 /**
  * A deterministic action resolver for the kernel lifecycle tests. The kernel
  * resolves no intent→capability mapping itself (ADR-0006, M1); these tests pin
@@ -563,6 +607,32 @@ test("a stale session cannot append over a newer committed chain tip", async () 
   } finally {
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test("standalone consent remains in the ledger without inventing an intervention in exported proof", async () => {
+  const { session, home } = await startTask();
+  try {
+    const decision = userDecisionSchema.parse({
+      decisionId: newId("dec"), taskId: session.taskId, branchId: session.branchId, at: new Date().toISOString(),
+      decision: "allow", rationale: "create a fresh local draft", recordedBy: "user",
+      appliesTo: { capability: "fs.write", resources: ["src/**"] },
+    });
+    await session.recordUserDecision(decision);
+    const state = session.state();
+    const proof = await session.exportProof({ changedPaths: [] });
+    assert.deepEqual(proof.interventions, []);
+    assert.equal(proof.outcome, "not_proven");
+    assert.deepEqual(session.state(), state, "proof projection must not change authoritative state");
+    const interventionId = newId("intr");
+    await session.recordUserDecision(userDecisionSchema.parse({ ...decision, decisionId: newId("dec"), interventionId }));
+    const decided = await session.exportProof({ changedPaths: [] });
+    assert.equal(decided.interventions.length, 1);
+    assert.equal(decided.interventions[0]?.interventionId, interventionId);
+    assert.equal(session.events().filter((event) => event.type === "intervention.decided").length, 2);
+    assert.equal(session.replay().consistent, true);
+    const reopened = await KernelSession.open({ paths: resolveKeystonePaths(home), taskId: session.taskId });
+    assert.equal((await reopened.exportProof({ changedPaths: [] })).interventions.length, 1);
+  } finally { await rm(home, { recursive: true, force: true }); }
 });
 
 test("confirmed irreversible operations need a recorded decision bound to exact task and parameters", async () => {

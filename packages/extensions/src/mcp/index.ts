@@ -9,5 +9,6 @@
 
 export * from "./protocol.ts";
 export * from "./stdio-client.ts";
+export * from "./http-client.ts";
 export * from "./wrap.ts";
 export * from "./conformance-probe.ts";

@@ -49,6 +49,7 @@ import {
   type TaskStatus,
   type UserDecision,
 } from "@keystone/schemas";
+import { join } from "node:path";
 
 import type {
   ContractProposal,
@@ -56,7 +57,7 @@ import type {
 } from "./contract/propose.ts";
 import { reviseContract, type ContractPatch, type ReviseContractResult } from "./contract/revise.ts";
 import { invalidateForWorkspaceChange } from "./evidence/invalidate.ts";
-import { listEvidence, recordEvidence, updateEvidence, type RecordEvidenceInput } from "./evidence/store.ts";
+import { recordEvidence, updateEvidence, type RecordEvidenceInput } from "./evidence/store.ts";
 import { buildEvent } from "./ledger/events.ts";
 import { foldTaskState } from "./ledger/fold.ts";
 import { appendEvent, chainTip, readLedger, type LedgerRead } from "./ledger/ledger.ts";
@@ -65,12 +66,16 @@ import { issueLease, type IssueLeaseInput, type LeaseDenial, type LeaseIssueResu
 import type { ActionCapabilityResolver } from "./lease/resolve.ts";
 import { buildProofGraph } from "./proof/graph.ts";
 import { renderProofPackage, type RenderProofPackageInput } from "./proof/package.ts";
-import { createBranch } from "./run/branches.ts";
-import { createCheckpoint, latestCheckpoint } from "./run/checkpoints.ts";
+import { createBranch, loadBranch } from "./run/branches.ts";
+import { createCheckpoint, latestCheckpoint, loadCheckpoint } from "./run/checkpoints.ts";
 import { assessRecovery, type RecoveryAssessment } from "./run/recovery.ts";
 import { decidePath } from "./scope/scope.ts";
 import { withLock, writeFileAtomic } from "./storage/atomic.ts";
 import type { KeystonePaths } from "./storage/paths.ts";
+import { editFact, rebuildFacts, updateFacts, type ProjectFactEdit, type ProjectFactUpdate,
+  type ProjectJournalInput } from "./project/journal.ts";
+import { ExperienceFirewall } from "./experience/firewall.ts";
+import { rebuildExperience } from "./experience/projection.ts";
 
 export class KernelError extends Error {
   readonly code: string;
@@ -118,6 +123,12 @@ export interface OpenTaskOptions {
   /** Open a specific run branch. Defaults to the task's primary branch. */
   readonly branchId?: BranchId;
   readonly actorId?: string;
+  /**
+   * Re-wire the scenario proposer only when an existing draft is explicitly
+   * continued. The policy object is not persisted and cannot rewrite the
+   * original request, references or any folded state.
+   */
+  readonly proposeContract?: ContractProposer;
   /**
    * Re-wire the action resolver when a reopened session continues to authorise
    * new work. Pure read/replay/proof paths never need it; it is optional so
@@ -167,6 +178,13 @@ export class KernelSession {
   private readonly resolveAction?: ActionCapabilityResolver;
   private eventLog: RunEvent[];
   private folded: TaskState;
+
+  static updateProjectFacts(input: ProjectFactUpdate): Promise<void> { return updateFacts(input); }
+  static editProjectFact(input: ProjectFactEdit): Promise<ProjectFact> { return editFact(input); }
+  static rebuildProjectFacts(input: ProjectJournalInput): Promise<void> { return rebuildFacts(input); }
+  static rebuildProjectExperience(input: ProjectJournalInput): Promise<void> {
+    return rebuildExperience(input.paths, input.projectId);
+  }
 
   private constructor(init: SessionInit) {
     this.paths = init.paths;
@@ -230,6 +248,7 @@ export class KernelSession {
         ledgerFile: mainLedger,
         actorId: options.actorId ?? "cli",
         events: main.events,
+        ...(options.proposeContract === undefined ? {} : { proposeContract: options.proposeContract }),
         ...(options.resolveAction === undefined ? {} : { resolveAction: options.resolveAction }),
       });
     }
@@ -253,6 +272,7 @@ export class KernelSession {
       ledgerFile: branchLedger,
       actorId: options.actorId ?? "cli",
       events: read.events,
+      ...(options.proposeContract === undefined ? {} : { proposeContract: options.proposeContract }),
       ...(options.resolveAction === undefined ? {} : { resolveAction: options.resolveAction }),
     });
   }
@@ -390,6 +410,7 @@ export class KernelSession {
         "this task has no checkpoint, so there is nothing to resume from",
       );
     }
+    await this.revokeExecutionLeases("execution recovery requires fresh leases");
     await this.append("task.resume_requested", { checkpointId: checkpoint.checkpointId, byUser: true });
     await this.transition("task.resume_requested", "resuming");
     return checkpoint;
@@ -471,21 +492,89 @@ export class KernelSession {
   /**
    * Record experience lifecycle events.
    *
-   * The firewall's own store is the authority for project-scoped experience, but
-   * promotion must still be traceable to a kernel event (PRD 7.2, 9.2): a
-   * long-term change to what future tasks are told has to be explainable, not
-   * just persisted.
+   * Commit first. The firewall is a rebuildable project projection, never the
+   * authority for a promotion.
    */
   async recordExperienceCandidate(
     candidate: import("@keystone/schemas").ExperienceCandidate,
   ): Promise<void> {
-    await this.append("experience.candidate_created", asPayload(candidate));
+    await this.withExperienceEventLock(async () => {
+      if (candidate.projectId !== this.projectId || candidate.status !== "quarantined") {
+        throw new KernelError("foreign_candidate", "new project candidates must start quarantined");
+      }
+      await rebuildExperience(this.paths, this.projectId);
+      const firewall = new ExperienceFirewall(this.paths, this.projectId); await firewall.load();
+      const previous = firewall.candidates().find((value) => value.candidateId === candidate.candidateId);
+      if (previous !== undefined) {
+        if (contentHash(previous) === contentHash(candidate)) return;
+        throw new KernelError("candidate_collision", "candidate identity cannot replace an existing or terminal revision");
+      }
+      await this.append("experience.candidate_created", asPayload(candidate));
+    });
+  }
+
+  async rejectExperienceCandidate(input: {
+    readonly candidateId: string; readonly reason: string; readonly decisionId: string;
+  }): Promise<void> {
+    await this.withExperienceEventLock(async () => {
+      const boundHash = contentHash({ candidateId: input.candidateId, reason: input.reason });
+      if (!this.eventLog.some((event) => event.type === "intervention.decided" &&
+          event.payload["decisionId"] === input.decisionId && event.payload["decision"] === "allow" &&
+          event.payload["recordedBy"] === "user" &&
+          canonicalJson((event.payload["appliesTo"] as UserDecision["appliesTo"])?.resources) === canonicalJson([input.candidateId]) &&
+          (event.payload["modifications"] as Record<string, unknown> | undefined)?.["parametersHash"] === boundHash)) {
+        throw new KernelError("candidate_decision_required", "candidate rejection requires an exact recorded local user decision");
+      }
+      await rebuildExperience(this.paths, this.projectId);
+      const firewall = new ExperienceFirewall(this.paths, this.projectId); await firewall.load();
+      const candidate = firewall.candidates().find((value) => value.candidateId === input.candidateId);
+      if (candidate?.status !== "quarantined") throw new KernelError("candidate_not_quarantined", "only quarantined candidates may be rejected");
+      await this.append("experience.candidate_created", asPayload({ ...candidate, status: "rejected", note: input.reason }));
+    });
+  }
+
+  private withExperienceEventLock<T>(operation: () => Promise<T>): Promise<T> {
+    return withLock(join(this.paths.projectDir(this.projectId), "experience-events.lock"), { timeoutMs: 10000 }, operation);
   }
 
   async recordExperiencePromotion(
     entry: import("@keystone/schemas").ExperienceEntry,
   ): Promise<void> {
+    await this.withExperienceEventLock(async () => {
+    const candidateEvent = [...this.eventLog].reverse().find((event) =>
+      event.type === "experience.candidate_created" && event.payload["candidateId"] === entry.candidateId);
+    if (!candidateEvent || entry.projectId !== this.projectId) {
+      throw new KernelError("invalid_promotion", "promotion requires a kernel-recorded project candidate");
+    }
+    await rebuildExperience(this.paths, this.projectId);
+    const firewall = new ExperienceFirewall(this.paths, this.projectId);
+    await firewall.load();
+    const candidate = firewall.candidates().find((value) => value.candidateId === entry.candidateId);
+    if (candidate?.status !== "quarantined") throw new KernelError("invalid_promotion", "candidate is no longer quarantined");
+    if (contentHash([entry.statement, entry.category, entry.applicability, entry.provenance,
+      entry.supportingTaskIds, entry.supportingEvidenceIds]) !== contentHash([candidate.statement,
+      candidate.category, candidate.applicability, candidate.provenance, candidate.sourceTaskIds, candidate.supportingEvidenceIds])) {
+      throw new KernelError("invalid_promotion", "promotion content must match the admitted candidate");
+    }
+    const verdict = firewall.evaluatePromotion(candidateEvent.payload as unknown as import("@keystone/schemas").ExperienceCandidate);
+    if (!verdict.eligible || verdict.basis !== entry.promotedBy) {
+      throw new KernelError("invalid_promotion", verdict.reason);
+    }
+    if (entry.promotedBy === "user_confirmation" && !this.eventLog.some((event) =>
+      event.type === "intervention.decided" &&
+      entry.provenance.locator === `user-decision:${String(event.payload["decisionId"])}` &&
+      event.payload["decision"] === "allow" &&
+      (event.payload["appliesTo"] as { resources?: string[] })?.resources?.includes(String(entry.candidateId)))) {
+      throw new KernelError("invalid_promotion", "user confirmation requires a recorded candidate-bound decision");
+    }
+    const evidence = await this.evidence();
+    if (entry.promotedBy !== "user_confirmation" &&
+        entry.supportingEvidenceIds.some((id) => !evidence.some((item) =>
+          item.evidenceId === id && item.status === "valid"))) {
+      throw new KernelError("invalid_promotion", "supporting evidence must exist and remain valid");
+    }
     await this.append("experience.promoted", asPayload(entry));
+    });
   }
 
   async recordExperienceDemotion(input: {
@@ -791,13 +880,25 @@ export class KernelSession {
       branchId: this.branchIdValue,
       contractId: contract.contractId,
       contractVersion: input.contractVersion ?? contract.version,
-    });
-    await this.append("evidence.recorded", asPayload(record));
+    }, async (value) => { await this.append("evidence.recorded", asPayload(value)); });
     return record;
   }
 
   async evidence(): Promise<readonly import("@keystone/schemas").EvidenceRecord[]> {
-    return listEvidence(this.paths, this.taskIdValue);
+    const records = new Map<string, EvidenceRecord>();
+    for (const event of this.eventLog) {
+      if (event.type === "evidence.recorded") {
+        const record = event.payload as unknown as EvidenceRecord;
+        if (record.branchId === this.branchIdValue) records.set(record.evidenceId, record);
+      } else if (event.type === "evidence.invalidated") {
+        for (const id of event.payload["evidenceIds"] as string[]) {
+          const record = records.get(id);
+          if (record) records.set(id, { ...record, status: "invalid",
+            invalidatedAt: event.at, invalidatedBy: [...record.invalidatedBy, String(event.payload["reason"])] });
+        }
+      }
+    }
+    return [...records.values()];
   }
 
   /**
@@ -823,9 +924,6 @@ export class KernelSession {
     // The downgrade must be durable before it is reported: a proof computed after
     // this call has to see the invalidated records, otherwise a stale pass would
     // still count (PRD VF-06).
-    for (const record of invalidated) {
-      await updateEvidence(this.paths, this.taskIdValue, record);
-    }
     await this.append("evidence.invalidated", {
       evidenceIds: invalidated.map((record) => record.evidenceId),
       reason: "the workspace changed since this evidence was produced",
@@ -833,6 +931,7 @@ export class KernelSession {
       affectedProofHashes:
         this.folded.proofGraphHash === undefined ? [] : [this.folded.proofGraphHash],
     });
+    for (const record of invalidated) await updateEvidence(this.paths, this.taskIdValue, record);
     return invalidated.map((record) => record.evidenceId);
   }
 
@@ -1014,15 +1113,37 @@ export class KernelSession {
   }
 
   /** Fork a new run branch. The source branch is never overwritten. */
-  async branch(label: string, reason: string): Promise<RunBranch> {
-    const contract = this.contract();
+  async recordBranchWorkspace(workspacePath: string): Promise<void> {
+    const branch = await loadBranch(this.paths, this.taskIdValue, this.branchIdValue);
+    if (!branch) throw new KernelError("branch_not_found", "primary task is not a derived branch");
+    const updated = { ...branch, workspacePath };
+    await this.append("branch.created", asPayload(updated));
+    const { join } = await import("node:path");
+    await writeFileAtomic(join(this.paths.taskDir(this.taskIdValue), "branches", `${this.branchIdValue}.json`), canonicalJson(updated));
+  }
+
+  async branch(label: string, reason: string,
+    options: { readonly checkpointId?: string; readonly workspacePath?: string } = {}): Promise<RunBranch> {
+    const checkpoint = options.checkpointId === undefined ? await this.latestCheckpoint() :
+      await loadCheckpoint(this.paths, this.taskIdValue, options.checkpointId);
+    if (options.checkpointId !== undefined && (!checkpoint || checkpoint.branchId !== this.branchIdValue)) {
+      throw new KernelError("checkpoint_not_found", "selected checkpoint does not belong to this branch");
+    }
+    const prefix = options.checkpointId === undefined ? this.eventLog :
+      this.eventLog.slice(0, checkpoint!.seq + 1);
+    if (options.checkpointId !== undefined && prefix.at(-1)?.payload["checkpointId"] !== options.checkpointId) {
+      throw new KernelError("checkpoint_not_committed", "selected checkpoint is not committed to the ledger");
+    }
+    const contractEvent = [...prefix].reverse().find((event) =>
+      event.type === "contract.compiled" || event.type === "contract.revised");
+    const contract = contractEvent?.type === "contract.revised" ?
+      contractEvent.payload["contract"] as OutcomeContract | undefined : contractEvent?.payload as OutcomeContract | undefined;
     if (contract === undefined) {
       throw new KernelError(
         "no_contract",
         "a run branch must reference a contract; compile one before forking",
       );
     }
-    const checkpoint = await this.latestCheckpoint();
     const branch = await createBranch(this.paths, {
       taskId: this.taskIdValue,
       label,
@@ -1031,17 +1152,24 @@ export class KernelSession {
       contractVersion: contract.version,
       forkedFromBranchId: this.branchIdValue,
       ...(checkpoint === undefined ? {} : { parentCheckpointId: checkpoint.checkpointId }),
+      ...(options.workspacePath === undefined ? {} : { workspacePath: options.workspacePath }),
     });
 
     // The fork carries the parent's history so the branch is independently
     // verifiable and replayable. Without this the branch ledger would start at
     // seq 1 while linking to a parent hash, and every read would fail integrity
     // verification (ADR-0003).
-    const seeded = this.eventLog.map((event) => canonicalJson(event)).join("\n");
+    const seeded = prefix.map((event) => canonicalJson(event)).join("\n");
     await writeFileAtomic(
       this.paths.branchLedgerFile(this.taskIdValue, branch.branchId),
       seeded === "" ? "" : `${seeded}\n`,
     );
+    if (options.checkpointId !== undefined) {
+      const fork = await KernelSession.open({ paths: this.paths, taskId: this.taskIdValue, branchId: branch.branchId,
+        actorId: this.actorId, resolveAction: this.resolveAction });
+      await fork.append("branch.created", asPayload(branch));
+      await fork.revokeExecutionLeases("branch requires fresh execution leases");
+    }
     return branch;
   }
 
@@ -1240,8 +1368,10 @@ function collectInterventions(
   for (const event of events) {
     if (event.type !== "intervention.decided") continue;
     const payload = event.payload;
-    const interventionId =
-      typeof payload["interventionId"] === "string" ? payload["interventionId"] : "";
+    // Standalone user consent is audited in the ledger, but is not an answer
+    // to an intervention and cannot acquire an invented intervention identity.
+    if (typeof payload["interventionId"] !== "string") continue;
+    const interventionId = payload["interventionId"];
     decided.push({
       interventionId,
       trigger: triggers.get(interventionId) ?? "unknown",

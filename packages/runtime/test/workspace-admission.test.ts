@@ -183,6 +183,7 @@ test("an isolated run is not blocked by a standard run holding the workspace loc
     const isoResult = await isolated.runTask({
       workspacePath: fixture.root,
       request: "Work on a copy instead.",
+      references: [{ kind: "directory", value: "src" }],
       autonomy: autonomyFor(["src/**"]),
       acceptContractAutomatically: true,
       maxSteps: 3,

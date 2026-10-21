@@ -4,13 +4,20 @@ import { createDraftStore } from "../state/drafts.js";
 import { createFileClient } from "../state/files.js";
 import { el, node, button, field, tr, note, icon, notify, translateStatic, localGet, localSet } from "../components/dom.js";
 import { createDialogs } from "../components/dialog.js";
+import { createSettingsModal } from "../components/settings-modal.js";
 import { renderDiff } from "../components/diff.js";
-import { renderOverview, renderTrace, renderInspector, proofIsCurrent } from "../views/task.js";
+import { renderOverview, renderTrace, renderInspector, renderProofView, proofIsCurrent } from "../views/task.js";
 import { createCommandsView } from "../views/commands.js";
 import { createFilesView } from "../views/files.js";
 import { createSettingsView } from "../views/settings.js";
 import { createComposer } from "../views/composer.js";
 import { fileReference, routedModels } from "../state/composer.js";
+import { groupProjectTasks, taskTitle } from "../state/navigation.js";
+import { createCognitionView } from "../views/cognition.js";
+import { createExtensionsView } from "../views/extensions.js";
+import { createLabView } from "../views/lab.js";
+import { createRecoveryView } from "../views/recovery.js";
+import { createCollaborationView, createReadinessView } from "../views/collaboration.js";
 
 const token = new URLSearchParams(location.hash.slice(1)).get("t") ?? "";
 const request = createApi({ token });
@@ -33,6 +40,7 @@ let disposed = false;
 let ready = false;
 let previousNotification = "";
 const tracePreferences = { all: false, search: "" };
+const serviceViews = new Set(["cognition", "extensions", "lab", "collaboration", "readiness"]);
 const files = createFileClient({ request, onMutation(projectId) {
   if (client.state.projectId === projectId && client.state.taskId) void client.reconnect();
 } });
@@ -52,6 +60,9 @@ for (const [id, name] of [["sidebar-toggle", "navigation"], ["settings-button", 
   el(id).replaceChildren(icon(name)); el(id).setAttribute("aria-label", tr(el(id).dataset.i18nTitle));
 }
 el("command-button").firstChild.textContent = `${tr("Search")} `;
+el("command-button").prepend(icon("search"));
+for (const item of document.querySelectorAll("[data-page]")) item.prepend(icon(item.dataset.page));
+el("sidebar-settings").prepend(icon("settings"));
 
 function setPanel(kind, open) {
   const narrow = kind === "sidebar" ? matchMedia("(max-width: 999px)").matches : matchMedia("(max-width: 1279px)").matches;
@@ -59,6 +70,7 @@ function setPanel(kind, open) {
   app.classList.toggle(`${kind}-collapsed`, !open);
   el(`${kind}-toggle`).setAttribute("aria-expanded", String(open));
   el(kind).inert = !open;
+  el("drawer-backdrop").hidden = !app.classList.contains("sidebar-open") && !app.classList.contains("inspector-open");
   if (narrow) {
     el(kind).setAttribute("aria-label", tr(kind === "sidebar" ? "Navigation drawer; Escape closes" : "Proof drawer; Escape closes"));
     if (open) el(kind).querySelector("button")?.focus();
@@ -71,7 +83,8 @@ function closeDrawers() {
 function restorePanels() {
   for (const kind of ["sidebar", "inspector"]) {
     const narrow = matchMedia(kind === "sidebar" ? "(max-width: 999px)" : "(max-width: 1279px)").matches;
-    setPanel(kind, !narrow && localGet(`keystone.panel.${client.state.projectId}.${kind}`) !== "0");
+    const stored = localGet(`keystone.panel.${client.state.projectId}.${kind}`);
+    setPanel(kind, !narrow && (kind === "sidebar" ? stored !== "0" : stored === "1"));
     const width = Number(localGet(`keystone.width.${client.state.projectId}.${kind}`));
     if (width) applyWidth(kind, width);
   }
@@ -102,43 +115,55 @@ for (const kind of ["sidebar", "inspector"]) {
 }
 window.addEventListener("resize", restorePanels);
 
-const titleOf = (task) => task.title || task.request || task.headline || task.taskId;
+const titleOf = taskTitle;
+let navigationSignature = "";
 function renderNavigation() {
   const state = client.state;
+  for (const item of document.querySelectorAll("[data-page]")) {
+    if (item.dataset.page === view) item.setAttribute("aria-current", "page"); else item.removeAttribute("aria-current");
+  }
+  const signature = JSON.stringify([state.projects, state.tasks, state.projectId, state.taskId, el("task-filter").value, globalThis.KEYSTONE_LANG]);
+  if (signature === navigationSignature) return;
+  navigationSignature = signature;
+  const focused = document.activeElement;
+  const focusTask = el("project-list").contains(focused) ? focused?.dataset.taskId : null;
+  const focusProject = el("project-list").contains(focused) ? focused?.dataset.projectId : null;
   const projects = state.projects.filter((project) => !project.archived || project.projectId === state.projectId)
     .slice().sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned));
   el("project-select").replaceChildren(node("option", { value: "", text: tr("Select project") }), ...projects.map((project) => node("option", { value: project.projectId, text: project.name || project.rootPath, selected: project.projectId === state.projectId })));
   el("project-list").replaceChildren();
-  for (const project of projects) {
-    const item = button(project.name || project.rootPath, () => selectProject(project.projectId), `nav-item ${state.projectId === project.projectId ? "active" : ""}`);
-    item.append(node("small", { text: `${project.pinned ? `${tr("Pinned")} · ` : ""}${project.branch ?? project.currentBranch ?? ""}${project.status ? ` · ${tr(project.status)}` : ""}` }));
-    el("project-list").append(item);
+  for (const group of groupProjectTasks(projects, state.tasks, el("task-filter").value)) {
+    const project = group.project;
+    const heading = button(project.name || project.rootPath, () => selectProject(project.projectId), `project-heading ${state.projectId === project.projectId ? "selected" : ""}`);
+    heading.prepend(icon("folder"));
+    heading.dataset.projectId = project.projectId;
+    heading.title = `${project.rootPath} · ${project.branch ?? project.currentBranch ?? tr("Branch unknown")}`;
+    if (project.pinned) heading.append(node("small", { text: tr("Pinned") }));
+    const section = node("div", { class: "project-group" }, [heading]);
+    for (const task of group.tasks) {
+      const item = button(titleOf(task), () => selectTask(task.taskId), `nav-item task-item ${task.taskId === state.taskId ? "active" : ""}`);
+      item.dataset.taskId = task.taskId;
+      if (task.taskId === state.taskId) item.setAttribute("aria-current", "page");
+      item.prepend(node("span", { class: `task-dot ${task.status}`, "aria-hidden": "true" }));
+      item.title = `${titleOf(task)} · ${tr(task.status)}`;
+      item.append(node("span", { class: "sr-only", text: tr(task.status) }));
+      section.append(item);
+    }
+    el("project-list").append(section);
   }
   if (!projects.length) el("project-list").append(note("No projects yet."));
   const tasks = state.tasks.filter((task) => task.projectId === state.projectId);
   el("task-select").replaceChildren(node("option", { value: "", text: tr("New task") }), ...tasks.map((task) => node("option", { value: task.taskId, text: titleOf(task), selected: task.taskId === state.taskId })));
-  const search = el("task-filter").value.toLocaleLowerCase();
-  el("task-list").replaceChildren();
-  const groups = [["Needs you", ["needs_attention", "awaiting_approval", "failed", "unrecoverable"]], ["Running", ["executing", "verifying", "auto_repairing", "resuming"]], ["Waiting", ["draft", "defining", "ready", "paused"]], ["Proven", ["proven"]], ["Exited", ["stopped", "exited_gracefully"]]];
-  for (const [label, statuses] of groups) {
-    const grouped = tasks.filter((task) => statuses.includes(task.status) && titleOf(task).toLocaleLowerCase().includes(search));
-    if (!grouped.length) continue;
-    el("task-list").append(node("div", { class: "nav-group", text: tr(label) }));
-    for (const task of grouped) {
-      const item = button(titleOf(task), () => selectTask(task.taskId), `nav-item ${task.taskId === state.taskId ? "active" : ""}`);
-      item.append(node("small", { text: tr(task.status) })); el("task-list").append(item);
-    }
-  }
-  if (!tasks.length) el("task-list").append(note("No tasks yet. Start one below."));
+  if (!state.tasks.length && projects.length) el("project-list").append(node("p", { class: "nav-empty", text: tr("No tasks yet. Start a new task.") }));
   el("project-manage").disabled = !state.projectId;
+  if (focusTask || focusProject) {
+    const replacement = [...el("project-list").querySelectorAll("button")].find((item) => focusTask ? item.dataset.taskId === focusTask : item.dataset.projectId === focusProject);
+    (replacement ?? el("new-task")).focus();
+  }
 }
 
 async function leaveSettings() {
-  if (view === "settings" && mounted?.dirty) {
-    if (!(await dialogs.confirm("Discard settings draft", note("Leaving settings discards unsaved configuration changes."), "Discard draft", true))) return false;
-    if (settings) presentation(settings.presentation);
-  }
-  return true;
+  return settingsModal.close();
 }
 async function selectProject(projectId) {
   if (!(await leaveSettings())) { renderNavigation(); return; }
@@ -155,12 +180,14 @@ async function selectTask(taskId) {
   const summary = client.state.tasks.find((entry) => entry.taskId === taskId);
   if (summary?.projectId && summary.projectId !== client.state.projectId) {
     client.selectProject(summary.projectId); files.setProject(summary.projectId);
+    localSet("keystone.project", summary.projectId); restorePanels();
   }
   view = "overview"; mountedView = ""; closeDrawers();
   await client.selectTask(taskId || null);
   render();
 }
 async function showView(next) {
+  if (next === "settings") { settingsModal.open(); closeDrawers(); return; }
   if (next === view) return;
   if (next !== view && !(await leaveSettings())) return;
   view = next; mountedView = ""; render();
@@ -175,28 +202,22 @@ function renderView() {
     else if (view === "commands") mounted = createCommandsView(host, {
       state: client.state, request, dialogs, refresh: async () => { await client.refreshLists(); await client.reconnect(); },
     });
-    else if (view === "settings") mounted = createSettingsView(host, {
-      request, dialogs, state: client.state, capabilities, shell, onPresentation: presentation,
-      async onSaved(saved) {
-        settings = saved;
-        if (saved.config.language && saved.config.language !== globalThis.KEYSTONE_LANG) {
-          const value = await request(`/v1/settings/catalog?${new URLSearchParams({ language: saved.config.language })}`);
-          globalThis.KEYSTONE_LANG = value.language; globalThis.KEYSTONE_I18N = value.catalog;
-          translateStatic(); document.documentElement.lang = value.language;
-          for (const id of ["sidebar-toggle", "settings-button", "inspector-toggle"]) el(id).setAttribute("aria-label", tr(el(id).dataset.i18nTitle));
-          el("command-button").firstChild.textContent = `${tr("Search")} `;
-          document.title = tr("Keystone task workbench");
-          mountedView = "";
-          composer.dispose(); composer = mountComposer();
-        }
-        capabilities = await request("/v1/capabilities");
-        composer.refresh(); render();
+    else if (view === "cognition") mounted = createCognitionView(host, { request, dialogs, projectId: client.state.projectId });
+    else if (view === "extensions") mounted = createExtensionsView(host, { request, dialogs });
+    else if (view === "lab") mounted = createLabView(host, { request, dialogs });
+    else if (view === "collaboration") mounted = createCollaborationView(host, {
+      request,
+      dialogs,
+      afterAdopt: async (result, context) => {
+        drafts.set(context.projectId, result.taskId, { request: context.request });
+        await client.refreshLists();
+        await selectTask(result.taskId);
       },
-      async openNativeConfiguration() {
-        if (!(await leaveSettings())) return;
-        mounted?.dispose?.(); mounted = null; mountedView = "";
-        await onboarding(); render();
-      },
+    });
+    else if (view === "readiness") mounted = createReadinessView(host, { request });
+    else if (view === "recovery") mounted = createRecoveryView(host, {
+      request, dialogs, taskId: client.state.taskId, checkpoints: client.state.checkpoints,
+      refresh: async (taskId) => { await client.refreshLists(); if (taskId === client.state.taskId) await client.reconnect(); },
     });
     else if (view === "diff") {
       const taskId = client.state.taskId; const selectedVersion = viewVersion;
@@ -209,7 +230,9 @@ function renderView() {
   }
   if (view === "overview") renderOverview(host, client.state);
   if (view === "trace") renderTrace(host, client.state, tracePreferences);
+  if (view === "proof") renderProofView(host, client.state, { exportProof: () => el("export-proof").click() });
   if (view === "commands") mounted?.update();
+  if (view === "recovery") mounted?.update(client.state.checkpoints);
   for (const item of el("workspace-tabs").querySelectorAll("button")) {
     if (item.dataset.view === view) item.setAttribute("aria-current", "page"); else item.removeAttribute("aria-current");
   }
@@ -220,7 +243,8 @@ function render() {
   renderNavigation();
   const project = state.projects.find((entry) => entry.projectId === state.projectId);
   const task = state.tasks.find((entry) => entry.taskId === state.taskId);
-  el("task-title").textContent = view === "settings" ? tr("Settings") : task ? titleOf(task) : project?.name ?? tr("Local workbench");
+  const pages = { cognition: "Project cognition", extensions: "Extensions", lab: "Harness Lab", collaboration: "Collaboration", readiness: "Release readiness" };
+  el("task-title").textContent = pages[view] ? tr(pages[view]) : task ? titleOf(task) : project?.name ?? tr("Local workbench");
   el("workspace-branch").textContent = project ? `${project.name} · ${project.branch ?? project.currentBranch ?? tr("Branch unknown")}` : tr("Local-first engineering");
   el("task-status").textContent = tr(state.detail?.status ?? (state.loading ? "Loading task" : "idle"));
   el("pause").disabled = state.run?.status !== "running";
@@ -235,6 +259,18 @@ function render() {
   el("budget-status").textContent = usage ? `${usage.tokens ?? 0} tokens · ${usage.retries ?? 0} ${tr("retries")} · ${Math.round((usage.wallClockMs ?? 0) / 1000)}s` : "";
   const pending = state.run?.pendingInterventions?.length ?? 0;
   el("pending-button").textContent = tr("{n} pending", { n: pending });
+  el("pending-button").hidden = pending === 0;
+  app.dataset.connection = state.connection;
+  const welcome = view === "overview" && !state.taskId;
+  app.classList.toggle("welcome", welcome); app.classList.toggle("service-view", serviceViews.has(view));
+  el("welcome").hidden = !welcome;
+  el("view-host").hidden = welcome;
+  el("workspace-tabs").hidden = welcome || serviceViews.has(view);
+  el("workspace-footer").hidden = welcome || serviceViews.has(view);
+  for (const id of ["pause", "stop", "task-status"]) el(id).hidden = !state.taskId || serviceViews.has(view);
+  el("refresh").hidden = serviceViews.has(view);
+  const composerParent = el(welcome ? "welcome-composer" : "task-composer");
+  if (el("composer-host").parentElement !== composerParent) composerParent.append(el("composer-host"));
   renderInspector(state, { request, dialogs, drafts, refresh: async (taskId) => { if (taskId === client.state.taskId) await client.reconnect(); } });
   renderView();
   const signature = `${state.taskId}:${state.detail?.status}:${pending}`;
@@ -308,7 +344,14 @@ function commandPalette(filesOnly = false) {
     const current = ++generation; pending?.abort(); results.replaceChildren();
     const query = search.value.toLocaleLowerCase();
     if (!filesOnly) {
-      for (const [label, action] of [["New task", () => composer.newTask()], ["Add project", addProject], ["Settings", () => showView("settings")], ["Files", () => showView("files")], ["Needs your decision", () => setPanel("inspector", true)]]) {
+      for (const [label, action] of [
+        ["New task", () => selectTask(null).then(() => composer.newTask())], ["Add project", addProject],
+        ["Settings", () => showView("settings")], ["Files", () => showView("files")],
+        ["Extensions", () => showView("extensions")], ["Project cognition", () => showView("cognition")],
+        ["Harness Lab", () => showView("lab")], ["Collaboration", () => showView("collaboration")],
+        ["Release readiness", () => showView("readiness")], ["Recovery and branches", () => showView("recovery")],
+        ["Proof", () => showView("proof")], ["Needs your decision", () => setPanel("inspector", true)],
+      ]) {
         if (tr(label).toLocaleLowerCase().includes(query)) results.append(button(label, () => { dialogs.close(); return action(); }));
       }
       for (const project of client.state.projects) if ((project.name ?? project.rootPath).toLocaleLowerCase().includes(query)) results.append(button(`${tr("Project")}: ${project.name}`, () => { dialogs.close(); return selectProject(project.projectId); }));
@@ -391,6 +434,37 @@ async function onboarding() {
   overlay.oncancel = () => { el("ob-key").value = ""; };
 }
 
+const settingsModal = createSettingsModal({
+  dialog: el("settings-modal"), host: el("settings-host"), closeButton: el("settings-close"), dialogs,
+  onDiscard() { if (settings) presentation(settings.presentation); },
+  createView(host) {
+    return createSettingsView(host, {
+      request, dialogs, state: client.state, capabilities, shell, onPresentation: presentation,
+      async onSaved(saved) {
+        settings = saved;
+        if (saved.config.language && saved.config.language !== globalThis.KEYSTONE_LANG) {
+          try {
+            const value = await request(`/v1/settings/catalog?${new URLSearchParams({ language: saved.config.language })}`);
+            globalThis.KEYSTONE_LANG = value.language; globalThis.KEYSTONE_I18N = value.catalog;
+            translateStatic(); document.documentElement.lang = value.language;
+            for (const id of ["sidebar-toggle", "settings-button", "inspector-toggle"]) el(id).setAttribute("aria-label", tr(el(id).dataset.i18nTitle));
+            el("command-button").firstChild.textContent = `${tr("Search")} `;
+            document.title = tr("Keystone task workbench");
+            mountedView = "";
+            composer.dispose(); composer = mountComposer();
+          } catch (error) { notify(error.message, true); }
+        }
+        try { capabilities = await request("/v1/capabilities"); } catch (error) { notify(error.message, true); }
+        composer.refresh(); render();
+      },
+      async openNativeConfiguration() {
+        if (!(await leaveSettings())) return;
+        await onboarding(); render();
+      },
+    });
+  },
+});
+
 el("project-select").onchange = () => { void selectProject(el("project-select").value); };
 el("task-select").onchange = () => { void selectTask(el("task-select").value); };
 el("task-filter").oninput = renderNavigation;
@@ -400,9 +474,12 @@ el("new-task").onclick = () => { void selectTask(null).then(() => composer.newTa
 el("workspace-files").onclick = () => { void showView("files"); closeDrawers(); };
 for (const id of ["settings-button", "sidebar-settings"]) el(id).onclick = () => { void showView("settings"); closeDrawers(); };
 for (const item of el("workspace-tabs").querySelectorAll("button")) item.onclick = () => { void showView(item.dataset.view); };
+for (const item of document.querySelectorAll("[data-page]")) item.onclick = () => { void showView(item.dataset.page); closeDrawers(); };
+for (const kind of ["sidebar", "inspector"]) el(`${kind}-close`).onclick = () => { setPanel(kind, false); el(`${kind}-toggle`).focus(); };
+el("drawer-backdrop").onclick = () => { closeDrawers(); el("sidebar-toggle").focus(); };
 el("command-button").onclick = () => commandPalette();
 el("pending-button").onclick = () => { setPanel("inspector", true); el("decisions").scrollIntoView({ block: "nearest" }); };
-el("refresh").onclick = async () => { await client.refreshLists(); await client.reconnect(); };
+el("refresh").onclick = async () => { await mounted?.load?.(); await client.refreshLists(); await client.reconnect(); };
 for (const kind of ["pause", "stop"]) el(kind).onclick = async () => {
   const taskId = client.state.taskId;
   try {
@@ -416,8 +493,19 @@ el("export-proof").onclick = () => {
   node("a", { href: url, download: `${client.state.taskId}.proof.json` }).click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !el("modal").open && !el("onboarding").open) { closeDrawers(); el("command-button").focus(); }
-  if (el("onboarding").open || el("modal").open) return;
+  if (el("onboarding").open || el("modal").open || el("settings-modal").open) return;
+  if (event.key === "Escape") { closeDrawers(); el("sidebar-toggle").focus(); }
+  if (event.key === "Tab") {
+    const kind = app.classList.contains("inspector-open") ? "inspector" : app.classList.contains("sidebar-open") ? "sidebar" : null;
+    if (kind) {
+      const panel = el(kind);
+      const controls = [...panel.querySelectorAll("button, input, select, textarea, [tabindex]")].filter((item) => !item.disabled && !item.hidden && item.getAttribute("tabindex") !== "-1");
+      const first = controls[0]; const last = controls.at(-1);
+      if (first && (!panel.contains(document.activeElement) || (event.shiftKey ? document.activeElement === first : document.activeElement === last))) {
+        event.preventDefault(); (event.shiftKey ? last : first).focus();
+      }
+    }
+  }
   if (!(event.metaKey || event.ctrlKey)) return;
   if (event.key.toLocaleLowerCase() === "k") { event.preventDefault(); commandPalette(); }
   if (event.key === ",") { event.preventDefault(); void showView("settings"); }
@@ -468,6 +556,6 @@ document.addEventListener("visibilitychange", () => { client.setVisible(!documen
 window.addEventListener("online", () => { client.setVisible(!document.hidden); void tick(); });
 window.addEventListener("offline", () => client.setVisible(false));
 window.addEventListener("pagehide", () => {
-  disposed = true; clearInterval(timer); composer.dispose(); mounted?.dispose?.(); files.dispose(); client.dispose(); diffController?.abort();
+  disposed = true; clearInterval(timer); composer.dispose(); mounted?.dispose?.(); settingsModal.dispose(); files.dispose(); client.dispose(); diffController?.abort();
 });
 await main();

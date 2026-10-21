@@ -23,6 +23,8 @@ import {
   KernelSession,
   projectIdForWorkspace,
   ProjectFactStore,
+  getArtifactBytes,
+  putJsonArtifact,
   type ContractPatch,
   type ContractProposer,
   type EvaluationResult,
@@ -33,6 +35,7 @@ import {
   detectProjectProfile,
   resolveEngineeringAction,
   scanWorkspace,
+  scanProjectCognition,
 } from "@keystone/pack-engineering";
 import {
   buildActionPrompt,
@@ -45,9 +48,13 @@ import {
 } from "@keystone/models";
 import {
   derivedIdBody,
+  canonicalJson,
   contentHash,
   newId,
   nowIso,
+  runBindingSchema,
+  sha256Bytes,
+  userDecisionSchema,
   type ActionProposal,
   type AutonomyEnvelope,
   type Budget,
@@ -63,9 +70,11 @@ import {
   type WorkspaceSnapshot,
   type ConfigurationSnapshot,
   type InputAttachment,
+  type RunBinding,
 } from "@keystone/schemas";
 import { builtinTools, type Tool } from "@keystone/tools";
 import { builtinVerifiers, type Verifier } from "@keystone/verifiers";
+import { defaultRegistryLocation, ExtensionLifecycleService } from "@keystone/extensions";
 
 import {
   budgetStateFrom,
@@ -77,13 +86,18 @@ import {
   buildInterventionRequest,
   interventionForDenial,
 } from "./assurance/intervention.ts";
-import { planContext, type FileCandidate } from "./context/planner.ts";
+import { ContextBudgetError, planContext, type FileCandidate, type PlanContextInput } from "./context/planner.ts";
 import { createIsolatedWorkspace } from "./isolation.ts";
 import { factsToInvalidate, judgeExperienceUse, learnFromRun } from "./learning.ts";
 import { evaluateDegradation, modeCapabilities, type RunMode } from "./modes.ts";
 import { runVerification, type VerificationOutcome } from "./verification.ts";
 import { WorkspaceWriteAdmission } from "./workspace-lock.ts";
 import { changedObservedPaths, observeWorkspace } from "./workspace-observation.ts";
+import { refreshCognition } from "./cognition.ts";
+import { assembleTaskExtensions, type TaskExtensionIntegration } from "./extension-integration.ts";
+import { captureRecoveryWorkspace } from "./continuous-branches.ts";
+import { AttachmentStore } from "./attachments.ts";
+import { buildExtensionContext } from "./extension-context.ts";
 
 export interface RuntimeOptions {
   readonly paths: KeystonePaths;
@@ -91,6 +105,8 @@ export interface RuntimeOptions {
   readonly routes?: Partial<Record<ModelRole, readonly string[]>>;
   readonly tools?: readonly Tool<never>[];
   readonly verifiers?: readonly Verifier[];
+  /** Shared lifecycle signals revoke in-flight calls when the workbench disables an extension. */
+  readonly extensions?: ExtensionLifecycleService;
   /**
    * Scenario pack that drafts the Outcome Contract. Defaults to the engineering
    * `compileContract`; a non-engineering vertical (e.g. localization) injects its
@@ -170,6 +186,11 @@ export interface RunTaskOptions {
   readonly control?: () => Promise<RunControlRequest | undefined>;
 }
 
+export type RunDraftTaskOptions = Omit<
+  RunTaskOptions,
+  "request" | "references" | "attachments" | "attachmentParts"
+>;
+
 /**
  * What the user asked a running task to do.
  *
@@ -219,6 +240,7 @@ export class KeystoneRuntime {
   private router = new ModelRouter();
   private readonly tools: readonly Tool<never>[];
   private readonly verifiers: readonly Verifier[];
+  private readonly extensionService: ExtensionLifecycleService;
   private readonly contractProposer: ContractProposer;
   private readonly mode: RunMode;
   private readonly actorId: string;
@@ -229,6 +251,7 @@ export class KeystoneRuntime {
     this.paths = options.paths;
     this.tools = options.tools ?? builtinTools();
     this.verifiers = options.verifiers ?? builtinVerifiers();
+    this.extensionService = options.extensions ?? new ExtensionLifecycleService(defaultRegistryLocation(options.paths.home));
     // Engineering remains the default vertical; a non-engineering pack injects its own.
     this.contractProposer = options.contractProposer ?? compileContract;
     this.mode = options.mode ?? "standard";
@@ -279,9 +302,13 @@ export class KeystoneRuntime {
     );
 
     const facts = new ProjectFactStore(this.paths, projectId as never);
+    await KernelSession.rebuildProjectFacts({ paths: this.paths, projectId });
     await facts.load();
-    await seedFacts(facts, projectId, profile, snapshot);
+    await seedFacts(this.paths, projectId, profile, snapshot);
+    await refreshCognition(this.paths, workspacePath, profile, snapshot);
+    await facts.load();
 
+    await KernelSession.rebuildProjectExperience({ paths: this.paths, projectId });
     const firewall = new ExperienceFirewall(this.paths, projectId);
     await firewall.load();
 
@@ -307,6 +334,102 @@ export class KeystoneRuntime {
     }
   }
 
+  async runDraftTask(taskId: string, options: RunDraftTaskOptions): Promise<RunTaskResult> {
+    const session = await KernelSession.open({
+      paths: this.paths,
+      taskId: taskId as TaskId,
+      actorId: this.actorId,
+      proposeContract: this.contractProposer,
+      resolveAction: resolveEngineeringAction,
+    });
+    if (session.state().status !== "draft") {
+      throw new Error(`task cannot start from ${session.state().status}`);
+    }
+    const created = session.events().find((event) => event.type === "task.created");
+    const request = created?.payload["request"];
+    if (typeof request !== "string" || request.length === 0) throw new Error("draft task request is unavailable");
+    const references = (created?.payload["references"] ?? []) as readonly TaskReference[];
+    const attachments = (created?.payload["attachments"] ?? []) as readonly InputAttachment[];
+    const projectId = await projectIdForWorkspace(options.workspacePath);
+    if (projectId !== session.projectId) throw new Error("draft task belongs to another workspace");
+    const router = this.router.snapshot();
+    const releaseWrite = this.acquireWorkspaceWrite(projectId);
+    try {
+      return await this.executeTask({
+        ...options,
+        workspacePath: options.workspacePath,
+        request,
+        references,
+        attachments,
+        attachmentParts: await new AttachmentStore(this.paths).parts(attachments),
+      }, projectId, router, { kind: "draft", session });
+    } finally {
+      releaseWrite();
+    }
+  }
+
+  async resumeTask(taskId: string, options: Pick<RunTaskOptions,
+    "signal" | "control" | "onIntervention" | "onTaskCreated" | "configurationSnapshot" | "attachmentParts"> = {},
+    branchId?: string): Promise<RunTaskResult> {
+    const session = await KernelSession.open({ paths: this.paths, taskId: taskId as never, branchId: branchId as never,
+      actorId: this.actorId, resolveAction: resolveEngineeringAction });
+    if (!["paused", "executing", "verifying", "auto_repairing", "resuming"].includes(session.state().status)) {
+      throw new Error(`task cannot resume from ${session.state().status}`);
+    }
+    const checkpoint = await session.latestCheckpoint();
+    if (!checkpoint) throw new Error("resume requires a complete checkpoint");
+    let binding: RunBinding | undefined;
+    for (const ref of checkpoint.artifactRefs) {
+      const bytes = await getArtifactBytes(this.paths, ref);
+      if (!bytes || `art_${sha256Bytes(bytes)}` !== ref) throw new Error("resume artifact missing or corrupt");
+      try {
+        const value = JSON.parse(new TextDecoder().decode(bytes));
+        if (value.schemaVersion === "keystone.runtime.runBinding@1.0.0") binding = runBindingSchema.parse(value);
+      } catch (error) {
+        if (error instanceof SyntaxError) continue;
+        throw error;
+      }
+    }
+    if (!binding) throw new Error("legacy task has no verifiable run binding; replay/export remain available");
+    const originalInputs = (session.events().find((event) => event.type === "task.created")?.payload["attachments"] ?? []) as InputAttachment[];
+    const attachmentParts = await new AttachmentStore(this.paths).parts(originalInputs);
+    if (options.attachmentParts !== undefined && contentHash(options.attachmentParts) !== contentHash(attachmentParts)) {
+      throw new Error("resume inputs differ from the recorded task; revise explicitly");
+    }
+    if (binding.mode !== this.mode) throw new Error("resume mode differs from the recorded run");
+    const router = this.router.snapshot();
+    if (binding.executionFingerprint !== await this.executionFingerprint(router)) throw new Error("resume execution configuration or active extension identities changed");
+    if (options.configurationSnapshot && contentHash(options.configurationSnapshot) !== contentHash(binding.configurationSnapshot)) {
+      throw new Error("resume configuration snapshot changed");
+    }
+    const release = this.acquireWorkspaceWrite(await projectIdForWorkspace(binding.workPath));
+    try {
+      const observation = await observeWorkspace(binding.workPath);
+      if (observation.fingerprint !== checkpoint.verification.workspaceFingerprint) throw new Error("resume workspace changed since checkpoint");
+      const assessment = await session.recover({ workspaceFingerprint: observation.fingerprint });
+      if (!assessment.consistent) throw new Error(assessment.explanation);
+      await session.requestResume();
+      await session.completeRecovery({ ...assessment,
+        resumedStatus: assessment.resumedStatus === "paused" ? "executing" : assessment.resumedStatus });
+      return await this.executeTask({ workspacePath: binding.workspacePath, request: binding.request,
+        maxSteps: binding.maxSteps, tokenBudgetPerStep: binding.tokenBudgetPerStep,
+        configurationSnapshot: binding.configurationSnapshot, ...options,
+        attachments: originalInputs, attachmentParts },
+      session.projectId, router, { kind: "resume", session, binding });
+    } finally { release(); }
+  }
+
+  private async executionFingerprint(router: ModelRouter): Promise<string> {
+    const base = contentHash({ tools: this.tools.map((tool) => tool.descriptor),
+      verifiers: this.verifiers.map((verifier) => verifier.descriptor),
+      models: router.listModels(), egress: router.describeEgress() });
+    const extensions = (await this.extensionService.list()).filter((entry) => entry.lifecycleStatus === "active")
+      .map((entry) => ({ manifest: entry.manifest, reviewHash: entry.reviewHash, source: entry.source.locator }))
+      .sort((a, b) => a.manifest.name.localeCompare(b.manifest.name));
+    // Legacy runs with no active extensions retain their execution binding.
+    return extensions.length ? contentHash({ base, extensions }) : base;
+  }
+
   /**
    * Take the workspace writer lock for standard runs only.
    *
@@ -316,7 +439,7 @@ export class KeystoneRuntime {
    * effect, and directed to isolated mode.
    */
   private acquireWorkspaceWrite(projectId: string): () => void {
-    if (this.mode !== "standard") return () => undefined;
+    if (this.mode === "isolated" || this.mode === "replay") return () => undefined;
     return this.writeAdmission.tryAcquire(projectId, nowIso());
   }
 
@@ -324,18 +447,32 @@ export class KeystoneRuntime {
     options: RunTaskOptions,
     projectId: string,
     router: ModelRouter,
+    continuation?: {
+      readonly kind: "resume";
+      readonly session: KernelSession;
+      readonly binding: RunBinding;
+    } | {
+      readonly kind: "draft";
+      readonly session: KernelSession;
+    },
   ): Promise<RunTaskResult> {
+    const resumed = continuation?.kind === "resume" ? continuation : undefined;
+    const startsLocally = continuation?.kind !== "resume";
     const attachment = await this.attachProject(options.workspacePath);
     const capabilities = modeCapabilities(this.mode);
     // Isolated mode works in a throwaway worktree, so a failed attempt cannot
     // damage the user's working copy (PRD EX-05).
-    const isolatedWorkspace =
-      this.mode === "isolated" ? await createIsolatedWorkspace(options.workspacePath) : undefined;
-    const workPath = isolatedWorkspace ?? options.workspacePath;
-    const baselineObservation = await observeWorkspace(workPath);
-    let currentObservation = baselineObservation;
+    let isolatedWorkspace =
+      resumed ? (resumed.binding.workPath !== options.workspacePath ? resumed.binding.workPath : undefined) :
+      undefined;
+    let workPath = isolatedWorkspace ?? options.workspacePath;
+    let baselineObservation = resumed ? {
+      fingerprint: resumed.binding.baselineFingerprint,
+      files: new Map(resumed.binding.baselineFiles.map((file) => [file.path, file.hash])),
+    } : await observeWorkspace(workPath);
+    let currentObservation = await observeWorkspace(workPath);
 
-    const session = await KernelSession.create({
+    const session = continuation?.session ?? await KernelSession.create({
       paths: this.paths,
       projectId: attachment.projectId as never,
       request: options.request,
@@ -365,14 +502,14 @@ export class KeystoneRuntime {
     let reasons: string[] = [];
     let steps = 0;
 
-    const budget: Budget = options.budget ?? options.autonomy?.budget ?? {
+    const budget: Budget = resumed?.session.contract()?.budget ?? options.budget ?? options.autonomy?.budget ?? {
       maxTokens: 300_000,
       maxWallClockMs: 7_200_000,
       maxRetries: 3,
     };
 
-    await session.submit();
-    const compiled = await session.compile({
+    if (startsLocally) await session.submit();
+    const compiled = resumed ? { contract: session.contract()!, questions: [] } : await session.compile({
       profile: attachment.profile,
       // Minimal and replay deliberately ignore project cognition: their purpose
       // is to reproduce a result from basic facts, not to lean on what the
@@ -416,27 +553,89 @@ export class KeystoneRuntime {
       };
     }
 
-    // Experience is selected once, against the compiled contract, so the same
-    // entries are offered on every repair attempt and the evaluation at the end
-    // can name exactly what the run was told (PRD LE-03, CX-02).
-    const selectedExperience = capabilities.usesExperience
-      ? attachment.firewall.selectForContext({
-          taskShape,
-          paths: contract.scope.include.map((entry) => entry.pattern),
-          toolVersions,
-        })
-      : [];
+    // Retain actual admitted entries for evaluation; eligibility is refreshed
+    // per step so a later revocation or contract revision cannot reuse them.
+    const selectedExperience: ReturnType<ExperienceFirewall["selectForContext"]>[number][] = [];
 
-    await session.start();
-    await session.checkpoint("stage_boundary");
+    if (startsLocally) await session.start();
+    if (startsLocally && this.mode === "isolated") {
+      const resources = contract.scope.include.filter((entry) => entry.intent === "write")
+        .map((entry) => entry.pattern);
+      const grant = await session.authorizeOperation({
+        subject: { kind: "orchestrator", id: "runtime.isolation" }, capability: "git.write",
+        resourceValues: resources, parametersHash: contentHash({
+          workspacePath: options.workspacePath, revision: "HEAD", preserveDirty: true,
+        }), reversibility: "reversible",
+      });
+      if (!grant.ok) { await session.stop("isolated workspace provisioning refused"); throw new Error(grant.denial.detail); }
+      const started = Date.now();
+      try {
+        isolatedWorkspace = await createIsolatedWorkspace(options.workspacePath);
+        workPath = isolatedWorkspace;
+        baselineObservation = await observeWorkspace(workPath);
+        currentObservation = baselineObservation;
+      } finally {
+        await session.consumeExecutionLease(grant.lease.leaseId);
+        await session.recordBudget({ wallClockMs: Date.now() - started, reason: "isolated workspace provisioning", measured: true });
+      }
+    }
+    const extensionResources = (await collectScopeFiles(workPath, contract, { limit: 64 })).map((file) => file.path);
+    const extensions = extensionResources.length ? await assembleTaskExtensions(
+      this.extensionService, session,
+      workPath, extensionResources, options.signal, { paths: this.paths,
+        operationDecision: async (operation) => {
+          const request = buildInterventionRequest({
+            taskId: session.taskId, branchId: session.branchId, contract, trigger: "irreversible_action",
+            question: "Run this reviewed extension process in its copied workspace?",
+            whyUserNeeded: "Starting extension code requires confirmation of this exact operation.",
+            ifIgnoredImpact: "This extension operation will remain unavailable; no code is launched.",
+            recommended: { label: "Run this operation once", rationale: "The displayed parameters and resource are fixed for this call." },
+            contextSummary: canonicalJson({ capability: operation.capability, resources: operation.resourceValues,
+              parameters: operation.parameters, parametersHash: contentHash(operation.parameters) }),
+          });
+          interventions.push(request);
+          await session.requestIntervention(request);
+          const answer = await this.ask(options, request);
+          if (answer === undefined) return undefined;
+          const decision = userDecisionSchema.parse({ ...answer, interventionId: request.interventionId,
+            appliesTo: { capability: operation.capability, resources: [...operation.resourceValues] },
+            modifications: { parametersHash: contentHash(operation.parameters) } });
+          if (decision.taskId !== session.taskId || decision.branchId !== session.branchId) throw new Error("extension decision belongs to another task");
+          await session.decide(request, decision);
+          return decision;
+        },
+      }) : undefined;
+    try {
 
     let fingerprint = currentObservation.fingerprint;
-    let snapshotId: string = attachment.snapshot.snapshotId;
+    let snapshotId: string = workPath === options.workspacePath
+      ? attachment.snapshot.snapshotId : (await scanWorkspace(workPath)).snapshotId;
     // Paths that were dirty/untracked at onboarding: a git.commit must refuse to
     // sweep them into the agent commit (PRD PI-01 line 312; ADR-0007, B1).
     const baselineDirtyPaths = new Set(
+      resumed?.binding.baselineDirtyPaths ??
       attachment.snapshot.entries.filter((entry) => entry.gitStatus !== "").map((entry) => entry.path),
     );
+    const binding = runBindingSchema.parse(resumed?.binding ?? {
+      schemaVersion: "keystone.runtime.runBinding@1.0.0", workspacePath: options.workspacePath, workPath,
+      mode: this.mode, request: options.request,
+      baselineFingerprint: baselineObservation.fingerprint,
+      baselineFiles: [...baselineObservation.files].map(([path, hash]) => ({ path, hash })),
+      baselineDirtyPaths: [...baselineDirtyPaths], maxSteps: options.maxSteps ?? 12,
+      ...(options.tokenBudgetPerStep === undefined ? {} : { tokenBudgetPerStep: options.tokenBudgetPerStep }),
+      ...(options.configurationSnapshot === undefined ? {} : { configurationSnapshot: options.configurationSnapshot }),
+      executionFingerprint: await this.executionFingerprint(router),
+    });
+    const bindingArtifact = await putJsonArtifact(this.paths, binding);
+    const checkpointRun = async (reason: import("@keystone/schemas").CheckpointReason): Promise<void> => {
+      const observation = await observeWorkspace(workPath);
+      const workspaceArtifact = await captureRecoveryWorkspace(this.paths, workPath);
+      await session.checkpoint(reason, { artifactRefs: [bindingArtifact.artifactId, ...(workspaceArtifact ? [workspaceArtifact] : [])],
+        contractDigest: contentHash(contract),
+        workspaceSnapshotId: snapshotId,
+        verification: { workspaceFingerprint: observation.fingerprint as never } });
+    };
+    await checkpointRun("stage_boundary");
     let lastProgressKey = "";
     let noProgressStreak = 0;
     let lastFailures: string[] = [];
@@ -523,7 +722,13 @@ export class KeystoneRuntime {
           }
         }
 
-        const plan = await this.buildPlan(
+        await KernelSession.rebuildProjectExperience({ paths: this.paths, projectId: session.projectId });
+        await attachment.firewall.load();
+        const eligibleExperience = capabilities.usesExperience ? attachment.firewall.selectForContext({
+          taskShape, paths: contract.scope.include.map((entry) => entry.pattern), toolVersions,
+        }) : [];
+        let plan: Awaited<ReturnType<KeystoneRuntime["buildPlan"]>>;
+        try { plan = await this.buildPlan(
           session,
           contract,
           fingerprint,
@@ -532,10 +737,26 @@ export class KeystoneRuntime {
           options,
           state,
           verdict,
-          selectedExperience.map((selection) => selection.entry),
+          eligibleExperience.map((selection) => selection.entry),
           router,
-        );
+          extensions,
+        ); } catch (error) {
+          const unavailableExtension = extensions !== undefined && error instanceof Error &&
+            ["ToolRefusedError", "LocalPackageError"].includes(error.name);
+          if (!(error instanceof ContextBudgetError) && !unavailableExtension) throw error;
+          if (["executing", "verifying", "auto_repairing"].includes(session.state().status)) {
+            await session.pause(error.message, false);
+          }
+          reasons.push(error.message); stopped = true; break;
+        }
+        snapshotId = plan.snapshotId;
         await session.recordContextPlan(plan.plan);
+        for (const selection of eligibleExperience) {
+          if (plan.plan.experiencesUsed.includes(selection.entry.entryId) &&
+              !selectedExperience.some((used) => used.entry.entryId === selection.entry.entryId)) {
+            selectedExperience.push(selection);
+          }
+        }
         for (const item of plan.plan.items) {
           if (item.kind === "file") readPaths.add(item.ref);
         }
@@ -549,8 +770,9 @@ export class KeystoneRuntime {
             lastFailures,
             attempt,
             router,
-            options.attachmentParts ?? [],
+            (options.attachmentParts ?? []).filter((part) => part.type !== "text"),
             options.signal,
+            extensions?.descriptors ?? [],
           );
         } catch (error) {
           const pendingControl = await this.pollControl(options, session);
@@ -685,6 +907,7 @@ export class KeystoneRuntime {
           workPath,
           baselineDirtyPaths,
           options.signal,
+          extensions,
         );
         if (outcome.intervention !== undefined) {
           interventions.push(outcome.intervention);
@@ -717,6 +940,7 @@ export class KeystoneRuntime {
           fingerprint = currentObservation.fingerprint;
           snapshotId = snapshot.snapshotId;
         }
+        await checkpointRun("stage_boundary");
 
         const progressKey = `${[...changedPaths].sort().join(",")}`;
         noProgressStreak = progressKey === lastProgressKey ? noProgressStreak + 1 : 0;
@@ -760,9 +984,7 @@ export class KeystoneRuntime {
       }
       if (session.state().status === "needs_attention") break;
 
-      await session.checkpoint("pre_verification", {
-        verification: { workspaceFingerprint: fingerprint as never },
-      });
+      await checkpointRun("pre_verification");
 
       verification = await runVerification({
         rootPath: workPath,
@@ -770,7 +992,7 @@ export class KeystoneRuntime {
         session,
         contract,
         changedPaths: [...changedPaths],
-        verifiers: this.verifiers,
+        verifiers: [...this.verifiers, ...(extensions?.verifiers ?? [])] as readonly Verifier[],
         workspaceSnapshotId: snapshotId,
         workspaceFingerprint: fingerprint,
         ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -933,11 +1155,11 @@ export class KeystoneRuntime {
     // stale is what stops the next task from being told something that stopped
     // being true (PRD PI-02, PI-04).
     const staleFactIds = factsToInvalidate(attachment.facts.all(), [...changedPaths]);
-    if (staleFactIds.length > 0) {
-      await attachment.facts.markStaleForSubjects(
-        [...changedPaths],
-        "the workspace changed during a task",
-      );
+    if (staleFactIds.length > 0 && workPath === options.workspacePath) {
+      await KernelSession.updateProjectFacts({ paths: this.paths, projectId: attachment.projectId,
+        reason: "workspace_changed", facts: attachment.facts.all()
+          .filter((fact) => staleFactIds.includes(fact.factId))
+          .map((fact) => ({ ...fact, status: "stale", updatedAt: nowIso() })) });
     }
 
     const learning: RunLearning = {
@@ -974,11 +1196,7 @@ export class KeystoneRuntime {
       },
     });
 
-    await session
-      .checkpoint("stage_boundary", {
-        verification: { workspaceFingerprint: fingerprint as never },
-      })
-      .catch(() => undefined);
+    await checkpointRun("stage_boundary");
 
     return {
       taskId: session.taskId,
@@ -996,6 +1214,7 @@ export class KeystoneRuntime {
       reasons: [...new Set(reasons)],
       summary: proof.summary,
     };
+    } finally { await extensions?.close(); }
   }
 
   private async ask(
@@ -1051,16 +1270,44 @@ export class KeystoneRuntime {
     verdict: ReturnType<typeof evaluateBudget>,
     experiences: readonly ExperienceEntry[],
     router: ModelRouter,
+    extensions?: TaskExtensionIntegration,
   ): Promise<{
     plan: Awaited<ReturnType<typeof planContext>>["plan"];
     rendered: string;
     stepId: string;
+    snapshotId: string;
   }> {
     const pressure = contextPressure(verdict);
     const files = await collectScopeFiles(workPath, contract, { limit: MAX_FILES_PER_PLAN });
+    const profile = await detectProjectProfile(workPath, session.projectId);
+    let observedAt = nowIso();
+    let facts: readonly import("@keystone/schemas").ProjectFact[] = [];
+    if (modeCapabilities(this.mode).usesProjectCognition) {
+      const snapshot = await scanWorkspace(workPath);
+      snapshotId = snapshot.snapshotId;
+      observedAt = snapshot.at;
+      if (workPath === options.workspacePath) {
+        await refreshCognition(this.paths, workPath, profile, { ...snapshot, projectId: session.projectId });
+        facts = await cognitionFacts(this.paths, session.projectId);
+      } else {
+        // Fork observations stay task-local; they must not rewrite cognition
+        // about the user's primary workspace.
+        const observed = await scanProjectCognition({ rootPath: workPath, profile,
+          snapshot: { ...snapshot, projectId: session.projectId } });
+        const frozen = (await cognitionFacts(this.paths, session.projectId)).filter((fact) => fact.status === "frozen");
+        facts = [...frozen, ...observed.facts.filter((fact) => !frozen.some((entry) => entry.factId === fact.factId))];
+      }
+      // Frozen user constraints outlive the repository observation they were
+      // frozen from. Only context applicability changes; stored provenance,
+      // trust, freshness and invalidation checks remain intact.
+      facts = facts.map((fact) => fact.status === "frozen" && fact.frozenBy !== undefined ? {
+          ...fact, applicableSnapshot: undefined,
+          source: { ...fact.source, applicableSnapshot: undefined },
+        } : fact);
+    }
 
     const builder = router.route("builder")[0];
-    const result = planContext({
+    const input: PlanContextInput = {
       taskId: session.taskId,
       branchId: session.branchId,
       stepId: `step.${state.stage}.${state.seq}`,
@@ -1077,22 +1324,41 @@ export class KeystoneRuntime {
       files,
       // Facts are already part of the contract when project cognition is on; the
       // planner takes them separately so minimal mode can leave them out.
-      facts: [],
+      facts,
       experiences,
+      taskInputs: (options.attachmentParts ?? []).map((part, index) => ({
+        ref: `task-input:${index}`,
+        content: part.type === "text" ? part.text :
+          `Image input ${part.sourceId}; artifact ${part.artifactId}; MIME ${part.mimeType}. Image provider token cost is unmeasured before invocation.`,
+        provenance: {
+          provenanceId: deterministicId("prov", `${session.taskId}:input:${index}`) as never,
+          sourceKind: "user" as const, trustLevel: "untrusted" as const, locator: `task-input:${index}`,
+          derivedFrom: (options.attachments ?? []).map((attachment) => attachment.provenance.provenanceId),
+          invalidatedBy: ["input.removed"], observedAt: session.state().createdAt,
+        },
+      })),
+      taskShape: inferTaskShape(options.request),
+      languages: profile.languages,
+      packageManager: profile.packageManager,
+      toolVersions: this.tools.map((tool) => ({ id: tool.descriptor.id, version: tool.descriptor.version })),
       retrieverProvenance: {
-        provenanceId: deterministicId("prov", fingerprint) as never,
+        provenanceId: deterministicId("prov", `${fingerprint}:${snapshotId}`) as never,
         sourceKind: "repository",
         trustLevel: "observed",
         locator: workPath,
         applicableSnapshot: snapshotId as never,
         derivedFrom: [],
         invalidatedBy: ["workspace.changed"],
-        observedAt: nowIso(),
+        observedAt,
         transformation: "scope-expansion",
       },
-    });
+    };
+    const result = extensions ? await buildExtensionContext(input, extensions.skills, {
+      metadataTokenBudget: Math.min(2000, Math.floor(input.tokenBudget / 10)),
+      observations: await extensions.contextObservations(),
+    }) : planContext(input);
 
-    return { plan: result.plan, rendered: result.rendered, stepId: result.plan.stepId };
+    return { plan: result.plan, rendered: result.rendered, stepId: result.plan.stepId, snapshotId };
   }
 
   private async askBuilder(
@@ -1104,6 +1370,7 @@ export class KeystoneRuntime {
     router: ModelRouter,
     attachmentParts: readonly ModelContentPart[],
     signal?: AbortSignal,
+    extensionDescriptors: readonly import("@keystone/schemas").ToolDescriptor[] = [],
   ): Promise<ReturnType<typeof parseActionEnvelope> & { readonly producerModelId: string }> {
     const prompt = buildActionPrompt({
       goal: contract.goal,
@@ -1112,7 +1379,7 @@ export class KeystoneRuntime {
       invariants: contract.invariants.map((invariant) => invariant.description),
       writeScope: contract.scope.include.map((entry) => entry.pattern),
       allowedCommands: contract.autonomy.allowedCommands,
-      availableTools: this.tools.map((tool) => tool.descriptor),
+      availableTools: [...this.tools.map((tool) => tool.descriptor), ...extensionDescriptors],
       contextSection,
       // A repair attempt must be told what failed, otherwise it repeats the
       // change that already did not work.
@@ -1169,11 +1436,15 @@ export class KeystoneRuntime {
     workPath: string,
     baselineDirtyPaths: ReadonlySet<string>,
     signal?: AbortSignal,
+    extensions?: TaskExtensionIntegration,
   ): Promise<{
     changedPaths: readonly string[];
     stopReason?: string;
     intervention?: InterventionRequest;
   }> {
+    const extension = await extensions?.executeTool(proposal);
+    if (extension) return { changedPaths: extension.changedPaths,
+      ...(extension.status === "succeeded" ? {} : { stopReason: `extension call ${extension.status}: ${extension.errorCode ?? "unavailable"}` }) };
     const authorization = await session.authorize(proposal);
     if (!authorization.ok) {
       const intervention = interventionForDenial({
@@ -1306,6 +1577,13 @@ function deterministicId(prefix: string, seed: string): string {
 
 const SKIP_DIRECTORIES = new Set([".git", "node_modules", "dist", "build", "coverage", ".keystone"]);
 
+async function cognitionFacts(paths: KeystonePaths, projectId: string) {
+  await KernelSession.rebuildProjectFacts({ paths, projectId });
+  const facts = new ProjectFactStore(paths, projectId as never);
+  await facts.load();
+  return facts.all();
+}
+
 /** Read the files a contract's write scope covers, bounded in count and size. */
 export async function collectScopeFiles(
   rootPath: string,
@@ -1381,11 +1659,12 @@ async function walk(
  * the gap is the point, not filling it with a guess (PRD PI-01 §4).
  */
 async function seedFacts(
-  store: ProjectFactStore,
+  paths: KeystonePaths,
   projectId: string,
   profile: ProjectProfile,
   snapshot: WorkspaceSnapshot,
 ): Promise<void> {
+  const updates: import("@keystone/schemas").ProjectFact[] = [];
   const observedAt = nowIso();
   const base = {
     projectId,
@@ -1397,7 +1676,7 @@ async function seedFacts(
     subjects: [] as readonly string[],
   };
 
-  await store.upsert({
+  updates.push({
     ...base,
     factId: deterministicId("fact", `${projectId}:languages`),
     kind: "language",
@@ -1414,7 +1693,7 @@ async function seedFacts(
   } as never);
 
   for (const command of profile.commands) {
-    await store.upsert({
+    updates.push({
       ...base,
       factId: deterministicId("fact", `${projectId}:${command.kind}`),
       kind: "command",
@@ -1434,7 +1713,7 @@ async function seedFacts(
     } as never);
   }
 
-  await store.upsert({
+  updates.push({
     ...base,
     factId: deterministicId("fact", `${projectId}:snapshot`),
     kind: "structure",
@@ -1451,4 +1730,5 @@ async function seedFacts(
     },
     applicableSnapshot: snapshot.snapshotId,
   } as never);
+  await KernelSession.updateProjectFacts({ paths, projectId, facts: updates, reason: "project_profile" });
 }

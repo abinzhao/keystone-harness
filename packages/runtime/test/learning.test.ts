@@ -6,7 +6,7 @@
  * that stops working has to leave before it is used again.
  *
  * These tests run the same fixture twice. The first run teaches; the second run
- * is judged, and a failed reuse demotes what it used.
+ * is judged without mistaking task failure for entry-attributed causality.
  */
 
 import assert from "node:assert/strict";
@@ -90,7 +90,7 @@ test("a proven run promotes what it can prove and quarantines what it merely obs
   }
 });
 
-test("a promoted entry is offered to the next task, and a failed reuse demotes it", async () => {
+test("a promoted entry is offered to the next task, and task failure alone cannot demote it", async () => {
   const fixture = await makeFixture();
   try {
     const first = await KeystoneRuntime.create({
@@ -149,30 +149,31 @@ test("a promoted entry is offered to the next task, and a failed reuse demotes i
     assert.equal(reused.learning.usedEntries[0]?.entryId, entryId);
     assert.ok((reused.learning.usedEntries[0]?.reason ?? "").length > 0);
 
-    // 2. Its use was judged from this run's evidence, as a negative transfer.
+    // 2. Task evidence alone cannot attribute the failure to this entry.
     const judgement = reused.learning.evaluations.find((entry) => entry.entryId === entryId);
     assert.ok(judgement !== undefined, "the run must judge the experience it was given");
-    assert.equal(judgement.outcome, "negative_transfer");
+    assert.equal(judgement.outcome, "not_evaluable");
+    assert.match(judgement.detail, /no entry-attributed causal evidence or control run/);
 
-    // 3. A negative transfer demotes immediately: the next task must not get it.
-    assert.deepEqual(
-      reused.learning.demoted.map((entry) => entry.entryId),
-      [entryId],
-    );
+    // 3. Uncertainty is recorded without inventing a reason to demote.
+    assert.deepEqual(reused.learning.demoted, []);
 
     const firewall = new ExperienceFirewall(fixture.paths, reused.contract.projectId);
     await firewall.load();
-    assert.deepEqual(firewall.promoted(), [], "a demoted entry must leave the reusable set");
-    assert.deepEqual(firewall.selectForContext({ taskShape: "bugfix", paths: ["src"] }), []);
+    assert.deepEqual(firewall.promoted().map((entry) => entry.entryId), [entryId]);
+    assert.deepEqual(firewall.selectForContext({ taskShape: "bugfix", paths: ["src"] })
+      .map(({ entry }) => entry.entryId), [entryId]);
 
-    // 4. Both the judgement and the demotion are on the record.
+    // 4. The ledger contains the honest evaluation and no automatic demotion.
     const session = await KernelSession.open({ paths: fixture.paths, taskId: reused.taskId });
     const types = session.events().map((event) => event.type);
     assert.ok(types.includes("experience.evaluated"), "the evaluation must be recorded");
-    assert.ok(types.includes("experience.demoted"), "the demotion must be recorded");
-    const demotion = session.events().find((event) => event.type === "experience.demoted");
-    assert.equal(demotion?.payload["entryId"], entryId);
-    assert.equal(demotion?.payload["reason"], "caused_verification_failure");
+    assert.ok(!types.includes("experience.demoted"), "task failure must not fabricate a demotion");
+    const evaluation = session.events().find((event) => event.type === "experience.evaluated" &&
+      event.payload["entryId"] === entryId);
+    assert.equal(evaluation?.payload["outcome"], "not_evaluable");
+    assert.equal(evaluation?.payload["used"], true);
+    assert.equal(evaluation?.payload["evaluatedBy"], "assurance_loop");
   } finally {
     await removeFixture(fixture);
   }

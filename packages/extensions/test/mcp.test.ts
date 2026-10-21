@@ -12,7 +12,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { capabilityLeaseSchema, newId, nowIso, sha256Hex, type CapabilityLease } from "@keystone/schemas";
+import { capabilityLeaseSchema, contentHash, newId, nowIso, sha256Hex, type CapabilityLease } from "@keystone/schemas";
 import type { ToolContext } from "@keystone/tools";
 
 import {
@@ -20,6 +20,7 @@ import {
   McpSession,
   McpTimeoutError,
   mcpHandshakeProbe,
+  mcpCallParameters,
   wrapMcpTools,
 } from "../src/index.ts";
 
@@ -127,8 +128,8 @@ function makeLease(command: string): CapabilityLease {
 function ctxFor(lease: CapabilityLease): ToolContext {
   return {
     rootPath: fixtures,
-    taskId: newId("task"),
-    branchId: newId("branch"),
+    taskId: lease.taskId,
+    branchId: lease.branchId,
     paths: {} as ToolContext["paths"],
     lease,
   };
@@ -175,7 +176,11 @@ test("wrapped MCP tool runs under a covering lease and returns untrusted output"
     const tools = wrapMcpTools({ session, tools: await session.listTools(), capabilities: ["cmd.exec"] });
     const echo = tools.find((t) => t.descriptor.id.endsWith(".echo"));
     assert.ok(echo !== undefined);
-    const result = await echo!.run({ hello: "world" }, ctxFor(makeLease(node)));
+    const lease = makeLease(node);
+    const bound = { ...lease, constraints: {
+      parametersHash: contentHash(mcpCallParameters(session, "echo", { hello: "world" })),
+    } };
+    const result = await echo!.run({ hello: "world" }, ctxFor(bound));
     assert.equal(result.status, "succeeded");
     assert.ok((result.stdout ?? "").includes('"hello":"world"'), result.stdout);
   } finally {

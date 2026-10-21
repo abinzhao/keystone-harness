@@ -54,6 +54,14 @@ export interface PromotionVerdict {
   readonly reason: string;
 }
 
+export type ExperienceCommit =
+  | { readonly type: "experience.candidate_created"; readonly value: ExperienceCandidate }
+  | { readonly type: "experience.promoted"; readonly value: ExperienceEntry }
+  | { readonly type: "experience.evaluated"; readonly value: ExperienceEvaluation }
+  | { readonly type: "experience.demoted"; readonly value: {
+      readonly entryId: string; readonly reason: string; readonly detail: string;
+      readonly affectedTaskIds: readonly string[] } };
+
 interface SelectionQuery {
   readonly taskShape?: string;
   readonly paths?: readonly string[];
@@ -101,11 +109,15 @@ export class ExperienceFirewall {
   private candidatesById: Map<string, ExperienceCandidate> = new Map();
   private entriesById: Map<string, ExperienceEntry> = new Map();
   private evaluationsByEntry: Map<string, ExperienceEvaluation[]> = new Map();
+  private commit?: (event: ExperienceCommit) => Promise<void>;
 
-  constructor(paths: KeystonePaths, projectId: string) {
+  constructor(paths: KeystonePaths, projectId: string, commit?: (event: ExperienceCommit) => Promise<void>) {
     this.paths = paths;
     this.projectId = projectId;
+    this.commit = commit;
   }
+
+  bindCommit(commit: (event: ExperienceCommit) => Promise<void>): void { this.commit = commit; }
 
   private get candidatesFile(): string {
     return this.paths.experienceCandidatesFile(this.projectId as ProjectId);
@@ -160,6 +172,7 @@ export class ExperienceFirewall {
       note: input.note ?? "",
     }) as ExperienceCandidate;
 
+    await this.commit?.({ type: "experience.candidate_created", value: candidate });
     await appendLineDurable(this.candidatesFile, canonicalJson(candidate));
     this.candidatesById.set(candidate.candidateId, candidate);
     return candidate;
@@ -227,6 +240,10 @@ export class ExperienceFirewall {
     if (candidate === undefined) {
       throw new Error(`unknown experience candidate ${candidateId}`);
     }
+    const verdict = this.evaluatePromotion(candidate);
+    if (candidate.status !== "quarantined" || !verdict.eligible || verdict.basis !== basis) {
+      throw new Error(`not promotable: ${verdict.reason}; requested basis=${basis}`);
+    }
 
     const entry = experienceEntrySchema.parse({
       entryId: newId("exp"),
@@ -246,6 +263,7 @@ export class ExperienceFirewall {
       note: "",
     }) as ExperienceEntry;
 
+    await this.commit?.({ type: "experience.promoted", value: entry });
     await appendLineDurable(this.entriesFile, canonicalJson(entry));
     this.entriesById.set(entry.entryId, entry);
 
@@ -268,6 +286,7 @@ export class ExperienceFirewall {
     if (entry === undefined) {
       throw new Error(`unknown experience entry ${entryId}`);
     }
+    if (entry.frozen && reason !== "user_requested") throw new Error("frozen experience requires user revocation");
 
     const demoted = experienceEntrySchema.parse({
       ...entry,
@@ -276,6 +295,7 @@ export class ExperienceFirewall {
       note: detail.slice(0, 2000),
     }) as ExperienceEntry;
 
+    await this.commit?.({ type: "experience.demoted", value: { entryId, reason, detail, affectedTaskIds: [] } });
     await appendLineDurable(this.entriesFile, canonicalJson(demoted));
     this.entriesById.set(demoted.entryId, demoted);
 
@@ -309,6 +329,7 @@ export class ExperienceFirewall {
       detail: input.detail ?? "",
     }) as ExperienceEvaluation;
 
+    await this.commit?.({ type: "experience.evaluated", value: evaluation });
     await appendLineDurable(this.evaluationsFile, canonicalJson(evaluation));
     const bucket = this.evaluationsByEntry.get(evaluation.entryId) ?? [];
     bucket.push(evaluation);

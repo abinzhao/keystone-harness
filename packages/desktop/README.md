@@ -80,12 +80,22 @@ stages `bin/Keystone.app`, and installs the model helper under
 `packages/models/bin`. `node packages/desktop/scripts/build-native.ts --out DIR`
 builds entirely into an isolated output directory.
 
+`node packages/desktop/scripts/package-local.ts --out NEW_DIR` creates a
+self-contained local application in a new output tree. It embeds the current
+host Node executable, the runtime sources, workspace package links and universal
+macOS window/credential helpers, then runs `keystone-start --self-check` with a
+sanitized `PATH`. The report distinguishes the host architecture of embedded
+Node from the `arm64`/`x86_64` native carrier architectures and records signing
+and notarization as unverified rather than inferring distribution readiness.
+
 `node --test "packages/models/test/**/*.test.ts" "packages/desktop/test/**/*.test.ts"`
 uses temporary homes, injected credentials and local fixture servers. Native
 tests compile real Swift/Cocoa/WebKit/Security code, inspect actual menu/panel
 objects, and run credential operations against memory storage.
 
-The staged `.app` is the native carrier, not a complete distributable containing
-Node/runtime resources. Signing, notarization, interactive GUI actions, real
-Keychain permission prompts, provider accounts and controller integration are
-separate verification steps. These tests never read real `~/.keystone` keys.
+The `build-native.ts` staged `.app` is only the native carrier. The
+`package-local.ts` output is a complete local bundle for the build-host
+architecture, but it is not a signed or notarized public distributable.
+Real Keychain permission prompts, provider accounts, Windows packaging and
+hosted controller integration remain separate verification steps. These checks
+never read real `~/.keystone` keys.

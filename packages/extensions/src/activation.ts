@@ -63,11 +63,12 @@ export function canActivate(input: ActivationGateInput): ActivationGateResult {
     }
   }
 
-  const needsConfirmation = reachesOutside(input.manifest);
+  const needsConfirmation = reachesOutside(input.manifest) ||
+    input.manifest.capabilities.includes("cmd.exec") || input.manifest.reversibility === "irreversible";
   const decision = input.decision;
   const decisionIsLive =
     decision !== undefined &&
-    (decision.decision === "allow" || decision.decision === "modify") &&
+    decision.recordedBy === "user" && decision.decision === "allow" &&
     (decision.appliesTo.expiresAt === undefined ||
       Date.parse(decision.appliesTo.expiresAt) > Date.now());
 
@@ -79,7 +80,7 @@ export function canActivate(input: ActivationGateInput): ActivationGateResult {
     );
   }
 
-  if (input.manifest.reversibility === "irreversible") {
+  if (input.manifest.reversibility === "irreversible" && !decisionIsLive) {
     blockers.push(
       "an extension that declares irreversible effects cannot be activated automatically",
     );

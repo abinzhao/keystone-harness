@@ -25,7 +25,7 @@ export function button(label, onClick, className = "") {
 export function field(label, id, value = "", type = "text") {
   const input = node(type === "textarea" ? "textarea" : "input", { id, ...(type === "textarea" ? { rows: "3" } : { type }) });
   input.value = value;
-  return { wrap: node("div", { class: "field" }, [node("label", { for: id, text: tr(label) }), input]), input };
+  return { wrap: node("div", { class: type === "checkbox" ? "field checkbox-field" : "field" }, [node("label", { for: id, text: tr(label) }), input]), input };
 }
 
 export function selectField(label, id, values, selected) {
@@ -61,7 +61,14 @@ export function translateStatic(root = document) {
 
 const paths = {
   navigation: "M4 5h16M4 12h16M4 19h16", settings: "M4 6h16M4 12h16M4 18h16M8 3v6M16 9v6M10 15v6",
+  search: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14M16 16l4 4",
   proof: "M12 3l8 4v5c0 5-8 9-8 9s-8-4-8-9V7zM8 12l3 3 5-6",
+  extensions: "M8 3h8v5h5v8h-5v5H8v-5H3V8h5z",
+  cognition: "M5 5h14v14H5zM8 8h8M8 12h6M8 16h4",
+  lab: "M9 3h6M10 3v7L4 20h16l-6-10V3M7 15h10",
+  collaboration: "M8 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6M16 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6M2 20v-3a5 5 0 0 1 10 0v3M14 20h8v-2a5 5 0 0 0-7-4",
+  readiness: "M5 3h14v18H5zM8 8l2 2 5-5M8 14h8M8 18h5",
+  folder: "M3 6h7l2 3h9v11H3z",
 };
 export function icon(name) {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");

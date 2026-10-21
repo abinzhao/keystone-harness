@@ -493,7 +493,9 @@ export type BranchStatus = (typeof BRANCH_STATUSES)[number];
  */
 export const runBranchSchema = defineSchema(
   "keystone.run.branch",
-  "1.0.0",
+  // 1.1 binds executable fork identity through branch.created (ADR-0015).
+  // The 1.0 field shape remains readable; legacy records are never rewritten.
+  "1.1.0",
   objectOf({
     branchId: branchIdValidator,
     taskId: taskIdValidator,

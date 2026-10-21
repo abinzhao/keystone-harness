@@ -11,6 +11,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { ExperienceFirewall, KernelSession } from "@keystone/kernel";
 import type { ModelAdapter } from "@keystone/models";
 import { createSequenceAdapter, scriptedModelDescriptor } from "@keystone/models";
 import { startServer } from "../src/index.ts";
@@ -470,7 +471,7 @@ test("data management lists what is stored, clears an experience cache, and dele
         projectId: string;
         name: string | null;
         facts: number;
-        experience: { entries: number };
+        experience: { candidates: number; entries: number; evaluations: number };
         bytes: number;
       }[];
       tasks: readonly { taskId: string; status: string; events: number }[];
@@ -483,13 +484,16 @@ test("data management lists what is stored, clears an experience cache, and dele
     assert.equal(task?.status, "proven");
     assert.ok((task?.events ?? 0) > 0);
 
-    const cleared = (await (
-      await fetch(`${base}/v1/projects/${project.projectId}/experience/clear`, {
-        method: "POST",
-        headers: auth,
-      })
-    ).json()) as { cleared: { entries: number } };
-    assert.ok(cleared.cleared.entries > 0);
+    const clearResponse = await fetch(`${base}/v1/projects/${project.projectId}/experience/clear`, {
+      method: "POST",
+      headers: auth,
+    });
+    const clearText = await clearResponse.text();
+    assert.equal(clearResponse.status, 200, clearText);
+    const cleared = JSON.parse(clearText) as {
+      cleared: { projectId: string; candidates: number; entries: number; evaluations: number };
+    };
+    assert.deepEqual(cleared.cleared, { projectId: project.projectId, ...project.experience });
     const afterClear = (await (await fetch(`${base}/v1/data`, { headers: auth })).json()) as {
       projects: readonly { projectId: string; experience: { entries: number } }[];
     };
@@ -497,6 +501,11 @@ test("data management lists what is stored, clears an experience cache, and dele
       afterClear.projects.find((entry) => entry.projectId === project.projectId)?.experience.entries,
       0,
     );
+    await KernelSession.rebuildProjectExperience({ paths: fixture.paths, projectId: project.projectId });
+    const firewall = new ExperienceFirewall(fixture.paths, project.projectId);
+    await firewall.load();
+    assert.deepEqual(firewall.selectForContext({ taskShape: "bugfix", paths: ["src/auth"] }), []);
+    assert.ok(firewall.candidates().every((candidate) => candidate.status !== "quarantined"));
 
     // An id that is not a task id never reaches the filesystem.
     const badId = await fetch(`${base}/v1/tasks/not-a-task-id`, { method: "DELETE", headers: auth });

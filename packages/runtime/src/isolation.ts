@@ -11,10 +11,10 @@
  * path is reported and cleanup is the caller's decision.
  */
 
-import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { copyFile, lstat, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
@@ -32,10 +32,32 @@ export class IsolationError extends Error {
  * `--detach` is intentional: giving the worktree a branch name would create a
  * ref in the user's repository as a side effect of *starting* a run.
  */
-export async function createIsolatedWorkspace(rootPath: string): Promise<string> {
+export async function createIsolatedWorkspace(rootPath: string, revision = "HEAD",
+  preserveDirty = true): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "keystone-isolated-"));
   try {
-    await exec("git", ["-C", rootPath, "worktree", "add", "--detach", directory, "HEAD"]);
+    await exec("git", ["-C", rootPath, "worktree", "add", "--detach", directory, revision]);
+    if (preserveDirty) {
+      const patch = await exec("git", ["-C", rootPath, "diff", "--binary", "HEAD"],
+        { maxBuffer: 8 * 1024 * 1024, timeout: 30000 });
+      if (patch.stdout) await applyWorkspacePatch(directory, patch.stdout);
+      const untracked = await exec("git", ["-C", rootPath, "ls-files", "-z", "--others", "--exclude-standard"],
+        { maxBuffer: 1024 * 1024, timeout: 30000 });
+      let bytes = 0;
+      for (const path of untracked.stdout.split("\0").filter(Boolean)) {
+        if (path.startsWith("/") || path.split("/").some((part) => part === ".." || part === ".git") ||
+            /(^|\/)(\.env(?:\..*)?|.*\.(?:pem|key|p12))$/.test(path)) {
+          throw new IsolationError("untracked path cannot be safely carried into an isolated workspace");
+        }
+        const source = join(rootPath, path);
+        const info = await lstat(source);
+        if (!info.isFile() || (bytes += info.size) > 8 * 1024 * 1024) {
+          throw new IsolationError("untracked workspace snapshot exceeds supported regular-file/8MiB limits");
+        }
+        await mkdir(dirname(join(directory, path)), { recursive: true });
+        await copyFile(source, join(directory, path));
+      }
+    }
   } catch (error) {
     await rm(directory, { recursive: true, force: true });
     throw new IsolationError(
@@ -45,6 +67,18 @@ export async function createIsolatedWorkspace(rootPath: string): Promise<string>
     );
   }
   return directory;
+}
+
+export async function applyWorkspacePatch(directory: string, patch: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn("git", ["-C", directory, "apply", "--binary", "-"], { stdio: ["pipe", "ignore", "pipe"] });
+    let error = "";
+    child.stderr.on("data", (data: Buffer) => { if (error.length < 2000) error += data.toString(); });
+    child.on("error", reject);
+    child.stdin.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolve() : reject(new IsolationError(`snapshot patch could not be applied: ${error}`)));
+    child.stdin.end(patch);
+  });
 }
 
 /** Remove a worktree created by `createIsolatedWorkspace`. */

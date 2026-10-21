@@ -14,7 +14,8 @@
  * the user can see exactly which directory they are trusting (PRD PL-01, PL-02).
  */
 
-import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,6 +40,7 @@ import { runConformance, type ConformanceProbe } from "./conformance.ts";
 import { describeInstallReview, type InstallReview } from "./manifest.ts";
 import { isolatedVerifierEntryShapeProbe, probeEnvironment, probeLimits, type IsolatedProbeLimits } from "./verifier-entry-probe.ts";
 import { decodeLine, encodeFrame } from "./mcp/protocol.ts";
+import { checkSkillConformance, inspectSkill } from "./skills/loader.ts";
 
 /** The manifest file every local package must ship at its root. */
 export const EXTENSION_MANIFEST_FILE = "keystone-extension.json";
@@ -93,7 +95,8 @@ async function snapshotPackage(packageRoot: string): Promise<PackageSnapshot> {
   const files: PackageFile[] = [];
   let bytes = 0;
   let visited = 0;
-  async function visit(dir: string): Promise<void> {
+  async function visit(dir: string, depth = 0): Promise<void> {
+    if (depth > 32) throw new LocalPackageError("package exceeds the static review directory depth limit");
     for (const name of (await readdir(dir)).sort()) {
       if (name === "node_modules" || name.startsWith(".")) continue;
       if (++visited > 512) throw new LocalPackageError("package exceeds the 512-entry static review limit");
@@ -101,11 +104,24 @@ async function snapshotPackage(packageRoot: string): Promise<PackageSnapshot> {
       const stat = await lstat(path);
       if (stat.isSymbolicLink()) throw new LocalPackageError(`package symlinks are not reviewable: ${relative(root, path)}`);
       if (stat.isDirectory()) {
-        await visit(path);
+        await visit(path, depth + 1);
       } else {
         if (!stat.isFile()) throw new LocalPackageError("package contains a non-regular file");
         if (bytes + stat.size > 16 * 1024 * 1024) throw new LocalPackageError("package exceeds the 16MiB static review limit");
-        const content = new Uint8Array(await readFile(path));
+        const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        let content: Uint8Array;
+        try {
+          const current = await handle.stat();
+          if (!current.isFile()) throw new LocalPackageError("reviewed file is no longer regular");
+          const buffer = Buffer.alloc(16 * 1024 * 1024 - bytes + 1);
+          let size = 0;
+          while (size < buffer.length) {
+            const { bytesRead } = await handle.read(buffer, size, buffer.length - size, size);
+            if (bytesRead === 0) break;
+            size += bytesRead;
+          }
+          content = buffer.subarray(0, size);
+        } finally { await handle.close(); }
         bytes += content.byteLength;
         if (bytes > 16 * 1024 * 1024) throw new LocalPackageError("package exceeds the 16MiB static review limit");
         files.push({ path: relative(root, path), bytes: content, mode: stat.mode });
@@ -161,6 +177,15 @@ function readSnapshot(snapshot: PackageSnapshot): ReadLocalPackage {
   }
 
   if (manifest.entry === undefined) {
+    if (manifest.kind === "skill") {
+      const skill = snapshot.files.find((file) => file.path === "SKILL.md");
+      if (skill === undefined) throw new LocalPackageError("a Skill package must include SKILL.md");
+      return {
+        manifest, integrityBasis: "entry_digest",
+        integrityVerified: sha256Bytes(skill.bytes) === manifest.integrity.digest,
+        review: describeInstallReview(manifest),
+      };
+    }
     throw new LocalPackageError(
       `a ${manifest.kind} extension must declare either an in-process entry (entry.module) or a stdio transport`,
     );
@@ -265,10 +290,47 @@ export async function probeLocalInstall(
 ): Promise<PreparedLocalInstall> {
   const decision = userDecisionSchema.parse(approval.decision) as UserDecision;
   requireLiveApproval(decision);
+  approval.signal?.throwIfAborted();
   const limits = probeLimits(approval);
+  return withReviewedPackage(packageRoot, approval.reviewHash, async (workspace, prepared) => {
+    const entry = prepared.read.manifest.entry;
+    const read = prepared.read.integrityBasis === "local_path_trust"
+      ? { ...prepared.read, integrityVerified: true } : prepared.read;
+    const probes: ConformanceProbe[] = [];
+    if (read.manifest.transport !== undefined) {
+      probes.push(isolatedMcpProbe(read.manifest, [await realpath(resolve(packageRoot)), resolve(packageRoot)],
+        workspace, { ...limits, signal: approval.signal }));
+    } else if (read.manifest.kind === "verifier" && entry !== undefined) {
+      probes.push(isolatedVerifierEntryShapeProbe({ workspace, entry, ...limits, signal: approval.signal }));
+    } else if (read.manifest.kind === "skill") {
+      const skill = await inspectSkill(workspace);
+      if (skill === undefined) throw new LocalPackageError("Skill frontmatter is invalid");
+      for (const check of checkSkillConformance(skill)) {
+        probes.push({ ...check, blocking: true, run: async () => check });
+      }
+    }
+    requireLiveApproval(decision);
+    approval.signal?.throwIfAborted();
+    const conformance = await runConformance({
+      manifest: read.manifest, integrityVerified: read.integrityVerified,
+      integrityBasis: read.integrityBasis, probes,
+    });
+    approval.signal?.throwIfAborted();
+    return {
+      ...prepared, read, phase: "probed", conformance,
+      gate: canActivate({ manifest: read.manifest, integrityVerified: read.integrityVerified, conformance, decision }),
+    };
+  }, approval.signal);
+}
+
+/** Trusted host callback receives immutable reviewed bytes in a disposable copy. */
+export async function withReviewedPackage<T>(packageRoot: string, reviewHash: string,
+  use: (workspace: string, prepared: PreparedLocalInstall) => Promise<T>, signal?: AbortSignal,
+): Promise<T> {
+  signal?.throwIfAborted();
   const snapshot = await snapshotPackage(packageRoot);
   const prepared = await prepareSnapshot(snapshot);
-  if (prepared.reviewHash !== approval.reviewHash) {
+  if (prepared.reviewHash !== reviewHash) {
     throw new LocalPackageError("package changed since static review; review and approve it again");
   }
   if (!prepared.staticChecksPassed) {
@@ -290,35 +352,8 @@ export async function probeLocalInstall(
     for (const name of ["schemas", "kernel", "verifiers", "spawn"]) {
       await symlink(join(packages, name), join(dependencies, name), "dir");
     }
-    const entry = prepared.read.manifest.entry;
-    const read = prepared.read.integrityBasis === "local_path_trust"
-      ? { ...prepared.read, integrityVerified: true } : prepared.read;
-    const probes: ConformanceProbe[] = [];
-    if (read.manifest.transport !== undefined) {
-      probes.push(isolatedMcpProbe(read.manifest, [snapshot.root, resolve(packageRoot)], workspace, limits));
-    } else if (read.manifest.kind === "verifier" && entry !== undefined) {
-      probes.push(isolatedVerifierEntryShapeProbe({ workspace, entry, ...limits }));
-    }
-    // Snapshotting/copying contains awaits; expired consent cannot launch code.
-    requireLiveApproval(decision);
-    const conformance = await runConformance({
-      manifest: read.manifest,
-      integrityVerified: read.integrityVerified,
-      integrityBasis: read.integrityBasis,
-      probes,
-    });
-    return {
-      ...prepared,
-      read,
-      phase: "probed",
-      conformance,
-      gate: canActivate({
-        manifest: read.manifest,
-        integrityVerified: read.integrityVerified,
-        conformance,
-        decision,
-      }),
-    };
+    signal?.throwIfAborted();
+    return await use(workspace, prepared);
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
@@ -329,13 +364,14 @@ function isolatedMcpProbe(
   manifest: ExtensionManifest,
   packageRoots: readonly string[],
   workspace: string,
-  limits: { readonly timeoutMs: number; readonly maxOutputBytes: number },
+  limits: { readonly timeoutMs: number; readonly maxOutputBytes: number; readonly signal?: AbortSignal },
 ): ConformanceProbe {
   return {
     checkId: "mcp.handshake",
     blocking: true,
     detail: "bounded initialize/tools-list in a copied temporary workspace",
     async run() {
+      limits.signal?.throwIfAborted();
       const transport = manifest.transport!;
       const cwd = confinedPath(workspace, transport.cwd ?? ".");
       const relocate = (arg: string) => {
@@ -409,6 +445,9 @@ function isolatedMcpProbe(
           kill();
         };
         const timer = setTimeout(() => finish(false, "MCP probe timed out"), limits.timeoutMs);
+        const onAbort = () => finish(false, "MCP probe cancelled");
+        limits.signal?.addEventListener("abort", onAbort, { once: true });
+        if (limits.signal?.aborted) onAbort();
         const account = (chunk: string) => {
           bytes += Buffer.byteLength(chunk);
           if (bytes > limits.maxOutputBytes) finish(false, "MCP probe exceeded its output limit");
@@ -450,6 +489,7 @@ function isolatedMcpProbe(
         child.on("error", () => finish(false, "could not launch MCP probe"));
         child.once("close", () => {
           clearTimeout(timer);
+          limits.signal?.removeEventListener("abort", onAbort);
           kill();
           complete(outcome ?? { passed: false, detail: "MCP probe exited before conformance completed" });
         });

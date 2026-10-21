@@ -127,6 +127,10 @@ function applyEvent(state: TaskState | undefined, event: RunEvent): TaskState {
   const mutable = next as unknown as Record<string, unknown>;
 
   switch (event.type) {
+    case "branch.created": {
+      mutable["branchId"] = readField<string>(payload, "branchId");
+      break;
+    }
     case "task.status_changed": {
       const from = readField<TaskStatus>(payload, "from");
       const to = readField<TaskStatus>(payload, "to");

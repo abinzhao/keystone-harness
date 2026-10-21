@@ -230,8 +230,8 @@ test("probes can extend conformance and blocking probes gate activation", async 
   );
 });
 
-test("activation requires conformance, integrity and — for egress — a decision", async () => {
-  const localManifest = manifestFor();
+test("activation requires conformance, integrity and — for commands/egress — a decision", async () => {
+  const localManifest = manifestFor({ capabilities: ["fs.read"], sideEffects: [{ kind: "fs_read" }] });
   const conformance = await runConformance({ manifest: localManifest, integrityVerified: true });
 
   assert.equal(
@@ -367,7 +367,7 @@ test("registry persists install, activation and isolation", async () => {
     assert.equal(registered.status, "registered");
     assert.match(registered.extensionId, /^ext_/);
 
-    const activated = await registry.activate(manifest.name);
+    const activated = await registry.activate(manifest.name, { decision: decisionFor() });
     assert.equal(activated.status, "active");
     assert.equal(registry.active().length, 1);
 
@@ -416,7 +416,7 @@ test("registry refuses activation of an extension that cannot be trusted", async
 test("an extension that cannot be uninstalled is flagged, not blocked", async () => {
   const manifest = manifestFor({ uninstall: "unsupported" });
   const conformance = await runConformance({ manifest, integrityVerified: true });
-  const gate = canActivate({ manifest, integrityVerified: true, conformance });
+  const gate = canActivate({ manifest, integrityVerified: true, conformance, decision: decisionFor() });
   assert.equal(gate.allowed, true);
   assert.ok(gate.notes.some((note) => note.includes("cannot be uninstalled")));
 });

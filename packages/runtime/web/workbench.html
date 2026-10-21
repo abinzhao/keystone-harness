@@ -11,66 +11,84 @@
   </head>
   <body>
     <a class="skip-link" href="#workspace-main" data-i18n="Skip to workspace">Skip to workspace</a>
-    <div id="app" class="app">
-      <header class="topbar">
-        <div class="brand"><span class="brand-mark" aria-hidden="true">K</span><strong>Keystone</strong></div>
-        <button id="sidebar-toggle" class="icon-button" aria-controls="sidebar" aria-expanded="true" data-i18n-title="Toggle navigation">Navigation</button>
-        <div class="object-navigation">
-          <label class="sr-only" for="project-select" data-i18n="Project">Project</label>
-          <select id="project-select"></select>
-          <span class="breadcrumb" aria-hidden="true">/</span>
-          <label class="sr-only" for="task-select" data-i18n="Task">Task</label>
-          <select id="task-select"></select>
-        </div>
-        <div class="top-actions">
-          <button id="command-button" data-i18n-title="Command palette">Search <kbd>⌘K</kbd></button>
-          <button id="settings-button" class="icon-button" data-i18n-title="Settings">Settings</button>
-          <button id="inspector-toggle" class="icon-button" aria-controls="inspector" aria-expanded="true" data-i18n-title="Toggle proof inspector">Proof</button>
-        </div>
-      </header>
+    <div id="app" class="app welcome inspector-collapsed">
       <aside id="sidebar" class="sidebar" aria-label="Navigation" data-i18n-aria="Navigation">
-        <div class="sidebar-head"><span data-i18n="Projects">Projects</span><button id="add-project" class="small" data-i18n="Add project">Add project</button></div>
-        <div id="project-list" class="nav-list"></div>
-        <div class="sidebar-head"><span data-i18n="Tasks">Tasks</span><button id="new-task" class="small" data-i18n="New task">New task</button></div>
-        <label class="sr-only" for="task-filter" data-i18n="Filter tasks">Filter tasks</label>
-        <input id="task-filter" type="search" data-i18n-placeholder="Filter tasks" />
-        <div id="task-list" class="nav-list"></div>
+        <div class="sidebar-brand"><div class="brand"><span class="brand-mark" aria-hidden="true">K</span><strong>Keystone</strong><small>HARNESS</small></div><button id="sidebar-close" class="icon-button drawer-close" data-i18n="Close">Close</button></div>
+        <button id="new-task" class="new-task-button"><span data-i18n="New task">New task</span><span aria-hidden="true">+</span></button>
+        <nav class="primary-navigation" aria-label="Workbench pages" data-i18n-aria="Workbench pages">
+          <button data-page="extensions" class="nav-item"><span data-i18n="Extensions">Extensions</span></button>
+          <button data-page="cognition" class="nav-item"><span data-i18n="Project cognition">Project cognition</span></button>
+          <button data-page="lab" class="nav-item"><span data-i18n="Harness Lab">Harness Lab</span></button>
+          <button data-page="collaboration" class="nav-item"><span data-i18n="Collaboration">Collaboration</span></button>
+          <button data-page="readiness" class="nav-item"><span data-i18n="Release readiness">Release readiness</span></button>
+        </nav>
+        <div class="sidebar-projects">
+          <div class="sidebar-head"><span data-i18n="Projects">Projects</span><button id="add-project" class="small" data-i18n="Add project">Add project</button></div>
+          <label class="sr-only" for="task-filter" data-i18n="Filter tasks">Filter tasks</label>
+          <input id="task-filter" type="search" data-i18n-placeholder="Filter tasks" />
+          <div id="task-list" class="nav-list" aria-label="Tasks" data-i18n-aria="Tasks"><div id="project-list"></div></div>
+        </div>
         <div class="sidebar-footer">
-          <button id="workspace-files" data-i18n="Files">Files</button>
-          <button id="project-manage" data-i18n="Manage project">Manage project</button>
-          <button id="sidebar-settings" data-i18n="Settings">Settings</button>
+          <div class="row"><button id="workspace-files" class="small" data-i18n="Files">Files</button><button id="project-manage" class="small" data-i18n="Manage project">Manage project</button></div>
+          <button id="sidebar-settings" class="nav-item"><span data-i18n="Settings">Settings</span></button>
+          <div class="local-status"><span class="local-dot" aria-hidden="true"></span><span id="connection" role="status" aria-live="polite" data-i18n="Connecting">Connecting</span></div>
         </div>
       </aside>
-      <div id="sidebar-resize" class="resize-handle" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize navigation" data-i18n-aria="Resize navigation" aria-valuemin="220" aria-valuemax="340" aria-valuenow="256"></div>
+      <div id="sidebar-resize" class="resize-handle" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize navigation" data-i18n-aria="Resize navigation" aria-valuemin="260" aria-valuemax="340" aria-valuenow="272"></div>
+      <header class="topbar">
+        <button id="sidebar-toggle" class="icon-button" aria-controls="sidebar" aria-expanded="true" data-i18n-title="Toggle navigation">Navigation</button>
+        <div class="workspace-title"><h1 id="task-title" data-i18n="Local workbench">Local workbench</h1><span id="workspace-branch" class="eyebrow"></span></div>
+        <div class="object-navigation">
+          <label class="sr-only" for="project-select" data-i18n="Project">Project</label><select id="project-select"></select>
+          <label class="sr-only" for="task-select" data-i18n="Task">Task</label><select id="task-select" class="sr-only" tabindex="-1"></select>
+        </div>
+        <div class="top-actions">
+          <button id="command-button" data-i18n-title="Command palette"><span data-i18n="Search">Search</span><kbd>⌘K</kbd></button>
+          <button id="settings-button" class="icon-button" data-i18n-title="Settings">Settings</button>
+          <button id="inspector-toggle" class="icon-button" aria-controls="inspector" aria-expanded="false" data-i18n-title="Toggle proof inspector">Proof</button>
+        </div>
+      </header>
       <main id="workspace-main" class="workspace" tabindex="-1">
         <div class="workspace-header">
-          <div class="workspace-title"><span id="workspace-branch" class="eyebrow"></span><h1 id="task-title" data-i18n="Local workbench">Local workbench</h1></div>
-          <div class="run-actions"><span id="task-status" class="pill"></span><button id="pause" data-i18n="Pause" disabled>Pause</button><button id="stop" data-i18n="Stop" disabled>Stop</button><button id="refresh" data-i18n="Refresh">Refresh</button></div>
+          <nav id="workspace-tabs" class="tabs" aria-label="Workspace views" data-i18n-aria="Workspace views">
+            <button data-view="overview" aria-current="page" data-i18n="Overview">Overview</button>
+            <button data-view="trace" data-i18n="Trace">Trace</button>
+            <button data-view="files" data-i18n="Files">Files</button>
+            <button data-view="diff" data-i18n="Changes">Changes</button>
+            <button data-view="commands" data-i18n="Commands">Commands</button>
+            <button data-view="proof" data-i18n="Proof">Proof</button>
+            <button data-view="recovery" data-i18n="Recovery and branches">Recovery and branches</button>
+          </nav>
+          <div class="run-actions"><span id="task-status" class="pill"></span><button id="pause" class="small" data-i18n="Pause" disabled>Pause</button><button id="stop" class="small" data-i18n="Stop" disabled>Stop</button><button id="refresh" class="small" data-i18n="Refresh">Refresh</button></div>
         </div>
         <div id="error" role="alert" class="notice bad" hidden></div>
-        <nav id="workspace-tabs" class="tabs" aria-label="Workspace views" data-i18n-aria="Workspace views">
-          <button data-view="overview" aria-current="page" data-i18n="Overview">Overview</button>
-          <button data-view="trace" data-i18n="Trace">Trace</button>
-          <button data-view="files" data-i18n="Files">Files</button>
-          <button data-view="diff" data-i18n="Changes">Changes</button>
-          <button data-view="commands" data-i18n="Commands">Commands</button>
-        </nav>
+        <div id="welcome" class="welcome-surface">
+          <div class="welcome-heading"><span class="welcome-mark" aria-hidden="true">K</span><h2 data-i18n="What would you like to work on?">What would you like to work on?</h2><p data-i18n="Describe an outcome. Keystone will work within your boundaries and bring back evidence.">Describe an outcome. Keystone will work within your boundaries and bring back evidence.</p></div>
+          <div id="welcome-composer"></div>
+          <p class="welcome-caption" data-i18n="Local by default. Permissions stay explicit. Completion needs proof.">Local by default. Permissions stay explicit. Completion needs proof.</p>
+        </div>
         <div id="view-host" class="view-host"></div>
       </main>
       <div id="inspector-resize" class="resize-handle" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize inspector" data-i18n-aria="Resize inspector" aria-valuemin="280" aria-valuemax="420" aria-valuenow="328"></div>
       <aside id="inspector" class="inspector" aria-label="Proof and decisions" data-i18n-aria="Proof and decisions">
-        <div class="inspector-head"><h2 data-i18n="Proof">Proof</h2><button id="export-proof" class="small" data-i18n="Export proof" disabled>Export proof</button></div>
+        <div class="inspector-head"><h2 data-i18n="Proof">Proof</h2><button id="export-proof" class="small" data-i18n="Export proof" disabled>Export proof</button><button id="inspector-close" class="icon-button" data-i18n="Close">Close</button></div>
         <div id="proof-summary"></div>
         <section><h2 data-i18n="Needs your decision">Needs your decision</h2><div id="decisions"></div></section>
         <section><h2 data-i18n="Evidence">Evidence</h2><div id="evidence"></div></section>
         <section><h2 data-i18n="Branches and checkpoints">Branches and checkpoints</h2><div id="checkpoints"></div></section>
         <section><h2 data-i18n="Cognition and experience">Cognition and experience</h2><div id="cognition"></div></section>
       </aside>
-      <footer class="bottom">
-        <div id="composer-host"></div>
-        <div class="statusbar"><span id="connection" role="status" aria-live="polite" data-i18n="Connecting">Connecting</span><span id="workspace-status"></span><span id="route-status"></span><span id="budget-status"></span><button id="pending-button" class="small" data-i18n="Needs your decision">Needs your decision</button></div>
+      <footer id="workspace-footer" class="bottom">
+        <div id="task-composer"><div id="composer-host"></div></div>
+        <div class="statusbar"><span id="workspace-status"></span><span id="route-status"></span><span id="budget-status"></span></div>
       </footer>
+      <button id="pending-button" class="pending-notice small" hidden data-i18n="Needs your decision">Needs your decision</button>
+      <button id="drawer-backdrop" class="drawer-backdrop" tabindex="-1" aria-label="Close drawers" data-i18n-aria="Close drawers" hidden></button>
     </div>
+    <dialog id="settings-modal" aria-labelledby="settings-title">
+      <div class="dialog-head"><h2 id="settings-title" data-i18n="Settings">Settings</h2><button id="settings-close" class="icon-button" data-i18n="Close">Close</button></div>
+      <div id="settings-host"></div>
+    </dialog>
     <dialog id="modal" aria-labelledby="modal-title">
       <div class="dialog-head"><h2 id="modal-title"></h2><button id="modal-close" data-i18n="Close">Close</button></div>
       <div id="modal-body" class="dialog-body"></div>

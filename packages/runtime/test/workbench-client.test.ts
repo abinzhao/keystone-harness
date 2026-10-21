@@ -345,6 +345,7 @@ function domFixture() {
     setAttribute(key: string, value: string) { this.attributes[key] = value; if (key === "id" || key === "value") this[key] = value; },
     getAttribute(key: string) { return this.attributes[key] ?? null; },
     append(...children: any[]) { this.children.push(...children); },
+    prepend(...children: any[]) { this.children.unshift(...children); },
     replaceChildren(...children: any[]) { this.children = children; },
     handlers: {} as Record<string, (event: any) => void>,
     addEventListener(kind: string, handler: any) { this.handlers[kind] = handler; },
@@ -555,13 +556,282 @@ test("write startup preserves the server's refuse, automatic and confirmation gr
         },
       });
       await host.children[0].onsubmit({ preventDefault() {} });
-      assert.equal(calls[0].path, "/v1/contract/preview");
+      assert.ok(calls.some((call) => call.path === "/v1/contract/preview"));
       const started = calls.find((call) => call.path === "/v1/tasks");
       assert.equal(!!started, grade !== "refuse");
       assert.equal(confirmations, grade === "confirm" ? 1 : 0);
       if (started) assert.equal(JSON.parse(started.init.body).startMode, grade === "auto_start" ? "auto" : "confirmed");
       composer.dispose();
     }
+  } finally { globals.document = original; }
+});
+
+test("an imported draft is submitted as the same task and keeps its recorded request immutable", async () => {
+  const { createComposer } = await moduleAt("views/composer.js");
+  const { createDraftStore } = await moduleAt("state/drafts.js");
+  const fixture = domFixture();
+  const globals = globalThis as typeof globalThis & { document?: any };
+  const original = globals.document; globals.document = fixture.document;
+  try {
+    const drafts = createDraftStore(null);
+    const state = {
+      projectId: "proj_one",
+      taskId: "task_imported",
+      projects: [{ projectId: "proj_one", rootPath: "/fixture" }],
+      detail: { status: "draft", request: "Review imported work independently", attachments: [] },
+      run: null,
+    };
+    const calls: any[] = [];
+    let navigated = "";
+    const host = fixture.create();
+    const composer = createComposer(host, {
+      client: { state, selectionVersion: 1, subscribe: () => () => {} },
+      drafts,
+      dialogs: { confirm: async () => true },
+      getSettings: () => null,
+      getEgress: () => [{ role: "builder", modelId: "local", local: true, endpointHost: "offline" }],
+      referencePicker() {},
+      afterStart: async (taskId: string) => { navigated = taskId; },
+      request: async (path: string, init: any = {}) => {
+        calls.push({ path, init });
+        return path === "/v1/contract/preview"
+          ? { risk: { decision: "auto_start" }, contract: { goal: state.detail.request } }
+          : { taskId: "task_imported" };
+      },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(host.querySelector("#composer-operation").value, "draft");
+    assert.equal(host.querySelector("#composer-input").value, state.detail.request);
+    assert.equal(host.querySelector("#composer-input").readOnly, true);
+    await host.children[0].onsubmit({ preventDefault() {} });
+    const start = calls.find((entry) => entry.path === "/v1/tasks/task_imported/start");
+    assert.ok(start, "the existing draft must use its dedicated start endpoint");
+    const body = JSON.parse(start.init.body);
+    assert.equal(body.request, undefined);
+    assert.equal(body.attachmentIds, undefined);
+    assert.equal(calls.some((entry) => entry.path === "/v1/tasks"), false);
+    assert.equal(navigated, "task_imported");
+    composer.dispose();
+  } finally { globals.document = original; }
+});
+
+test("changing imported draft permissions invalidates both a pending preview and pending confirmation", async () => {
+  const { createComposer } = await moduleAt("views/composer.js");
+  const { createDraftStore } = await moduleAt("state/drafts.js");
+  const globals = globalThis as typeof globalThis & { document?: any };
+  const original = globals.document;
+  try {
+    for (const phase of ["preview", "confirmation"]) {
+      for (const [selector, changed] of [
+        ["#composer-commands", "node, git"], ["#composer-write", "other/**"], ["select", "read"],
+      ]) {
+        const fixture = domFixture(); globals.document = fixture.document;
+        const drafts = createDraftStore(null);
+        drafts.set("proj_one", "task_imported", { access: "write", writePaths: "src/**", allowedCommands: "node" });
+        const state = { projectId: "proj_one", taskId: "task_imported",
+          projects: [{ projectId: "proj_one", rootPath: "/fixture" }],
+          detail: { status: "draft", request: "Review imported source" }, run: null };
+        const preview = deferred(); const confirmation = deferred();
+        const calls: any[] = [];
+        const host = fixture.create();
+        const composer = createComposer(host, {
+          client: { state, selectionVersion: 1, subscribe: () => () => {} }, drafts,
+          dialogs: { confirm: () => confirmation.promise }, getSettings: () => null,
+          referencePicker() {}, afterStart: async () => {},
+          request: async (path: string, init: any = {}) => {
+            calls.push({ path, init });
+            return path === "/v1/contract/preview" ? preview.promise : { taskId: "task_imported" };
+          },
+        });
+        await new Promise((resolve) => setImmediate(resolve));
+        const submission = host.children[0].onsubmit({ preventDefault() {} });
+        if (phase === "confirmation") {
+          preview.resolve({ risk: { decision: "confirm" }, contract: {}, allowedCommands: ["node"] });
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+        const control = selector === "select"
+          ? fixture.walk(host).find((entry) => entry.attributes["aria-label"] === "Task access")
+          : host.querySelector(selector);
+        assert.ok(control); control.value = changed;
+        preview.resolve({ risk: { decision: "confirm" }, contract: {}, allowedCommands: ["node"] });
+        confirmation.resolve(true); await submission;
+        assert.equal(calls.some((entry) => entry.path.endsWith("/start")), false, `${phase}: ${selector} must invalidate consent`);
+        assert.equal(drafts.get("proj_one", "task_imported").request, state.detail.request);
+        composer.dispose();
+      }
+    }
+  } finally { globals.document = original; }
+});
+
+test("the composer converts an unsupported local file through a reviewed processor before adding it", async () => {
+  const { createComposer } = await moduleAt("views/composer.js");
+  const { createDraftStore } = await moduleAt("state/drafts.js");
+  const fixture = domFixture();
+  const globals = globalThis as typeof globalThis & { document?: any; FileReader?: any };
+  const originalDocument = globals.document;
+  const originalReader = globals.FileReader;
+  globals.document = fixture.document;
+  globals.FileReader = class {
+    result = "data:application/pdf;base64,YWJj";
+    onload: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    readAsDataURL() { queueMicrotask(() => this.onload?.()); }
+    abort() {}
+  };
+  try {
+    const drafts = createDraftStore(null);
+    const state = {
+      projectId: "proj_one",
+      taskId: null,
+      projects: [{ projectId: "proj_one", rootPath: "/fixture" }],
+      run: null,
+    };
+    const calls: any[] = [];
+    const reviews: string[] = [];
+    const host = fixture.create();
+    const composer = createComposer(host, {
+      client: { state, selectionVersion: 1, subscribe: () => () => {} },
+      drafts,
+      dialogs: {
+        confirm: async (_title: string, content: any) => {
+          reviews.push(content.textContent);
+          return true;
+        },
+      },
+      getSettings: () => null,
+      getEgress: () => [{ role: "builder", modelId: "local", local: true, endpointHost: "offline" }],
+      referencePicker() {},
+      afterStart: async () => {},
+      request: async (path: string, init: any = {}) => {
+        calls.push({ path, init });
+        if (path.startsWith("/v1/input-processors?")) return {
+          localOnly: true,
+          autoSubmit: false,
+          processors: [{
+            name: "local-pdf",
+            kind: "document",
+            available: true,
+            detail: "Reviewed local PDF parser",
+            mimeTypes: ["application/pdf"],
+            maxInputBytes: 1024,
+            processor: { name: "local-pdf", version: "1.0.0", extensionName: "pdf-reader", reviewHash: "review" },
+          }],
+        };
+        if (path === "/v1/input-processors/process") return {
+          attachment: {
+            attachmentId: "attachment.0123456789abcdef0123456789abcdef",
+            name: "report.pdf.processed.txt",
+            kind: "text",
+            status: "ready",
+            size: 12,
+            contentHash: "processed-hash",
+          },
+          text: "reviewed text",
+          requiresReview: true,
+          autoSubmit: false,
+          source: { name: "report.pdf", contentHash: "source-hash" },
+          processor: { name: "local-pdf", version: "1.0.0" },
+        };
+        return { attachments: [] };
+      },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    await composer.importFiles([{ name: "report.pdf", type: "application/pdf", size: 3 }]);
+    const processed = calls.find((entry) => entry.path === "/v1/input-processors/process");
+    assert.deepEqual(JSON.parse(processed.init.body), {
+      projectId: "proj_one",
+      processorName: "local-pdf",
+      confirmed: true,
+      raw: { name: "report.pdf", mimeType: "application/pdf", data: "YWJj" },
+    });
+    assert.ok(reviews.some((entry) => /reviewed text/.test(entry)));
+    assert.deepEqual(drafts.get("proj_one", null).attachmentIds,
+      ["attachment.0123456789abcdef0123456789abcdef"]);
+    assert.equal(calls.some((entry) => entry.path === "/v1/tasks"), false);
+    composer.dispose();
+  } finally {
+    globals.document = originalDocument;
+    globals.FileReader = originalReader;
+  }
+});
+
+test("the composer restores processor configuration after confirmation and rejects stale project selections", async () => {
+  const { createComposer } = await moduleAt("views/composer.js");
+  const { createDraftStore } = await moduleAt("state/drafts.js");
+  const fixture = domFixture();
+  const globals = globalThis as typeof globalThis & { document?: any };
+  const original = globals.document; globals.document = fixture.document;
+  try {
+    const calls: any[] = [];
+    let opened: { content: any; actions: any[] } | undefined;
+    let confirm: (() => void) | undefined;
+    const state = { projectId: "proj_one", taskId: null, projects: [{ projectId: "proj_one", rootPath: "/fixture" }], run: null };
+    const host = fixture.create();
+    const composer = createComposer(host, {
+      client: {
+        state,
+        selectionVersion: 1,
+        subscribe: () => () => {},
+      },
+      drafts: createDraftStore(null),
+      dialogs: {
+        open: (_title: string, content: any, actions: any[]) => { opened = { content, actions }; },
+        close() {},
+        confirm: () => {
+          opened = undefined;
+          return new Promise((resolve) => { confirm = () => resolve(true); });
+        },
+      },
+      getSettings: () => null,
+      referencePicker() {},
+      afterStart: async () => {},
+      request: async (path: string, init: any = {}) => {
+        calls.push({ path, init });
+        if (path.startsWith("/v1/input-processors?")) return { processors: [], localOnly: true, autoSubmit: false };
+        if (path === "/v1/extensions") return { extensions: [{
+          manifest: { name: "pdf-reader", version: "1.0.0", kind: "tool", capabilities: ["fs.read"] },
+          lifecycleStatus: "active",
+          reviewHash: "a".repeat(64),
+        }] };
+        if (path === "/v1/input-processors/configure") return { configured: true };
+        return {};
+      },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const manage = fixture.walk(host).find((entry) => entry.textContent === "Input processors");
+    assert.ok(manage);
+    manage.click();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(opened);
+    opened.content.querySelector("#processor-name").value = "local-pdf";
+    opened.content.querySelector("#processor-mimes").value = "application/pdf";
+    const configure = opened.actions.find((entry) => entry.textContent === "Configure processor");
+    configure.click();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(opened, undefined, "the confirmation replaces the original form");
+    confirm!();
+    await new Promise((resolve) => setImmediate(resolve));
+    const configured = calls.find((entry) => entry.path === "/v1/input-processors/configure");
+    assert.deepEqual(JSON.parse(configured.init.body), {
+      projectId: "proj_one",
+      name: "local-pdf",
+      kind: "document",
+      extensionName: "pdf-reader",
+      mimeTypes: ["application/pdf"],
+      reviewHash: "a".repeat(64),
+      confirmed: true,
+    });
+    const restored = opened as { content: any; actions: any[] } | undefined;
+    assert.ok(restored, "save feedback must return to a visible processor form");
+    assert.match(restored.content.textContent, /Processor mapping saved for this project/);
+    configure.click();
+    await new Promise((resolve) => setImmediate(resolve));
+    state.projectId = "proj_two";
+    confirm!();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls.filter((entry) => entry.path === "/v1/input-processors/configure").length, 1,
+      "a confirmation belonging to another project cannot write a mapping");
+    composer.dispose();
   } finally { globals.document = original; }
 });
 

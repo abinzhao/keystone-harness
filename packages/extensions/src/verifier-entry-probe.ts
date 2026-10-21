@@ -169,6 +169,7 @@ export function verifierEntryShapeProbe(options: {
 export interface IsolatedProbeLimits {
   readonly timeoutMs?: number;
   readonly maxOutputBytes?: number;
+  readonly signal?: AbortSignal;
 }
 
 /** Fixed upper bounds cannot be enlarged by a manifest or caller. */
@@ -212,6 +213,7 @@ export function isolatedVerifierEntryShapeProbe(options: IsolatedProbeLimits & {
     blocking: true,
     detail: "inspects the copied verifier export in a bounded child, never in the host",
     async run() {
+      options.signal?.throwIfAborted();
       const limits = probeLimits(options);
       const here = dirname(fileURLToPath(import.meta.url));
       const packages = resolve(here, "../..");
@@ -258,6 +260,9 @@ export function isolatedVerifierEntryShapeProbe(options: IsolatedProbeLimits & {
           failure = "verifier entry probe timed out";
           kill();
         }, limits.timeoutMs);
+        const onAbort = () => { failure = "verifier entry probe cancelled"; kill(); };
+        options.signal?.addEventListener("abort", onAbort, { once: true });
+        if (options.signal?.aborted) onAbort();
         for (const [index, stream] of child.stdio.entries()) {
           if (index < 1 || stream === null || stream === undefined) continue;
           stream.on("data", (chunk: Buffer) => {
@@ -271,6 +276,7 @@ export function isolatedVerifierEntryShapeProbe(options: IsolatedProbeLimits & {
         child.on("error", () => { failure = "could not launch verifier entry probe"; });
         child.once("close", (code) => {
           clearTimeout(timer);
+          options.signal?.removeEventListener("abort", onAbort);
           // Kill any remaining group members before removing the workspace.
           kill();
           if (failure !== undefined || code !== 0) {

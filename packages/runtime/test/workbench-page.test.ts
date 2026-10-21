@@ -43,7 +43,7 @@ test("responsive drawers preserve navigation and support themes, density and red
 test("catalog markers cover the shell and no inline execution remains", async () => {
   const html = await read("workbench.html");
   assert.match(html, /data-i18n="Projects"/);
-  assert.match(html, /data-i18n="Tasks"/);
+  assert.match(html, /data-i18n(?:-aria)?="Tasks"/);
   assert.match(html, /data-i18n="Settings"/);
   assert.doesNotMatch(html, /onclick=|<script>(?!<\/script>)/);
 });
@@ -55,6 +55,26 @@ test("onboarding retains native password entry and all four protocol choices", a
   for (const protocol of ["openai-chat", "openai-responses", "anthropic-messages", "gemini-generate"]) {
     assert.ok(html.includes(`value="${protocol}"`), protocol);
   }
+});
+
+test("reference shell has full-height brand navigation, centered welcome and modal settings", async () => {
+  const html = await read("workbench.html");
+  const sidebar = html.slice(html.indexOf('<aside id="sidebar"'), html.indexOf('id="sidebar-resize"'));
+  assert.match(sidebar, /class="brand"/);
+  assert.match(sidebar, /id="new-task"/);
+  assert.match(sidebar, /id="connection"/);
+  for (const view of ["extensions", "cognition", "lab", "collaboration", "readiness"]) {
+    assert.ok(sidebar.includes(`data-page="${view}"`), view);
+  }
+  assert.match(html, /id="welcome"/);
+  assert.match(html, /<dialog id="settings-modal" aria-labelledby="settings-title"/);
+  assert.match(html, /id="settings-host"/);
+  const css = await read("styles/workbench.css");
+  assert.match(css, /--sidebar: 27[0-9]px/);
+  assert.match(css, /max-width: 900px/);
+  assert.match(css, /grid-row: 1 \/ -1/);
+  assert.match(css, /\.app\.welcome/);
+  assert.match(css, /\.theme-tiles/);
 });
 
 test("every literal workbench presentation key has a Chinese catalog entry", async () => {
@@ -72,6 +92,16 @@ test("every literal workbench presentation key has a Chinese catalog entry", asy
     const tree = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
     const visit = (node: ts.Node) => {
       if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && helpers.has(node.expression.text) && node.arguments[0]) collect(node.arguments[0]);
+      if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && ts.isIdentifier(node.expression.expression) && node.expression.expression.text === "dialogs") {
+        if (node.arguments[0]) collect(node.arguments[0]);
+        if (node.expression.name.text === "prompt" && node.arguments[1]) collect(node.arguments[1]);
+      }
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "emptyProjection" && node.arguments[3]) collect(node.arguments[3]);
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "servicePage" && node.arguments[1] && ts.isObjectLiteralExpression(node.arguments[1])) {
+        for (const property of node.arguments[1].properties) {
+          if (ts.isPropertyAssignment(property) && ts.isIdentifier(property.name) && ["title", "description"].includes(property.name.text)) collect(property.initializer);
+        }
+      }
       if (ts.isArrayLiteralExpression(node) && ts.isArrayLiteralExpression(node.parent) && node.elements[1] && ts.isStringLiteral(node.elements[1]) && /^[A-Z]/.test(node.elements[1].text)) keys.add(node.elements[1].text);
       if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === "EVENTS" && node.initializer && ts.isObjectLiteralExpression(node.initializer)) {
         for (const property of node.initializer.properties) if (ts.isPropertyAssignment(property)) collect(property.initializer);

@@ -4,5 +4,8 @@ export * from "./verifier-entry-probe.ts";
 export * from "./activation.ts";
 export * from "./registry.ts";
 export * from "./manager.ts";
+export * from "./service.ts";
+export * from "./task-host.ts";
+export * from "./lab.ts";
 export * from "./mcp/index.ts";
 export * from "./skills/index.ts";

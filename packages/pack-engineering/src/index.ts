@@ -22,3 +22,5 @@
 export * from "./scan/workspace.ts";
 export * from "./contract/compile.ts";
 export * from "./lease/resolve.ts";
+export * from "./cognition/scan.ts";
+export * from "./cognition/parser.ts";

@@ -27,7 +27,6 @@ import {
   type ExperienceEvaluation,
   type ProjectFact,
   type ProvenanceRef,
-  type TransferOutcome,
 } from "@keystone/schemas";
 
 /** What a finished run can teach. */
@@ -90,6 +89,7 @@ function topLevelScope(paths: readonly string[]): string[] {
  * is the lesson that stops the same wrong patch being proposed again.
  */
 export async function learnFromRun(input: RunLearningInput): Promise<LearningOutcome> {
+  bindLearningEvents(input.firewall, input.session);
   const candidates: ExperienceCandidate[] = [];
   const promoted: ExperienceEntry[] = [];
   const skipped: { statement: string; reason: string }[] = [];
@@ -131,7 +131,6 @@ export async function learnFromRun(input: RunLearningInput): Promise<LearningOut
       supportingEvidenceIds: evidenceIds,
       note: `derived from a proven run of "${input.goal}"`,
     });
-    await input.session.recordExperienceCandidate(candidate);
     candidates.push(candidate);
 
     const verdict = input.firewall.evaluatePromotion(candidate);
@@ -140,7 +139,6 @@ export async function learnFromRun(input: RunLearningInput): Promise<LearningOut
       return;
     }
     const entry = await input.firewall.promote(candidate.candidateId, verdict.basis);
-    await input.session.recordExperiencePromotion(entry);
     promoted.push(entry);
   };
 
@@ -202,17 +200,15 @@ export interface ExperienceJudgement {
 /**
  * Judge how the entries a run used actually behaved.
  *
- * This is deliberately blunt: there is no counterfactual branch here, so the
- * verdict is "the entry was in context and the run succeeded / failed". A real
- * positive-transfer measurement needs a control run, which is the evaluation
- * harness (PRD 13.2) — the CLI has `--control`-shaped space for it later, and
- * until then reporting `not_evaluable` is better than inventing a number.
+ * Task evidence describes the run, not the causal effect of an individual
+ * entry. Without an entry-attributed observation or a controlled comparison,
+ * neither success nor failure establishes transfer (PRD LE-03, 13.2).
  */
 export async function judgeExperienceUse(
   input: ExperienceJudgementInput,
 ): Promise<ExperienceJudgement> {
+  bindLearningEvents(input.firewall, input.session);
   const evaluations: ExperienceEvaluation[] = [];
-  const demoted: { entryId: string; reason: string }[] = [];
   const notes: string[] = [];
 
   const judgeEvidenceIds = input.evidence
@@ -229,52 +225,38 @@ export async function judgeExperienceUse(
           ),
     );
 
-    let outcome: TransferOutcome;
     let detail: string;
     if (!scopeTouched) {
-      outcome = "not_evaluable";
       detail =
         "the run changed nothing inside the entry's applicability, so this usage says nothing about the entry";
-      notes.push(`${entry.entryId}: ${detail}`);
-    } else if (input.proven) {
-      outcome = "positive_transfer";
-      detail = "the entry was in context and the task reached proven with the entry's scope modified";
     } else {
-      outcome = "negative_transfer";
-      detail = "the entry was in context, its scope was modified, and the task did not prove out";
+      detail = `the entry was in context and its scope was modified; the task ${input.proven ? "reached proven" : "did not reach proven"}, but no entry-attributed causal evidence or control run is available`;
     }
+    notes.push(`${entry.entryId}: ${detail}`);
 
     const evaluation = await input.firewall.recordEvaluation({
       entryId: entry.entryId,
       taskId: input.session.taskId,
       used: true,
-      outcome,
+      outcome: "not_evaluable",
       judgeEvidenceIds,
       detail,
     });
-    await input.session.recordExperienceEvaluation(evaluation);
     evaluations.push(evaluation);
-
-    if (outcome === "negative_transfer") {
-      // A demotion is immediate: waiting for a threshold means the next task
-      // gets the same bad advice (PRD LE-04).
-      const result = await input.firewall.demote(
-        entry.entryId,
-        "caused_verification_failure",
-        detail,
-      );
-      await input.session.recordExperienceDemotion({
-        entryId: entry.entryId,
-        reason: "caused_verification_failure",
-        detail,
-        affectedTaskIds: [...result.affectedTaskIds],
-      });
-      demoted.push({ entryId: entry.entryId, reason: "caused_verification_failure" });
-      notes.push(`${entry.entryId}: demoted because the run did not prove out`);
-    }
   }
 
-  return { evaluations, demoted, notes };
+  return { evaluations, demoted: [], notes };
+}
+
+function bindLearningEvents(firewall: ExperienceFirewall, session: KernelSession): void {
+  firewall.bindCommit(async (event) => {
+    switch (event.type) {
+      case "experience.candidate_created": return session.recordExperienceCandidate(event.value);
+      case "experience.promoted": return session.recordExperiencePromotion(event.value);
+      case "experience.evaluated": return session.recordExperienceEvaluation(event.value);
+      case "experience.demoted": return session.recordExperienceDemotion(event.value);
+    }
+  });
 }
 
 /** Project facts that are worth re-checking after a run touched the workspace. */

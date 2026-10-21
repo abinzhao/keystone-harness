@@ -32,3 +32,4 @@ export * from "./schemas/agent.ts";
 export * from "./schemas/events.ts";
 export * from "./schemas/attachment.ts";
 export * from "./schemas/workbench.ts";
+export * from "./schemas/run-binding.ts";

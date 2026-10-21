@@ -115,9 +115,9 @@ export function renderCallOutput(result: ToolsCallResult): {
   readonly text: string;
   readonly isError: boolean;
 } {
-  const blocks = result.content ?? [];
+  const blocks = Array.isArray(result?.content) ? result.content : [];
   const text = blocks
-    .filter((block) => typeof block.text === "string")
+    .filter((block) => typeof block === "object" && block !== null && typeof block.text === "string")
     .map((block) => block.text as string)
     .join("\n");
   return { text, isError: result.isError === true };

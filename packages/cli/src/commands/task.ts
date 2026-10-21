@@ -18,10 +18,8 @@ import { open as openFile, readFile } from "node:fs/promises";
 
 import type { Translator } from "@keystone/i18n";
 import {
-  canResume,
   compareBranches,
   defaultEnvelope,
-  describeRecovery,
   KernelSession,
   listBranches,
   projectIdForWorkspace,
@@ -37,7 +35,6 @@ import {
   type ModelAdapter,
   type ModelRole,
 } from "@keystone/models";
-import { scanWorkspace } from "@keystone/pack-engineering";
 import { KeystoneRuntime, type RunMode } from "@keystone/runtime";
 import {
   autonomyEnvelopeSchema,
@@ -706,7 +703,7 @@ async function runResume(argv: readonly string[], context: CliContext): Promise<
   const t = translatorForContext(context);
   const args = parseArgs(argv, {
     positionals: ["taskId"],
-    flags: { json: "boolean", verbose: "boolean" },
+    flags: { json: "boolean", verbose: "boolean", branch: "string", "scripted-fixture": "string", mode: "string" },
   });
   const output = createOutput({
     stdout: context.stdout,
@@ -718,59 +715,28 @@ async function runResume(argv: readonly string[], context: CliContext): Promise<
   if (taskIdValue === undefined) return 2;
 
   const paths = pathsFor(context);
-  const session = await openSession(context, taskIdValue);
-  const checkpoint = await session.requestResume();
-  output.detail(t("resuming from checkpoint {checkpointId}", { checkpointId: checkpoint.checkpointId }));
-
-  const root = await readWorkspaceRoot(paths, session.projectId);
-  if (root === undefined) {
-    output.error(
-      t("cannot resume: the task's workspace root is unknown (project record is missing)"),
-    );
-    return 1;
+  const config = await loadConfig({ configFile: paths.configFile });
+  const fixturePath = getString(args, "scripted-fixture");
+  let models: ModelAdapter[];
+  let routes: Partial<Record<ModelRole, readonly string[]>>;
+  if (fixturePath) {
+    const fixture = JSON.parse(await readFile(fixturePath, "utf8")) as { responses?: string[] } | string[];
+    const responses = Array.isArray(fixture) ? fixture : fixture.responses;
+    if (!responses?.length) throw new UsageError("scripted fixture requires responses");
+    const id = "scripted";
+    models = [createSequenceAdapter({ descriptor: scriptedModelDescriptor({ id }), responses })];
+    routes = { builder: [id], planner: [id], summarizer: [id] };
+  } else {
+    models = enabledModels(config).map((entry) => buildAdapter(entry, credentialsFor(context)));
+    routes = { builder: routeFor(config, "builder"), planner: routeFor(config, "planner"), summarizer: routeFor(config, "summarizer") };
   }
-
-  const snapshot = await scanWorkspace(root);
-  const assessment = await session.recover({
-    workspaceFingerprint: snapshot.fingerprint,
-    ...(snapshot.headCommit === undefined ? {} : { currentHeadCommit: snapshot.headCommit }),
-  });
-
-  output.section(t("Recovery"));
-  output.line(describeRecovery(assessment));
-  // Recording the outcome is what moves the task out of `resuming`; the status
-  // it lands on is the assessment's, never a hopeful default (PRD EX-04, 10).
-  await session.completeRecovery(assessment);
-
-  if (!canResume(assessment)) {
-    output.section(t("Affected by the change"));
-    for (const path of assessment.changedPaths) output.line(`  ${t("changed: {path}", { path })}`);
-    if (assessment.invalidatedEvidenceIds.length > 0) {
-      output.line(
-        `  ${t("invalidated evidence: {ids}", { ids: assessment.invalidatedEvidenceIds.join(", ") })}`,
-      );
-    }
-    if (assessment.invalidatedFactIds.length > 0) {
-      output.line(`  ${t("invalidated facts: {ids}", { ids: assessment.invalidatedFactIds.join(", ") })}`);
-    }
-    output.error(t("The task cannot resume automatically and remains in needs_attention."));
-    output.json({
-      taskId: taskIdValue,
-      resumable: false,
-      status: session.state().status,
-      assessment,
-    });
-    return 3;
-  }
-
-  output.line(
-    t('task {taskId} resumed; status is now "{status}"', {
-      taskId: taskIdValue,
-      status: session.state().status,
-    }),
-  );
-  output.json({ taskId: taskIdValue, resumable: true, status: session.state().status, assessment });
-  return 0;
+  const mode = getString(args, "mode") ?? "standard";
+  if (!RUN_MODES.includes(mode as RunMode)) throw new UsageError("unsupported resume mode");
+  const runtime = await KeystoneRuntime.create({ paths, models, routes, mode: mode as RunMode });
+  const result = await runtime.resumeTask(taskIdValue, {}, getString(args, "branch"));
+  output.line(result.summary);
+  output.json(result);
+  return exitCodeForTask(result.status, result.interventions.length);
 }
 
 async function runBranch(argv: readonly string[], context: CliContext): Promise<number> {

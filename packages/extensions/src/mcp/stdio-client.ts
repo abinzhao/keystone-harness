@@ -5,7 +5,7 @@
  * spawn boundary (`resolveSpawnTarget` + `sanitizeEnv`), speaks the fixed MCP
  * handshake over newline-delimited stdio, and exposes `tools/list` /
  * `tools/call`. It owns the child's lifecycle: handshake and per-call timeouts,
- * a bounded restart on crash, and a process-group kill on stop.
+ * no automatic tool-call retry, and a process-group kill on stop.
  *
  * Governance, not convenience, shapes this file:
  *  - the child gets a sanitized, allowlisted environment — never the parent's
@@ -18,6 +18,7 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { resolve } from "node:path";
+import { contentHash } from "@keystone/schemas";
 
 import { sanitizeEnv } from "@keystone/tools";
 import { resolveSpawnTarget } from "@keystone/spawn";
@@ -87,6 +88,7 @@ interface Pending {
   readonly resolve: (response: JsonRpcResponse) => void;
   readonly reject: (error: Error) => void;
   readonly timer: NodeJS.Timeout;
+  readonly cleanup: () => void;
 }
 
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
@@ -115,7 +117,6 @@ export class McpSession {
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
   private stdoutBuffer = "";
-  private restarts = 0;
   private closed = true;
   private closedListeners: Array<(code: number | null) => void> = [];
 
@@ -134,8 +135,14 @@ export class McpSession {
     };
   }
 
+  /** Binds command arguments, cwd and declared environment without disclosing it. */
+  get launchDigest(): string {
+    return contentHash({ command: this.command, args: this.options.args, cwd: resolve(this.options.cwd), env: this.options.env });
+  }
+
   /** Spawn the child and complete the MCP handshake. */
   async start(): Promise<{ readonly serverInfo: { name: string; version: string } }> {
+    if (this.state === "ready" || this.state === "starting") throw new McpHandshakeError("session already started");
     this.state = "starting";
     this.spawnChild();
     try {
@@ -156,7 +163,13 @@ export class McpSession {
 
   private spawnChild(): void {
     const target = resolveSpawnTarget(this.command, this.options.args);
-    const env = sanitizeEnv(process.env, this.options.env);
+    const env = sanitizeEnv({}, this.options.env);
+    for (const key of Object.keys(env)) {
+      if (/^(?:NODE_|LD_|DYLD_|BASH_ENV$|ENV$)/i.test(key)) delete env[key];
+    }
+    env.PATH = process.env.PATH ?? "";
+    if (process.platform === "win32" && process.env.SystemRoot !== undefined) env.SystemRoot = process.env.SystemRoot;
+    this.stdoutBuffer = "";
     this.closed = false;
     this.child = spawn(target.command, [...target.args], {
       cwd: resolve(this.options.cwd),
@@ -170,6 +183,18 @@ export class McpSession {
     this.child.stdout?.setEncoding("utf8");
     this.child.stdout?.on("data", (chunk: string) => this.onStdout(chunk));
     this.child.stderr?.setEncoding("utf8");
+    // Drain, never retain or log server diagnostics that may contain secrets.
+    let stderrBytes = 0;
+    this.child.stderr?.on("data", (chunk: string) => {
+      stderrBytes += Buffer.byteLength(chunk);
+      if (stderrBytes > this.options.maxFrameBytes) {
+        this.failPending(new McpProtocolError("MCP diagnostics exceeded output limit", "mcp_oversized_frame"));
+        void this.stop();
+      }
+    });
+    this.child.stdin.on("error", () => {
+      this.failPending(new McpProtocolError("MCP input closed", "mcp_exited"));
+    });
 
     this.child.on("error", () => {
       // A spawn failure (ENOENT, permission) surfaces as a closed session.
@@ -192,10 +217,16 @@ export class McpSession {
     while (newline !== -1) {
       const line = this.stdoutBuffer.slice(0, newline);
       this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
+      if (Buffer.byteLength(line) > this.options.maxFrameBytes) {
+        this.failPending(new McpProtocolError("MCP server emitted an oversized frame", "mcp_oversized_frame"));
+        this.stdoutBuffer = "";
+        void this.stop();
+        return;
+      }
       this.dispatchLine(line);
       newline = this.stdoutBuffer.indexOf("\n");
     }
-    if (this.stdoutBuffer.length > this.options.maxFrameBytes) {
+    if (Buffer.byteLength(this.stdoutBuffer) > this.options.maxFrameBytes) {
       // A server that streams an unbounded line with no newline is hostile or
       // broken: refuse the session rather than grow memory.
       this.stdoutBuffer = "";
@@ -217,6 +248,7 @@ export class McpSession {
     const pending = this.pending.get(message.id);
     if (pending === undefined) return; // unsolicited; cannot be acted on
     clearTimeout(pending.timer);
+    pending.cleanup();
     this.pending.delete(message.id);
     pending.resolve(message);
   }
@@ -235,6 +267,11 @@ export class McpSession {
       throw new McpHandshakeError(`initialize rejected: ${response.error.message}`);
     }
     const result = (response.result ?? {}) as InitializeResult;
+    if (result.protocolVersion !== MCP_PROTOCOL_VERSION ||
+        typeof result.serverInfo?.name !== "string" || typeof result.serverInfo.version !== "string" ||
+        result.serverInfo.name.length > 256 || result.serverInfo.version.length > 128) {
+      throw new McpHandshakeError("initialize response is malformed or uses an incompatible protocol version");
+    }
     // Notification, fire-and-forget; no response expected.
     this.write({ jsonrpc: "2.0", method: "notifications/initialized" });
     return result;
@@ -247,12 +284,15 @@ export class McpSession {
       throw new McpProtocolError(`tools/list failed: ${response.error.message}`, "mcp_tools_list");
     }
     const result = (response.result ?? {}) as { tools?: readonly McpTool[] };
+    if (!Array.isArray(result.tools) || result.tools.length > 512) {
+      throw new McpProtocolError("tools/list result is malformed or exceeds tool limit", "mcp_tools_list");
+    }
     return (result.tools ?? []).filter(
       (tool) => typeof tool === "object" && tool !== null && typeof tool.name === "string",
     );
   }
 
-  /** Call one advertised tool, with a bounded timeout and a bounded restart. */
+  /** Never replay an irreversible call, including on timeout or server errors. */
   async callTool(
     name: string,
     args: Record<string, unknown>,
@@ -262,13 +302,9 @@ export class McpSession {
     try {
       return await this.callOnce(name, args, timeoutMs, options.signal);
     } catch (error) {
-      // A transient crash: restart and retry exactly once, within budget.
-      if (this.restarts >= this.options.maxRestarts) throw error;
-      this.restarts += 1;
-      this.state = "restarting";
-      await this.killChild();
-      await this.start();
-      return await this.callOnce(name, args, timeoutMs, options.signal);
+      if (error instanceof McpTimeoutError ||
+          (error instanceof McpProtocolError && error.code === "mcp_aborted")) await this.stop();
+      throw error;
     }
   }
 
@@ -278,6 +314,8 @@ export class McpSession {
     timeoutMs: number,
     signal?: AbortSignal,
   ): Promise<ToolsCallResult> {
+    if (this.state !== "ready") throw new McpProtocolError("MCP session is not ready", "mcp_stopped");
+    signal?.throwIfAborted();
     const response = await this.request(
       "tools/call",
       { name, arguments: args },
@@ -285,7 +323,7 @@ export class McpSession {
       signal,
     );
     if (response.error !== undefined) {
-      throw new McpProtocolError(`tools/call "${name}" failed: ${response.error.message}`, "mcp_tools_call");
+      throw new McpProtocolError("MCP tools/call was rejected", "mcp_tools_call");
     }
     return (response.result ?? {}) as ToolsCallResult;
   }
@@ -299,8 +337,18 @@ export class McpSession {
     const id = this.nextId++;
     const limit = timeoutMs ?? this.options.callTimeoutMs;
     return new Promise<JsonRpcResponse>((resolve, reject) => {
+      const cleanup = () => signal?.removeEventListener("abort", onAbort);
+      const onAbort = () => {
+        clearTimeout(timer);
+        cleanup();
+        this.pending.delete(id);
+        // Cancellation is advisory on the wire; stopping the child is the bound.
+        this.write({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id, reason: "cancelled" } });
+        reject(new McpProtocolError("call aborted", "mcp_aborted"));
+      };
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        cleanup();
         reject(new McpTimeoutError(limit));
       }, limit);
       if (signal !== undefined) {
@@ -309,25 +357,30 @@ export class McpSession {
           reject(new McpProtocolError("call aborted", "mcp_aborted"));
           return;
         }
-        signal.addEventListener("abort", () => {
-          clearTimeout(timer);
-          this.pending.delete(id);
-          reject(new McpProtocolError("call aborted", "mcp_aborted"));
-        }, { once: true });
+        signal.addEventListener("abort", onAbort, { once: true });
       }
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve, reject, timer, cleanup });
       this.write({ jsonrpc: "2.0", id, method, params });
     });
   }
 
   private write(message: { readonly jsonrpc: "2.0"; readonly method: string; readonly params?: unknown } | { readonly jsonrpc: "2.0"; readonly id: number; readonly method: string; readonly params?: unknown }): void {
-    if (this.child?.stdin?.writableEnded) return;
-    this.child?.stdin?.write(encodeFrame(message));
+    const frame = encodeFrame(message);
+    if (Buffer.byteLength(frame) > this.options.maxFrameBytes) {
+      this.failPending(new McpProtocolError("outbound MCP frame exceeds limit", "mcp_oversized_frame"));
+      return;
+    }
+    if (this.child === undefined || this.child.stdin.writableEnded) {
+      this.failPending(new McpProtocolError("MCP session is closed", "mcp_stopped"));
+      return;
+    }
+    this.child.stdin.write(frame);
   }
 
   private failPending(error: Error): void {
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
+      pending.cleanup();
       pending.reject(error);
     }
     this.pending.clear();
@@ -358,6 +411,7 @@ export class McpSession {
 
   /** Stop the session and kill the whole process group. */
   async stop(): Promise<void> {
+    this.state = "stopped";
     await this.killChild();
     this.failPending(new McpProtocolError("session stopped", "mcp_stopped"));
     this.state = "stopped";

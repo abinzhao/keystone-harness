@@ -18,6 +18,7 @@
 import { validateLease } from "@keystone/kernel";
 import {
   looseObject,
+  contentHash,
   toolDescriptorSchema,
   type Capability,
   type ToolDescriptor,
@@ -40,6 +41,13 @@ export interface WrapMcpToolsInput {
    * Defaults-deny — an empty ceiling means the tools exist but refuse.
    */
   readonly capabilities: readonly Capability[];
+  /** Runtime binds the actual reviewed extension identity and checks live bytes. */
+  readonly subjectId?: string;
+  readonly assertAvailable?: () => Promise<void>;
+}
+
+export function mcpCallParameters(session: McpSession, name: string, args: Record<string, unknown>): Record<string, unknown> {
+  return { launchDigest: session.launchDigest, name, arguments: args };
 }
 
 /** Sanitize a server-supplied tool name into a stable, non-empty descriptor id. */
@@ -79,6 +87,7 @@ export function wrapMcpTools(input: WrapMcpToolsInput): readonly Tool<Record<str
       input: inputValidator,
       async run(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
         const start = Date.now();
+        await input.assertAvailable?.();
 
         // Defaults-deny: the call must present a lease that covers launching
         // this exact server. A model proposal with no lease never reaches the
@@ -86,27 +95,43 @@ export function wrapMcpTools(input: WrapMcpToolsInput): readonly Tool<Record<str
         const check = validateLease(ctx.lease, {
           capability: "cmd.exec",
           resourceValues: [input.session.command],
+          parametersHash: contentHash(mcpCallParameters(input.session, tool.name, args)),
         });
         if (!check.ok) {
           throw new ToolRefusedError(check.denial.detail, check.denial.code);
         }
+        if (ctx.lease.taskId !== ctx.taskId || ctx.lease.branchId !== ctx.branchId ||
+            ctx.lease.subject.kind !== "extension" ||
+            (input.subjectId !== undefined && ctx.lease.subject.id !== input.subjectId) ||
+            ctx.lease.constraints.parametersHash !== contentHash(mcpCallParameters(input.session, tool.name, args))) {
+          throw new ToolRefusedError("MCP call requires an extension subject and exact task/branch/launch/parameters binding", "mcp_binding_mismatch");
+        }
+        ctx.signal?.throwIfAborted();
 
-        const timeoutMs = ctx.lease.constraints.timeoutMs;
+        const timeoutMs = Math.min(ctx.lease.constraints.timeoutMs ?? 60000,
+          ctx.lease.budget.maxWallClockMs ?? 60000, Date.parse(ctx.lease.expiresAt) - Date.now());
         try {
           const result = await input.session.callTool(tool.name, args, {
             ...(timeoutMs === undefined ? {} : { timeoutMs }),
             ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
           });
           const { text, isError } = renderCallOutput(result);
+          await input.assertAvailable?.();
+          const maxBytes = Math.min(descriptor.maxOutputBytes, ctx.lease.constraints.maxOutputBytes ?? descriptor.maxOutputBytes,
+            ctx.lease.budget.maxBytes ?? descriptor.maxOutputBytes);
+          const bytes = Buffer.from(text);
           return {
             status: isError ? "failed" : "succeeded",
-            stdout: text,
-            outputBytes: Buffer.byteLength(text, "utf8"),
+            stdout: bytes.subarray(0, maxBytes).toString("utf8"),
+            outputBytes: bytes.byteLength,
             changedPaths: [],
             durationMs: Date.now() - start,
-            truncated: false,
+            truncated: bytes.byteLength > maxBytes,
           };
         } catch (error) {
+          if (ctx.signal?.aborted) return {
+            status: "cancelled", changedPaths: [], durationMs: Date.now() - start, outputBytes: 0, truncated: false,
+          };
           if (error instanceof McpTimeoutError) {
             return {
               status: "timeout",
@@ -118,7 +143,7 @@ export function wrapMcpTools(input: WrapMcpToolsInput): readonly Tool<Record<str
               errorCode: "mcp_timeout",
             };
           }
-          const message = error instanceof Error ? error.message : String(error);
+          const message = "MCP call failed; extension output remains untrusted";
           return {
             status: "failed",
             stderr: message,

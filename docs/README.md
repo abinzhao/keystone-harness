@@ -27,6 +27,8 @@ ADRs record decisions that affect kernel authority, protocol behavior, security 
 | [0011](./adr/0011-acp-mapping-and-adapter-blocker.md) | ACP mapping limitations | Proposed, blocked |
 | [0012](./adr/0012-release-candidate-boundary.md) | Release-candidate boundary | Accepted |
 | [0013](./adr/0013-risk-graded-startup-and-dirty-overlap.md) | Risk-graded startup and dirty-overlap refusal | Accepted |
+| [0014](./adr/0014-trustworthy-workbench-and-multimodal-input.md) | Workbench, settings, credentials and input boundaries | Accepted |
+| [0015](./adr/0015-continuous-runtime-and-governed-collaboration.md) | Continuous runtime, event-derived cognition and governed collaboration | Accepted for local implementation |
 
 ## Project Documents
 

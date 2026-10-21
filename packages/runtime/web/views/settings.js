@@ -55,9 +55,9 @@ export function createSettingsView(host, { request, dialogs, state, capabilities
     if (dirty && !(await dialogs.confirm("Discard settings draft", note("Reload discards only unsaved settings changes."), "Reload settings", true))) return;
     await load();
   });
-  host.replaceChildren(node("div", { class: "stack" }, [
-    node("div", { class: "row" }, [node("h2", { text: tr("Settings") }), save, reload]), status,
+  host.replaceChildren(node("div", { class: "settings-view" }, [
     node("div", { class: "settings-layout" }, [nav, content]),
+    node("div", { class: "settings-savebar" }, [status, node("div", { class: "row" }, [reload, save])]),
   ]));
   const changed = () => { editVersion += 1; dirty = true; save.disabled = saving; };
   async function load() {
@@ -100,13 +100,30 @@ export function createSettingsView(host, { request, dialogs, state, capabilities
   }
   function appearance() {
     const theme = selectField("Theme", "settings-theme", [["system", "Follow system"], ["light", "Light"], ["dark", "Dark"]], presentation.theme);
+    theme.wrap.className = "field sr-only";
+    const tiles = node("div", { class: "theme-tiles", role: "group", "aria-label": tr("Theme") });
+    const paintTiles = () => {
+      for (const item of tiles.querySelectorAll("button")) item.setAttribute("aria-pressed", String(item.getAttribute("data-theme-choice") === presentation.theme));
+    };
+    for (const [value, label] of [["light", "Light"], ["dark", "Dark"], ["system", "Follow system"]]) {
+      const tile = button(label, () => {
+        presentation.theme = value; theme.input.value = value;
+        onPresentation(presentation); changed(); paintTiles();
+      }, `theme-tile theme-${value}`);
+      tile.setAttribute("data-theme-choice", value);
+      tile.prepend(node("span", { class: "theme-preview", "aria-hidden": "true" }, [
+        node("span", { class: "theme-preview-sidebar" }), node("span", { class: "theme-preview-content" }),
+      ]));
+      tiles.append(tile);
+    }
+    paintTiles();
     const density = selectField("Density", "settings-density", [["comfortable", "Comfortable"], ["compact", "Compact"]], presentation.density);
     const language = selectField("Language", "settings-language", [["zh-CN", "Chinese"], ["en", "English"]], draft.language ?? globalThis.KEYSTONE_LANG ?? "zh-CN");
-    theme.input.onchange = () => { presentation.theme = theme.input.value; onPresentation(presentation); changed(); };
+    theme.input.onchange = () => { presentation.theme = theme.input.value; onPresentation(presentation); changed(); paintTiles(); };
     density.input.onchange = () => { presentation.density = density.input.value; onPresentation(presentation); changed(); };
     language.input.onchange = () => { draft.language = language.input.value; changed(); };
-    content.append(node("div", { class: "form-columns" }, [theme.wrap, density.wrap, language.wrap]));
-    content.append(note("Language changes apply after reopening the workbench. Theme and density preview immediately."));
+    content.append(node("h4", { text: tr("Theme") }), tiles, theme.wrap, node("div", { class: "settings-rows" }, [language.wrap, density.wrap]));
+    content.append(note("Language applies after saving. Theme and density preview immediately."));
     content.append(jsonDetails("Keyboard shortcuts", {
       "Cmd/Ctrl+K": tr("Command palette"), "Cmd/Ctrl+,": tr("Settings"), "Cmd/Ctrl+Enter": tr("Submit"),
       Escape: tr("Close dialogs and drawers"), "Arrow keys": tr("Resize focused separators"),
@@ -295,5 +312,5 @@ export function createSettingsView(host, { request, dialogs, state, capabilities
     } catch (error) { if (!disposed && page === "data" && selectedVersion === pageVersion) target.append(note(error.message, "bad")); }
   }
   save.disabled = true; void load();
-  return { dispose() { disposed = true; loading?.abort(); }, get dirty() { return dirty; } };
+  return { dispose() { disposed = true; loading?.abort(); }, get dirty() { return dirty; }, get saving() { return saving; } };
 }
