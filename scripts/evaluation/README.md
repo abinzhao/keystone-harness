@@ -37,7 +37,7 @@ timings, generated IDs or event hashes.
 ```sh
 node --test scripts/evaluation/test/harness.test.ts
 node scripts/evaluation/harness.ts --repetitions 2
-node scripts/evaluation/harness.ts --repetitions 2 --out reports/2026-10-21-keystone-m4-m8/evaluation-scorecard.json
+node scripts/evaluation/harness.ts --repetitions 2 --out dist/evaluation/scorecard.json
 ```
 
 Without `--out`, the scorecard goes to stdout. Explicit output creates a new file

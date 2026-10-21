@@ -23,6 +23,8 @@ logs/
 coverage/
 .tmp/
 tmp/
+/reports/
+/.keystone-native-rc-audit/
 
 # editor and OS
 .DS_Store

@@ -3,7 +3,7 @@
 - Status: Accepted for implementation, 2026-10-21
 - Basis: PRD v1.0, invariants 1–5, ADR-0002/0003/0005/0008/0009/0010/0013, approved M0–M3 design
 - Scope: proof admission, execution/stop boundaries, project/file/settings workbench, model configuration application, typed text/image attachments
-- Product design: `reports/2026-10-21-keystone-ui/iteration-plan.md`
+- Maintained workbench references: `packages/runtime/web/API-CONTRACTS.md`, `packages/desktop/README.md`
 
 ## Context
 
@@ -119,7 +119,7 @@ Implemented regression mapping:
 | 5 | `models/test/{config-snapshots,router-hooks}.test.ts`, `runtime/test/settings-live-api.test.ts`, `desktop/test/{settings-shell,data-switch}.test.ts` |
 | 6, 7 | `models/test/{multimodal,transport-boundary}.test.ts`, `runtime/test/attachments-api.test.ts`, `workbench-client.test.ts` |
 | 8 | `extensions/test/extensions.test.ts`, `cli/test/extension-command.test.ts` |
-| 9, 10 | `runtime/test/{server,workbench-page,workbench-client}.test.ts`, browser/native screenshots and `reports/2026-10-21-keystone-ui/acceptance.md` |
+| 9, 10 | `runtime/test/{server,workbench-page,workbench-client,workbench-shell-client}.test.ts`, `desktop/test/{native-controls,native-build}.test.ts` |
 
 Local acceptance completed with typecheck and 535 passing tests. Commercial provider capability, real Keychain permission prompts, full OS sandbox guarantees, distribution/signing and independent model review are explicitly not inferred from these tests.
 
