@@ -133,7 +133,9 @@ export function renderProofPackage(input: RenderProofPackageInput): ProofPackage
 
   // Explicitly not verified: auxiliary conditions that are not satisfied, and
   // any observation the verifier could not fully evaluate (PRD DP-01).
-  const unverified: string[] = [];
+  const unverified: string[] = decision.reasons
+    .filter(reason => reason.code === "pending")
+    .map(reason => reason.detail);
   for (const result of decision.conditionResults) {
     if (!result.required && !result.satisfied) {
       unverified.push(
@@ -192,6 +194,9 @@ export function renderProofPackage(input: RenderProofPackageInput): ProofPackage
     changedPaths: input.changedPaths,
     residualRisks,
   });
+  const decisionDetail = decision.outcome === "not_proven"
+    ? decision.reasons.map(reason => reason.detail).join(" ").slice(0, 2000)
+    : "";
 
   return proofPackageSchema.parse({
     packageId: packageIdFrom(graph.contentHash),
@@ -201,7 +206,7 @@ export function renderProofPackage(input: RenderProofPackageInput): ProofPackage
     branchId: graph.branchId,
     generatedAt: new Date().toISOString(),
 
-    summary,
+    summary: (summary + (decisionDetail ? ` ${decisionDetail}` : "")).slice(0, 8000),
     goal: contract.goal,
     outcome: decision.outcome,
 

@@ -20,6 +20,8 @@ import {
   contentHash,
   newId,
   nowIso,
+  modelResponsePayloadSchema,
+  sha256Bytes,
   type ActionProposal,
   type BranchId,
   type Budget,
@@ -71,6 +73,7 @@ import { createCheckpoint, latestCheckpoint, loadCheckpoint } from "./run/checkp
 import { assessRecovery, type RecoveryAssessment } from "./run/recovery.ts";
 import { decidePath } from "./scope/scope.ts";
 import { withLock, writeFileAtomic } from "./storage/atomic.ts";
+import { putArtifact } from "./storage/artifacts.ts";
 import type { KeystonePaths } from "./storage/paths.ts";
 import { editFact, rebuildFacts, updateFacts, type ProjectFactEdit, type ProjectFactUpdate,
   type ProjectJournalInput } from "./project/journal.ts";
@@ -95,6 +98,7 @@ export interface CreateTaskOptions {
   readonly paths: KeystonePaths;
   readonly projectId: ProjectId;
   readonly request: string;
+  readonly taskIntent?: "analysis" | "engineering";
   readonly references?: readonly TaskReference[];
   readonly requestedBy?: "user" | "cli" | "ci";
   readonly attachments?: readonly InputAttachment[];
@@ -221,6 +225,7 @@ export class KernelSession {
     await session.append("task.created", {
       projectId: options.projectId,
       request: options.request,
+      ...(options.taskIntent === undefined ? {} : { taskIntent: options.taskIntent }),
       requestedBy: options.requestedBy ?? "cli",
       references: [...(options.references ?? [])],
       ...(options.attachments === undefined ? {} : { attachments: options.attachments }),
@@ -357,6 +362,7 @@ export class KernelSession {
       taskId: this.taskIdValue,
       projectId: this.folded.projectId,
       request: this.request(),
+      taskIntent: this.taskIntent(),
       references: this.references(),
       profile: options.profile,
       facts: options.facts ?? [],
@@ -669,6 +675,27 @@ export class KernelSession {
     await this.append("context.plan_created", asPayload(plan));
   }
 
+  taskIntent(): "analysis" | "engineering" {
+    const created = this.eventLog.find((event) => event.type === "task.created");
+    return created?.payload["taskIntent"] === "analysis" ? "analysis" : "engineering";
+  }
+
+  async recordModelResponse(input: {
+    readonly stepId: string; readonly modelId: string; readonly provider: string;
+    readonly modelName: string; readonly text: string;
+  }): Promise<void> {
+    this.requireStatus(["executing", "auto_repairing"], "record a model response");
+    // Validate before storing bytes; a malformed model output cannot create an artifact.
+    const digest = sha256Bytes(new TextEncoder().encode(input.text));
+    const payload = modelResponsePayloadSchema.parse({
+      ...input, trustLevel: "untrusted", artifactId: `art_${digest}`, contentHash: digest,
+    });
+    await putArtifact(this.paths, payload.text);
+    await this.append("model.response_recorded", asPayload(payload), {
+      kind: "model", id: payload.modelId,
+    });
+  }
+
   /**
    * Authorise a proposed action. Scope and envelope are both checked; a lease is
    * issued or the refusal is recorded. A user decision never bypasses these
@@ -948,6 +975,7 @@ export class KernelSession {
     const evidence = await this.evidence();
     const graph = buildProofGraph({
       contract,
+      taskIntent: this.taskIntent(),
       branchId: this.branchIdValue,
       changedPaths: [...input.changedPaths],
       ...(input.workspaceFingerprint === undefined ? {} : { workspaceFingerprint: input.workspaceFingerprint }),
@@ -1012,6 +1040,7 @@ export class KernelSession {
     // deterministic query, so re-deriving it cannot change the verdict.
     const graph = buildProofGraph({
       contract,
+      taskIntent: this.taskIntent(),
       branchId: this.branchIdValue,
       changedPaths: [...options.changedPaths],
       ...((options.workspaceFingerprint ?? options.environment?.workspaceFingerprint) === undefined

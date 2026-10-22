@@ -8,7 +8,7 @@
  * long-lived credential: they receive a resolver and ask for a handle.
  */
 
-import type { ModelDescriptor, ToolDescriptor } from "@keystone/schemas";
+import type { CapabilityLease, ModelDescriptor, ToolDescriptor } from "@keystone/schemas";
 
 // Re-exported so adapter implementations can name descriptor types without also
 // depending on the schema package directly.
@@ -40,6 +40,19 @@ export interface ModelRequest {
   readonly signal?: AbortSignal;
   /** Free-form label used for cost attribution in the proof package. */
   readonly role?: ModelRole;
+  /** Runtime-only execution admission; model content cannot supply this callback. */
+  readonly authorizeTransport?: (proposal: ModelTransportProposal) => Promise<CapabilityLease>;
+}
+
+export interface ModelTransportProposal {
+  readonly subject: { readonly kind: "extension"; readonly id: string };
+  readonly capability: "cmd.exec";
+  readonly resource: { readonly kind: "command"; readonly values: readonly string[]; readonly mode: "execute" };
+  readonly parameters: {
+    readonly command: string; readonly args: readonly string[]; readonly cwd: string;
+    readonly timeoutMs: number; readonly maxOutputBytes: number;
+  };
+  readonly parametersHash: string;
 }
 
 export interface ModelUsage {
@@ -76,10 +89,16 @@ export type ModelProtocol =
   | "openai-chat"
   | "openai-responses"
   | "anthropic-messages"
-  | "gemini-generate";
+  | "gemini-generate"
+  | "trae-cli-exec";
 
 export interface ModelAdapter {
   readonly descriptor: ModelDescriptor;
+  /** Digest of public adapter configuration, never resolved credentials or resource bytes. */
+  readonly configurationDigest?: string;
+  readonly transportPermission?: {
+    readonly subjectId: string; readonly executable: string; readonly argvPrefix: readonly string[];
+  };
   complete(request: ModelRequest): Promise<ModelResponse>;
 }
 

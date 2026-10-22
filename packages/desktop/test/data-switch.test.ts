@@ -4,15 +4,31 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { resolveKeystonePaths } from "@keystone/kernel";
+import { KeychainCredentialBroker } from "@keystone/models";
 import { DesktopShell } from "../src/shell.ts";
 
 test("desktop migration keeps the runtime and moves subsequent native settings writes", async () => {
   const parent = await mkdtemp(join(tmpdir(), "keystone-desktop-migration-"));
   const home = await mkdtemp(join(parent, "home-"));
   const destination = join(parent, "destination");
+  const secrets = new Map<string, string>();
+  const credentials = new KeychainCredentialBroker({
+    service: "net.keystone.credentials.test",
+    invoke: async (input) => {
+      if (input.operation === "set") secrets.set(input.handle!, input.secret!);
+      if (input.operation === "delete") secrets.delete(input.handle!);
+      return {
+        ok: true,
+        ...(input.operation === "resolve" ? { secret: secrets.get(input.handle!) } : {}),
+        ...(input.operation === "list" ? {
+          handles: [...secrets.keys()].map((handle) => ({ handle, present: true })),
+        } : {}),
+      };
+    },
+  });
   let launches = 0;
   const shell = new DesktopShell({
-    paths: resolveKeystonePaths(home), onBrowserOpen() {}, onRuntimeReady() { launches++; },
+    paths: resolveKeystonePaths(home), credentials, onBrowserOpen() {}, onRuntimeReady() { launches++; },
   });
   await shell.start();
   const headers = { "x-keystone-shell-nonce": shell.shellNonce(), "content-type": "application/json" };
@@ -31,6 +47,7 @@ test("desktop migration keeps the runtime and moves subsequent native settings w
     assert.equal(saved.status, 200, await saved.clone().text());
     assert.match(await readFile(join(result.newHome, "config.json"), "utf8"), /fixture/);
     await assert.rejects(readFile(join(home, "config.json"), "utf8"), { code: "ENOENT" });
+    assert.deepEqual([...secrets.values()], [""]);
     assert.equal(launches, 1);
   } finally { await shell.close("test"); await rm(parent, { recursive: true, force: true }); }
 });

@@ -15,14 +15,13 @@
 
 import { DEFAULT_LANGUAGE } from "@keystone/i18n";
 import {
-  buildAdapter,
   enabledModels,
   loadConfig,
   routeFor,
   type ModelAdapter,
   type ModelRole,
 } from "@keystone/models";
-import { startServer } from "@keystone/runtime";
+import { startServer, ModelPluginService, buildRuntimeAdapter } from "@keystone/runtime";
 import { createSequenceAdapter, scriptedModelDescriptor } from "@keystone/models";
 
 import { getBoolean, getString, parseArgs } from "../args.ts";
@@ -124,7 +123,7 @@ export const command: CommandModule = {
       for (const entry of enabledModels(config)) {
         if (requested !== undefined && entry.id !== requested) continue;
         try {
-          adapters.push(buildAdapter(entry, credentials));
+          adapters.push(buildRuntimeAdapter(entry, credentials, new ModelPluginService(paths)));
         } catch (error) {
           output.error(t('skipping model "{id}": {message}', { id: entry.id, message: messageOf(error) }));
         }

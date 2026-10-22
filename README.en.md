@@ -8,8 +8,9 @@ Keystone is a local-first runtime for engineering agents. It separates task goal
 
 The repository is currently at `1.0.0-rc.1` and is intended for developers evaluating or integrating an agent runtime.
 
-- The kernel, runtime, CLI, local Run Protocol, and web workbench are implemented.
-- The native macOS window can be built from source, but no signed, notarized, or universal installer is available.
+- The kernel, runtime, CLI, local Run Protocol, and web workbench support read-only analysis, recorded model answers, scoped changes, and independent proof.
+- The workbench supports file recovery drafts, input model selection, and task configuration snapshots. Recovery drafts never save themselves to source files.
+- A local macOS application can be packaged with embedded Node; no signed, notarized, or universal installer is available.
 - The root and all workspace packages are `private` and are not published to npm.
 - macOS is the primary verified platform, and CI also targets Linux. Windows has a non-blocking verification job but no completed end-to-end run on Windows hardware.
 
@@ -64,6 +65,10 @@ node packages/cli/src/bin.ts task run \
   --request "fix the duplicate session refresh"
 ```
 
+Select read-only analysis in the workbench. The CLI accepts `--model <registered-id>`
+to select a model for a new task. Model answers remain untrusted observations
+and cannot establish engineering proof.
+
 Use `keystone ci` for unattended runs. It writes one stable JSON object to stdout and uses exit codes to distinguish proven, human attention required, not proven, and usage errors:
 
 ```bash
@@ -83,6 +88,32 @@ node packages/cli/src/bin.ts serve --port 7801
 
 The service listens on loopback only and prints an access token at startup.
 
+### TRAE CLI Model Plugin
+
+Open “Extensions → TRAE CLI model” to detect the installation, discover models,
+and check generation compatibility. Activation requires generation and isolation
+checks for the exact reviewed configuration. The CLI handles its own native
+login; Keystone never reads login secrets. Cloud inputs still travel to explicitly
+authorized cloud hosts.
+
+The corrected `0.210.1` transport disables independent Argos tracing and pins
+metrics/file-log endpoints to HTTPS. Live generation checks passed and
+`Seed-2.1-Turbo` is enabled on this machine; new installations still need their
+own review and checks. HTTPS telemetry may still occur; plaintext remains denied.
+See the
+[plugin guide](./packages/extension-trae-cli/README.md).
+
+### Package a Local macOS Application
+
+```bash
+node packages/desktop/scripts/package-local.ts --out /tmp/keystone-local-package
+/tmp/keystone-local-package/Keystone.app/Contents/MacOS/keystone-start --self-check
+```
+
+The output directory must not exist. The native window supports both architectures;
+embedded Node uses the build host architecture. Local packaging does not establish
+signing, notarization, or cross-platform release readiness.
+
 ## Workspace
 
 | Package | Responsibility |
@@ -99,15 +130,17 @@ The service listens on loopback only and prints an access token at startup.
 | `@keystone/runtime` | Builder/Assurance loops, context, autonomy, intervention, and local service |
 | `@keystone/cli` | Project, task, proof, replay, model, and extension commands |
 | `@keystone/desktop` | Supervised macOS WKWebView thin shell |
+| `@keystone/extension-trae-cli` | Inactive-by-default, lease-authorized and OS-confined CLI model transport |
 
-Two reference extensions live under `packages/extension-*`.
+Reference extensions and the CLI model plugin live under `packages/extension-*`.
 
 ## Known Limits
 
 - Only the engineering scenario pack is currently implemented; a generic extension boundary does not mean other domains are ready.
 - Native model protocols are covered by in-process mock-`fetch` tests, not live provider end-to-end verification.
 - Windows coverage is limited to unit tests such as process resolution; end-to-end behavior is still unverified.
-- The macOS window is a source-level preview, not a distributable application.
+- Local macOS applications can be packaged and self-checked; public distribution still requires signing, notarization, and release verification.
+- TRAE CLI currently supports verified macOS 0.210.1 only. Invalid model output is refused; forbidden native activity quarantines the plugin.
 - ACP integration remains blocked; no ACP adapter ships.
 
 See the [roadmap](./ROADMAP.md) for progress and admission criteria.

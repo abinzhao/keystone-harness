@@ -128,7 +128,7 @@ export type ActionProposal = InferSchema<typeof actionProposalSchema>;
  */
 export const modelDescriptorSchema = defineSchema(
   "keystone.agent.modelDescriptor",
-  "1.1.0",
+  "1.2.0",
   objectOf({
     id: nonEmptyStr(),
     kind: enumOf(["cloud", "local"] as const),
@@ -145,6 +145,7 @@ export const modelDescriptorSchema = defineSchema(
       "openai-responses",
       "anthropic-messages",
       "gemini-generate",
+      "trae-cli-exec",
     ] as const),
     capabilities: objectOf({
       /** Accepts provider-native tool definitions and returns structured calls. */

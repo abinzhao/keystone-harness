@@ -47,6 +47,7 @@ import {
   defineSchema,
   enumOf,
   int,
+  lit,
   nonEmptyStr,
   objectOf,
   optional,
@@ -56,11 +57,12 @@ import {
 
 export const taskCreatedPayloadSchema = defineSchema(
   "keystone.event.taskCreated",
-  "1.1.0",
+  "1.2.0",
   objectOf({
     projectId: nonEmptyStr(),
     /** The user's original phrasing, kept verbatim for contract re-derivation. */
     request: str({ maxLength: 8000 }),
+    taskIntent: optional(enumOf(["analysis", "engineering"] as const)),
     requestedBy: enumOf(["user", "cli", "ci"] as const),
     /** References the user attached: files, directories, issues, logs. */
     references: arrayOf(
@@ -72,6 +74,22 @@ export const taskCreatedPayloadSchema = defineSchema(
     ),
     attachments: optional(arrayOf(attachmentSchema.validator, { maxItems: 10 })),
     configurationSnapshot: optional(configurationSnapshotSchema.validator),
+  }),
+);
+
+/** Public model output is an observation, never Evidence or a completion vote. */
+export const modelResponsePayloadSchema = defineSchema(
+  "keystone.event.modelResponse",
+  "1.0.0",
+  objectOf({
+    stepId: localIdValidator,
+    modelId: nonEmptyStr(),
+    provider: nonEmptyStr(),
+    modelName: nonEmptyStr(),
+    text: str({ maxLength: 65536 }),
+    trustLevel: lit("untrusted"),
+    artifactId: nonEmptyStr(),
+    contentHash: sha256Validator,
   }),
 );
 
@@ -467,6 +485,7 @@ export const EVENT_PAYLOAD_SCHEMAS: Readonly<Record<EventType, Schema<unknown> |
   "contract.revised": contractRevisedPayloadSchema,
 
   "context.plan_created": contextPlanSchema,
+  "model.response_recorded": modelResponsePayloadSchema,
   "budget.consumed": budgetConsumedPayloadSchema,
   "degradation.applied": degradationAppliedPayloadSchema,
 

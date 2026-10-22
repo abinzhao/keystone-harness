@@ -83,3 +83,31 @@ test("snapshot freezes role routing and registration independently", async () =>
   assert.equal(router.route("builder")[0]?.descriptor.id, "backup");
   assert.notEqual(active.listModels()[0], router.listModels()[0]);
 });
+
+test("adapter registration listing is independent of default routing and replacement", () => {
+  const router = new models.ModelRouter();
+  const first = adapter("first", async () => response);
+  const selected = adapter("selected", async () => response);
+  router.register(first);
+  router.register(selected);
+  router.setRoute("builder", ["first"]);
+  assert.equal(typeof router.listAdapters, "function");
+  assert.deepEqual(router.listAdapters(), [first, selected]);
+  const replacement = adapter("first", async () => ({ ...response, text: "replacement" }));
+  router.register(replacement);
+  assert.deepEqual(router.listAdapters(), [replacement, selected]);
+  assert.deepEqual(router.route("builder"), [replacement]);
+});
+
+test("task snapshots freeze the transport policy independently of registration mutations", () => {
+  const router = new models.ModelRouter();
+  const permission = { subjectId: "fixture.cli", executable: "fixture-cli", argvPrefix: ["-p"] };
+  router.register({ ...adapter("selected", async () => response), transportPermission: permission });
+  const snapshot = router.snapshot();
+  const frozen = snapshot.route("builder")[0]!.transportPermission!;
+  permission.executable = "changed-cli";
+  permission.argvPrefix.push("--changed");
+  assert.deepEqual(frozen, { subjectId: "fixture.cli", executable: "fixture-cli", argvPrefix: ["-p"] });
+  assert.ok(Object.isFrozen(frozen), "a task's transport policy must be immutable");
+  assert.ok(Object.isFrozen(frozen.argvPrefix));
+});

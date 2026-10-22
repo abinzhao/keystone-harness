@@ -86,6 +86,8 @@ importers:
         specifier: workspace:*
         version: link:../kernel
 
+  packages/extension-trae-cli: {}
+
   packages/extensions:
     dependencies:
       '@keystone/kernel':
@@ -126,6 +128,9 @@ importers:
 
   packages/runtime:
     dependencies:
+      '@keystone/extension-trae-cli':
+        specifier: workspace:*
+        version: link:../extension-trae-cli
       '@keystone/extensions':
         specifier: workspace:*
         version: link:../extensions

@@ -18,6 +18,7 @@ import { createExtensionsView } from "../views/extensions.js";
 import { createLabView } from "../views/lab.js";
 import { createRecoveryView } from "../views/recovery.js";
 import { createCollaborationView, createReadinessView } from "../views/collaboration.js";
+import { createGettingStarted } from "../components/getting-started.js";
 
 const token = new URLSearchParams(location.hash.slice(1)).get("t") ?? "";
 const request = createApi({ token });
@@ -36,12 +37,14 @@ let settings = null;
 let capabilities = {};
 let shell = null;
 let composer;
+let gettingStarted;
+let settingsInitialPage = "appearance";
 let disposed = false;
 let ready = false;
 let previousNotification = "";
 const tracePreferences = { all: false, search: "" };
 const serviceViews = new Set(["cognition", "extensions", "lab", "collaboration", "readiness"]);
-const files = createFileClient({ request, onMutation(projectId) {
+const files = createFileClient({ request, storage, onMutation(projectId) {
   if (client.state.projectId === projectId && client.state.taskId) void client.reconnect();
 } });
 
@@ -119,6 +122,7 @@ const titleOf = taskTitle;
 let navigationSignature = "";
 function renderNavigation() {
   const state = client.state;
+  if (["lab", "collaboration", "readiness"].includes(view)) el("advanced-navigation").open = true;
   for (const item of document.querySelectorAll("[data-page]")) {
     if (item.dataset.page === view) item.setAttribute("aria-current", "page"); else item.removeAttribute("aria-current");
   }
@@ -140,14 +144,18 @@ function renderNavigation() {
     heading.title = `${project.rootPath} · ${project.branch ?? project.currentBranch ?? tr("Branch unknown")}`;
     if (project.pinned) heading.append(node("small", { text: tr("Pinned") }));
     const section = node("div", { class: "project-group" }, [heading]);
-    for (const task of group.tasks) {
-      const item = button(titleOf(task), () => selectTask(task.taskId), `nav-item task-item ${task.taskId === state.taskId ? "active" : ""}`);
-      item.dataset.taskId = task.taskId;
-      if (task.taskId === state.taskId) item.setAttribute("aria-current", "page");
-      item.prepend(node("span", { class: `task-dot ${task.status}`, "aria-hidden": "true" }));
-      item.title = `${titleOf(task)} · ${tr(task.status)}`;
-      item.append(node("span", { class: "sr-only", text: tr(task.status) }));
-      section.append(item);
+    for (const taskGroup of group.sections) {
+      const label = tr({ attention: "Needs attention", running: "Running tasks", finished: "Finished tasks" }[taskGroup.kind]);
+      section.append(node("p", { class: "nav-empty", text: label }));
+      for (const task of taskGroup.tasks) {
+        const item = button(titleOf(task), () => selectTask(task.taskId), `nav-item task-item ${task.taskId === state.taskId ? "active" : ""}`);
+        item.dataset.taskId = task.taskId;
+        if (task.taskId === state.taskId) item.setAttribute("aria-current", "page");
+        item.prepend(node("span", { class: `task-dot ${task.status}`, "aria-hidden": "true" }));
+        item.title = `${titleOf(task)} · ${tr(task.status)}${task.updatedAt ? ` · ${new Date(task.updatedAt).toLocaleString(globalThis.KEYSTONE_LANG || "zh-CN")}` : ""}`;
+        item.append(node("span", { class: "sr-only", text: tr(task.status) }));
+        section.append(item);
+      }
     }
     el("project-list").append(section);
   }
@@ -187,10 +195,13 @@ async function selectTask(taskId) {
   render();
 }
 async function showView(next) {
-  if (next === "settings") { settingsModal.open(); closeDrawers(); return; }
+  if (next === "settings") { settingsInitialPage = "appearance"; settingsModal.open(); closeDrawers(); return; }
   if (next === view) return;
   if (next !== view && !(await leaveSettings())) return;
   view = next; mountedView = ""; render();
+}
+function configureModels() {
+  settingsInitialPage = "models"; settingsModal.open(); closeDrawers();
 }
 function renderView() {
   const host = el("view-host");
@@ -203,7 +214,10 @@ function renderView() {
       state: client.state, request, dialogs, refresh: async () => { await client.refreshLists(); await client.reconnect(); },
     });
     else if (view === "cognition") mounted = createCognitionView(host, { request, dialogs, projectId: client.state.projectId });
-    else if (view === "extensions") mounted = createExtensionsView(host, { request, dialogs });
+    else if (view === "extensions") mounted = createExtensionsView(host, { request, dialogs, async onModelEnabled() {
+      settings = await request("/v1/settings"); capabilities = await request("/v1/capabilities");
+      composer.refresh(); render();
+    } });
     else if (view === "lab") mounted = createLabView(host, { request, dialogs });
     else if (view === "collaboration") mounted = createCollaborationView(host, {
       request,
@@ -228,7 +242,9 @@ function renderView() {
       }).catch((error) => { if (selectedVersion === viewVersion && error.name !== "AbortError") host.replaceChildren(note(error.message, "bad")); });
     }
   }
-  if (view === "overview") renderOverview(host, client.state);
+  if (view === "overview") renderOverview(host, client.state, { openFile(path, line) {
+    void showView("files").then(() => files.open(path, line));
+  } });
   if (view === "trace") renderTrace(host, client.state, tracePreferences);
   if (view === "proof") renderProofView(host, client.state, { exportProof: () => el("export-proof").click() });
   if (view === "commands") mounted?.update();
@@ -254,7 +270,12 @@ function render() {
   el("connection").textContent = tr(state.connection === "stale" ? "Disconnected; showing last known state" : state.loading ? "Loading task" : state.connection === "connected" ? "Connected locally" : "Connecting");
   el("workspace-status").textContent = project ? `${project.rootPath} · ${tr(project.dirty ? "Uncommitted changes" : "Workspace")}` : tr("No project selected");
   const models = routedModels(settings?.config, "builder", capabilities.egress ?? []);
-  el("route-status").textContent = models.length ? `${models[0].modelName} · ${tr(models[0].kind === "local" ? "Local" : "Cloud")}` : tr("No model configured");
+  gettingStarted?.update({ project, models });
+  const boundModelId = state.detail?.configurationSnapshot?.builderModelId
+    ?? state.detail?.messages?.at(-1)?.modelId;
+  el("route-status").textContent = state.taskId
+    ? boundModelId ? `${boundModelId} · ${tr("Task-bound model")}` : tr("Inspect the task configuration snapshot for its bound model.")
+    : models[0] ? `${models[0].modelName || models[0].id} · ${tr(models[0].kind === "local" ? "Local" : "Cloud")}` : tr("No model configured");
   const usage = state.detail?.budgetUsed;
   el("budget-status").textContent = usage ? `${usage.tokens ?? 0} tokens · ${usage.retries ?? 0} ${tr("retries")} · ${Math.round((usage.wallClockMs ?? 0) / 1000)}s` : "";
   const pending = state.run?.pendingInterventions?.length ?? 0;
@@ -265,6 +286,7 @@ function render() {
   app.classList.toggle("welcome", welcome); app.classList.toggle("service-view", serviceViews.has(view));
   el("welcome").hidden = !welcome;
   el("view-host").hidden = welcome;
+  if (welcome && state.loading) el("welcome").setAttribute("aria-busy", "true"); else el("welcome").removeAttribute("aria-busy");
   el("workspace-tabs").hidden = welcome || serviceViews.has(view);
   el("workspace-footer").hidden = welcome || serviceViews.has(view);
   for (const id of ["pause", "stop", "task-status"]) el(id).hidden = !state.taskId || serviceViews.has(view);
@@ -440,6 +462,10 @@ const settingsModal = createSettingsModal({
   createView(host) {
     return createSettingsView(host, {
       request, dialogs, state: client.state, capabilities, shell, onPresentation: presentation,
+      initialPage: settingsInitialPage,
+      async openModelPlugins() {
+        if (await leaveSettings()) await showView("extensions");
+      },
       async onSaved(saved) {
         settings = saved;
         if (saved.config.language && saved.config.language !== globalThis.KEYSTONE_LANG) {
@@ -493,6 +519,7 @@ el("export-proof").onclick = () => {
   node("a", { href: url, download: `${client.state.taskId}.proof.json` }).click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
 document.addEventListener("keydown", (event) => {
+  if (event.isComposing || event.keyCode === 229 || event.defaultPrevented) return;
   if (el("onboarding").open || el("modal").open || el("settings-modal").open) return;
   if (event.key === "Escape") { closeDrawers(); el("sidebar-toggle").focus(); }
   if (event.key === "Tab") {
@@ -509,19 +536,27 @@ document.addEventListener("keydown", (event) => {
   if (!(event.metaKey || event.ctrlKey)) return;
   if (event.key.toLocaleLowerCase() === "k") { event.preventDefault(); commandPalette(); }
   if (event.key === ",") { event.preventDefault(); void showView("settings"); }
-  if (event.key === "Enter") { event.preventDefault(); composer.submit(); }
+  if (event.key === "Enter" && document.activeElement === el("composer-input")) { event.preventDefault(); composer.submit(); }
   if (event.key.toLocaleLowerCase() === "p") { event.preventDefault(); commandPalette(true); }
 });
 window.addEventListener("keystone:settings", () => { void showView("settings"); });
 
 function mountComposer() { return createComposer(el("composer-host"), {
   client, request, drafts, dialogs, getSettings: () => settings, getEgress: () => capabilities.egress ?? [], referencePicker: () => commandPalette(true),
+  configureModel: configureModels,
   async afterStart(taskId, projectId) {
     await client.refreshLists();
     if (client.state.projectId === projectId) await selectTask(taskId);
   },
 }); }
 composer = mountComposer();
+gettingStarted = createGettingStarted(el("getting-started"), {
+  addProject, configureModel: () => shell ? onboarding() : configureModels(),
+  openPlugin: () => showView("extensions"),
+  example(value) {
+    if (!composer.example(value)) notify(tr("Your current draft is kept. Clear it explicitly before choosing another example."), true);
+  },
+});
 client.subscribe(render);
 restorePanels(); render();
 
@@ -555,6 +590,9 @@ const timer = setInterval(() => { void tick(); }, 2500);
 document.addEventListener("visibilitychange", () => { client.setVisible(!document.hidden && navigator.onLine !== false); if (!document.hidden) void tick(); });
 window.addEventListener("online", () => { client.setVisible(!document.hidden); void tick(); });
 window.addEventListener("offline", () => client.setVisible(false));
+window.addEventListener("beforeunload", (event) => {
+  if (files.hasUnsavedDrafts()) { event.preventDefault(); event.returnValue = ""; }
+});
 window.addEventListener("pagehide", () => {
   disposed = true; clearInterval(timer); composer.dispose(); mounted?.dispose?.(); settingsModal.dispose(); files.dispose(); client.dispose(); diffController?.abort();
 });

@@ -344,7 +344,7 @@ test("recovery uses checkpoint/label and explicit branch comparison query, not l
       request: async (path: string, init: any = {}) => {
         calls.push({ path, init });
         return path.includes("/compare?") ? { left: "base", right: "candidate", proof: { outcome: "unproven" } }
-          : { branches: [{ branchId: "base", label: "Baseline" }, { branchId: "candidate", label: "Candidate" }] };
+          : { branches: [{ branchId: "base", label: "primary", status: "paused" }, { branchId: "candidate", label: "Candidate" }] };
       },
       dialogs: { confirm: async () => true }, refresh: async () => { refreshed += 1; },
     });
@@ -374,6 +374,30 @@ test("recovery receives new checkpoints without resetting the branch-label draft
     assert.equal(f.host.querySelector("#branch-label").value, "Keep this draft");
     assert.ok(f.host.querySelector("#branch-checkpoint").querySelectorAll("option").some((entry: any) => entry.value === "new"));
     assert.equal(f.button("Create branch").disabled, false);
+    view.dispose();
+  });
+});
+
+test("recovery refuses resume controls for unresolved attention and unknown status", async () => {
+  const { createRecoveryView } = await moduleAt("views/recovery.js");
+  for (const status of ["needs_attention", undefined]) await inDom(async (f) => {
+    let writes = 0;
+    const view = createRecoveryView(f.host, {
+      taskId: "attention", checkpoints: [], dialogs: { confirm: async () => true },
+      request: async (_path: string, init: any = {}) => {
+        if (init.method === "POST") writes++;
+        return { branches: [
+          { branchId: "primary", label: "primary", status },
+          { branchId: "child", label: "child", forkedFromBranchId: "primary", status },
+        ] };
+      },
+    });
+    await settle();
+    assert.equal(f.button("Resume task").disabled, true);
+    assert.equal(f.button("Resume branch").disabled, true);
+    await f.button("Resume task").click();
+    await f.button("Resume branch").click();
+    assert.equal(writes, 0);
     view.dispose();
   });
 });

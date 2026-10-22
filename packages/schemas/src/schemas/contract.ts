@@ -182,14 +182,26 @@ export const exitConditionSchema = defineSchema(
  * *never* widen — only a recorded user decision can, and each widening names
  * the decision it came from (PRD HI-04, 9.5).
  */
+export const modelTransportPermissionSchema = defineSchema(
+  "keystone.contract.modelTransportPermission",
+  "1.0.0",
+  objectOf({
+    subjectId: nonEmptyStr(),
+    executable: nonEmptyStr(),
+    argvPrefix: arrayOf(str(), { minItems: 1, maxItems: 128 }),
+  }),
+);
+
 export const autonomyEnvelopeSchema = defineSchema(
   "keystone.contract.autonomyEnvelope",
-  "1.0.0",
+  "1.1.0",
   objectOf({
     projectId: projectIdValidator,
     readPaths: arrayOf(nonEmptyStr(), { maxItems: 512 }),
     writePaths: arrayOf(nonEmptyStr(), { maxItems: 512 }),
     allowedCommands: arrayOf(nonEmptyStr(), { maxItems: 256 }),
+    /** Exact extension transport ceilings; never available to Builder cmd tools. */
+    modelTransports: optional(arrayOf(modelTransportPermissionSchema.validator, { maxItems: 16 })),
     allowedHosts: arrayOf(nonEmptyStr(), { maxItems: 128 }),
     allowedCredentials: arrayOf(nonEmptyStr(), { maxItems: 64 }),
     externalSystems: enumOf(["none", "read_only_source", "reversible_write"] as const),

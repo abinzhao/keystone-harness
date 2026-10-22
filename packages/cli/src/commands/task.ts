@@ -26,7 +26,6 @@ import {
   summarizeBranch,
 } from "@keystone/kernel";
 import {
-  buildAdapter,
   createSequenceAdapter,
   enabledModels,
   loadConfig,
@@ -35,7 +34,7 @@ import {
   type ModelAdapter,
   type ModelRole,
 } from "@keystone/models";
-import { KeystoneRuntime, type RunMode } from "@keystone/runtime";
+import { KeystoneRuntime, ModelPluginService, buildRuntimeAdapter, withModelTransportPermissions, type RunMode } from "@keystone/runtime";
 import {
   autonomyEnvelopeSchema,
   newId,
@@ -285,7 +284,7 @@ async function runTask(argv: readonly string[], context: CliContext): Promise<nu
   } else {
     for (const entry of enabledModels(config)) {
       try {
-        adapters.push(buildAdapter(entry, credentials));
+        adapters.push(buildRuntimeAdapter(entry, credentials, new ModelPluginService(paths)));
       } catch (error) {
         output.error(t('skipping model "{id}": {reason}', { id: entry.id, reason: messageOf(error) }));
       }
@@ -336,7 +335,7 @@ async function runTask(argv: readonly string[], context: CliContext): Promise<nu
     workspacePath: projectPath,
     request,
     references,
-    autonomy,
+    autonomy: withModelTransportPermissions(autonomy, adapters),
     budget,
     ...(maxSteps === undefined ? {} : { maxSteps }),
     acceptContractAutomatically: acceptContract,
@@ -727,7 +726,7 @@ async function runResume(argv: readonly string[], context: CliContext): Promise<
     models = [createSequenceAdapter({ descriptor: scriptedModelDescriptor({ id }), responses })];
     routes = { builder: [id], planner: [id], summarizer: [id] };
   } else {
-    models = enabledModels(config).map((entry) => buildAdapter(entry, credentialsFor(context)));
+    models = enabledModels(config).map((entry) => buildRuntimeAdapter(entry, credentialsFor(context), new ModelPluginService(paths)));
     routes = { builder: routeFor(config, "builder"), planner: routeFor(config, "planner"), summarizer: routeFor(config, "summarizer") };
   }
   const mode = getString(args, "mode") ?? "standard";

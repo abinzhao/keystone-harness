@@ -13,7 +13,7 @@ export class ApiError extends Error {
 }
 
 /** The bearer lives only in this closure. Native shells inject it upstream. */
-export function createApi({ token = "", fetch: fetcher = globalThis.fetch } = {}) {
+export function createApi({ token = "", fetch: fetcher = globalThis.fetch, timeoutMs: defaultTimeout = 30000 } = {}) {
   return async (path, init = {}) => {
     if (!/^\/(?:v1|desktop)\//.test(path) || path.includes("\\") || /[\r\n]/.test(path)) {
       throw new Error("Only same-origin workbench requests are permitted.");
@@ -21,10 +21,30 @@ export function createApi({ token = "", fetch: fetcher = globalThis.fetch } = {}
     const headers = new Headers(init.headers);
     headers.set("content-type", "application/json");
     if (token) headers.set("authorization", `Bearer ${token}`);
-    const response = await fetcher(path, { ...init, headers, redirect: "error", cache: "no-store" });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new ApiError(response.status, body);
-    return body;
+    const { timeoutMs = defaultTimeout, ...options } = init;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300000) throw new Error("Invalid request timeout.");
+    const controller = new AbortController();
+    const cancel = () => controller.abort(init.signal.reason);
+    if (init.signal?.aborted) cancel();
+    else init.signal?.addEventListener("abort", cancel, { once: true });
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+    try {
+      const response = await fetcher(path, { ...options, signal: controller.signal, headers, redirect: "error", cache: "no-store" });
+      const body = await response.json().catch((error) => { if (controller.signal.aborted) throw error; return {}; });
+      if (controller.signal.aborted) throw controller.signal.reason;
+      if (!response.ok) throw new ApiError(response.status, body);
+      return body;
+    } catch (error) {
+      if (timedOut) throw new ApiError(0, {
+        code: "request_timeout",
+        error: "Request timed out. The server result is unknown; reconnect before retrying.",
+      });
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      init.signal?.removeEventListener("abort", cancel);
+    }
   };
 }
 

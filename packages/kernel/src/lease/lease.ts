@@ -71,6 +71,7 @@ export interface IssueLeaseInput {
   readonly ttlMs?: number;
   readonly workingDirectory?: string;
   readonly timeoutMs?: number;
+  readonly maxOutputBytes?: number;
   readonly argvPrefix?: readonly string[];
   readonly parametersHash?: string;
   /**
@@ -180,7 +181,13 @@ export function issueLease(input: IssueLeaseInput): LeaseIssueResult {
   }
 
   const envelopeReach = reachWithinEnvelope(capability, values, envelope);
-  if (!envelopeReach.allowed) return { ok: false, denial: asDenial(envelopeReach) };
+  const transportOnly = capability === "cmd.exec" && input.subject.kind === "extension" &&
+    input.parametersHash !== undefined && values.length === 1 &&
+    [envelope, contract.autonomy].every((boundary) => boundary.modelTransports?.some((transport) =>
+      transport.subjectId === input.subject.id && transport.executable === values[0] &&
+      transport.argvPrefix.every((argument, index) => input.argvPrefix?.[index] === argument),
+    ));
+  if (!envelopeReach.allowed && !transportOnly) return { ok: false, denial: asDenial(envelopeReach) };
 
   const scopeReach = reachWithinContractScope(capability, values, contract);
   if (!scopeReach.allowed) return { ok: false, denial: asDenial(scopeReach) };
@@ -191,6 +198,7 @@ export function issueLease(input: IssueLeaseInput): LeaseIssueResult {
   const constraints = {
     ...(input.workingDirectory === undefined ? {} : { workingDirectory: input.workingDirectory }),
     ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
+    ...(input.maxOutputBytes === undefined ? {} : { maxOutputBytes: input.maxOutputBytes }),
     ...(input.argvPrefix === undefined ? {} : { argvPrefix: [...input.argvPrefix] }),
     ...(input.parametersHash === undefined ? {} : { parametersHash: input.parametersHash }),
     denySymlinkEscape: true,

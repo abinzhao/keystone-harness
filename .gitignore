@@ -42,3 +42,6 @@ tmp/
 credentials.json
 
 docs/*
+!docs/adr/
+docs/adr/*
+!docs/adr/0016-product-task-intent-and-model-transports.md

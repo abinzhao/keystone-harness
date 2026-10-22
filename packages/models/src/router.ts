@@ -104,6 +104,11 @@ export class ModelRouter {
       .filter((descriptor): descriptor is ModelDescriptor => descriptor !== undefined);
   }
 
+  /** Registered adapters, including models outside every configured route. */
+  listAdapters(): readonly ModelAdapter[] {
+    return this.order.map((id) => this.adapters.get(id)!);
+  }
+
   /** Copy registration/routes; adapter closures and their credential handles remain task-local. */
   snapshot(): ModelRouter {
     const snapshot = new ModelRouter();
@@ -114,7 +119,17 @@ export class ModelRouter {
       Object.freeze(descriptor.dataEgress.classes);
       Object.freeze(descriptor.dataEgress);
       Object.freeze(descriptor);
-      snapshot.register({ descriptor, complete: adapter.complete.bind(adapter) });
+      const transportPermission = adapter.transportPermission === undefined
+        ? undefined : structuredClone(adapter.transportPermission);
+      if (transportPermission !== undefined) {
+        Object.freeze(transportPermission.argvPrefix);
+        Object.freeze(transportPermission);
+      }
+      snapshot.register({
+        descriptor, complete: adapter.complete.bind(adapter),
+        ...(adapter.configurationDigest === undefined ? {} : { configurationDigest: adapter.configurationDigest }),
+        ...(transportPermission === undefined ? {} : { transportPermission }),
+      });
     }
     for (const [role, ids] of this.routes) snapshot.setRoute(role, ids);
     return snapshot;

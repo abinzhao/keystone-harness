@@ -10,9 +10,11 @@
 
 import type { Catalog } from "../../types.ts";
 import { workbenchModern } from "./workbench-modern.ts";
+import { workbenchProduct } from "./workbench-product.ts";
 
 export const workbench: Catalog = {
   ...workbenchModern,
+  ...workbenchProduct,
   // Document title, brand and title bar.
   "Keystone — task workbench": "Keystone — 任务工作台",
   "task workbench": "任务工作台",

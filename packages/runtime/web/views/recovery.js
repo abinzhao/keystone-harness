@@ -14,8 +14,10 @@ export function createRecoveryView(host, { taskId, checkpoints = [], request, di
   let checkpointSignature = "";
   let recordedCheckpoints = checkpoints;
   let resuming = false;
+  let primaryStatus;
   let branchPoll = null;
   const terminal = new Set(["proven", "failed", "stopped", "exited_gracefully"]);
+  const resumable = new Set(["paused", "executing", "verifying", "auto_repairing", "resuming"]);
   const comparison = node("div", { role: "status", "aria-live": "polite" });
   const verification = node("div", { role: "status", "aria-live": "polite" });
   const checkpoint = selectField("Source checkpoint", "branch-checkpoint", [
@@ -25,7 +27,7 @@ export function createRecoveryView(host, { taskId, checkpoints = [], request, di
   const left = selectField("Baseline branch", "compare-left", [["", "Select branch"]], "");
   const right = selectField("Candidate branch", "compare-right", [["", "Select branch"]], "");
   async function resumeBranch(entry) {
-    if (resuming || page.resource.state.busy || page.resource.state.stale || page.resource.disposed) return;
+    if (!resumable.has(entry.status) || resuming || page.resource.state.busy || page.resource.state.stale || page.resource.disposed) return;
     resuming = true;
     try {
       if (!(await dialogs.confirm("Resume branch", node("div", { class: "stack" }, [
@@ -50,7 +52,7 @@ export function createRecoveryView(host, { taskId, checkpoints = [], request, di
     }, 2000);
   }
   const resume = button("Resume task", async () => {
-    if (resuming || page.resource.state.busy || page.resource.state.stale) return;
+    if (!resumable.has(primaryStatus) || resuming || page.resource.state.busy || page.resource.state.stale) return;
     resuming = true;
     try {
       if (!(await dialogs.confirm("Resume task", note("The service must validate the ledger, workspace, configuration and artifacts before continuing. Old leases are not reused."), "Resume task"))) return;
@@ -152,7 +154,8 @@ export function createRecoveryView(host, { taskId, checkpoints = [], request, di
       if (!data) return;
       const branches = collection(data, "branches", "entries");
       const primary = branches?.find((entry) => entry.label === "primary" && !entry.forkedFromBranchId);
-      resume.disabled = state.busy || state.loading || state.stale || resuming || terminal.has(primary?.status);
+      primaryStatus = primary?.status;
+      resume.disabled = state.busy || state.loading || state.stale || resuming || !resumable.has(primaryStatus);
       for (const control of [left.input, right.input]) {
         const selected = control.value;
         control.replaceChildren(node("option", { value: "", text: tr("Select branch") }), ...(branches ?? []).map((entry) => node("option", {
@@ -165,7 +168,7 @@ export function createRecoveryView(host, { taskId, checkpoints = [], request, di
       verifyBaseline.disabled = verifying || state.busy || state.loading || state.stale;
       for (const entry of branches ?? []) {
         const action = button("Resume branch", () => resumeBranch(entry));
-        action.disabled = resuming || state.busy || state.loading || state.stale || terminal.has(entry.status);
+        action.disabled = resuming || state.busy || state.loading || state.stale || !resumable.has(entry.status);
         body.append(node("article", { class: "record-row" }, [
           node("h3", { text: entry.label ?? entry.branchId ?? entry.id ?? tr("Unknown") }),
           note(tr(entry.status ?? "Unknown")),

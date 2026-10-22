@@ -1,8 +1,9 @@
 import { button, field, jsonDetails, node, note, tr } from "../components/dom.js";
 import { collection, emptyProjection, projectionDetails, servicePage, unwrap } from "../components/service.js";
 import { post } from "../client/api.js";
+import { createModelPluginView } from "./model-plugin.js";
 
-export function createExtensionsView(host, { request, dialogs }) {
+export function createExtensionsView(host, { request, dialogs, onModelEnabled }) {
   let tab = "installed";
   let review = null;
   let reviewDirectory = "";
@@ -129,6 +130,12 @@ export function createExtensionsView(host, { request, dialogs }) {
     directory.wrap, node("div", { class: "row" }, [reviewButton, install]), reviewHost,
   ]);
   page.controls.append(tabs, input);
+  const modelHost = node("div");
+  const pluginSection = node("details", { class: "plugin-section", open: true }, [
+    node("summary", { text: tr("TRAE CLI model") }), modelHost,
+  ]);
+  page.controls.prepend(pluginSection);
+  const modelPlugin = createModelPluginView(modelHost, { request, dialogs, onEnabled: onModelEnabled });
   void page.load();
-  return { dispose() { disposed = true; reviewVersion += 1; page.dispose(); } };
+  return { dispose() { disposed = true; reviewVersion += 1; modelPlugin.dispose(); page.dispose(); } };
 }

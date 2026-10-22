@@ -66,9 +66,11 @@ const modelActionSchema = defineSchema(
  */
 export const modelActionEnvelopeSchema = defineSchema(
   "keystone.model.actionEnvelope",
-  "1.0.0",
+  "1.1.0",
   objectOf({
     summary: str({ maxLength: 2000 }),
+    /** Public response, not hidden reasoning and not a completion verdict. */
+    answer: optional(str({ maxLength: 65536 })),
     actions: arrayOf(modelActionSchema.validator, { maxItems: 16 }),
     /** Explicit request for human input; mutually exclusive with actions. */
     needs_user: optional(
@@ -131,7 +133,7 @@ export function buildActionPrompt(input: ActionPromptInput): string {
     AUTHORITY_HEADER,
     "",
     "JSON shape:",
-    '{"summary": string, "actions": [{"intent": one of ' +
+    '{"summary": string, "answer": optional public answer in Markdown, "actions": [{"intent": one of ' +
       ACTION_INTENTS.join("|") +
       ', "tool": string, "parameters": object, "rationale": string, "expected_effects": [{"kind": string, "target": string, "description": string}], "requested_capabilities": [string], "produces_evidence_for": [string], "reversibility": "reversible|compensable|irreversible"}], "needs_user": {"question": string, "why": string, "options": [string]} | omitted}',
     "",
@@ -172,6 +174,8 @@ export function buildActionPrompt(input: ActionPromptInput): string {
     input.contextSection.trim() === "" ? "(no context was selected for this step)" : input.contextSection,
     "",
     "If you cannot proceed without a human decision, return {\"needs_user\": {...}} instead of guessing.",
+    "Use answer for the useful public explanation, results and local file:line references. Never include hidden reasoning.",
+    "When the write scope is empty, only read the supplied context or propose allowed read tools. Do not propose edits.",
   );
 
   return lines.join("\n");
@@ -185,7 +189,9 @@ export function buildActionPrompt(input: ActionPromptInput): string {
  * So: locate the first balanced object, and let the schema decide if it is real.
  */
 export function extractJsonObject(text: string): string {
-  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
+  // Only an outer JSON fence is a wrapper. Markdown fences inside a JSON
+  // string are answer content and must never be extracted as the envelope.
+  const fenced = /^\s*```(?:json)?[ \t]*\r?\n?([\s\S]*)\r?\n?```\s*$/i.exec(text);
   const candidate = fenced?.[1] ?? text;
   const start = candidate.indexOf("{");
   if (start === -1) {

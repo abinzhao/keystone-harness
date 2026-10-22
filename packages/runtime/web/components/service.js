@@ -14,7 +14,7 @@ export function unavailable(error) {
   const unsupported = [404, 405, 501, 503].includes(error?.status);
   return node("div", { class: "service-error", role: "alert" }, [
     note(unsupported ? "This capability is unavailable from the local service." : "The request failed. No change is confirmed.", "bad"),
-    node("p", { text: error?.message ?? tr("Unknown") }),
+    node("p", { text: tr(error?.message ?? "Unknown") }),
     ...(error?.body ? [jsonDetails("Service refusal", error.body)] : []),
   ]);
 }

@@ -18,9 +18,12 @@
         <nav class="primary-navigation" aria-label="Workbench pages" data-i18n-aria="Workbench pages">
           <button data-page="extensions" class="nav-item"><span data-i18n="Extensions">Extensions</span></button>
           <button data-page="cognition" class="nav-item"><span data-i18n="Project cognition">Project cognition</span></button>
-          <button data-page="lab" class="nav-item"><span data-i18n="Harness Lab">Harness Lab</span></button>
-          <button data-page="collaboration" class="nav-item"><span data-i18n="Collaboration">Collaboration</span></button>
-          <button data-page="readiness" class="nav-item"><span data-i18n="Release readiness">Release readiness</span></button>
+          <details id="advanced-navigation" class="advanced-navigation">
+            <summary data-i18n="More tools">More tools</summary>
+            <button data-page="lab" class="nav-item"><span data-i18n="Harness Lab">Harness Lab</span></button>
+            <button data-page="collaboration" class="nav-item"><span data-i18n="Collaboration">Collaboration</span></button>
+            <button data-page="readiness" class="nav-item"><span data-i18n="Release readiness">Release readiness</span></button>
+          </details>
         </nav>
         <div class="sidebar-projects">
           <div class="sidebar-head"><span data-i18n="Projects">Projects</span><button id="add-project" class="small" data-i18n="Add project">Add project</button></div>
@@ -65,6 +68,7 @@
         <div id="welcome" class="welcome-surface">
           <div class="welcome-heading"><span class="welcome-mark" aria-hidden="true">K</span><h2 data-i18n="What would you like to work on?">What would you like to work on?</h2><p data-i18n="Describe an outcome. Keystone will work within your boundaries and bring back evidence.">Describe an outcome. Keystone will work within your boundaries and bring back evidence.</p></div>
           <div id="welcome-composer"></div>
+          <div id="getting-started"></div>
           <p class="welcome-caption" data-i18n="Local by default. Permissions stay explicit. Completion needs proof.">Local by default. Permissions stay explicit. Completion needs proof.</p>
         </div>
         <div id="view-host" class="view-host"></div>

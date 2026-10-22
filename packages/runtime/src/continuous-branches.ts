@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { compareBranches, getArtifactBytes, KernelSession, listBranches, loadCheckpoint, putJsonArtifact,
@@ -17,6 +17,7 @@ interface WorkspaceCapsule {
   patch: string;
   changedPaths: string[];
   files: { path: string; bytes: string; mode: number }[];
+  trackedModes?: { path: string; mode: number }[];
   fingerprint: string;
   observedFiles: [string, string][];
 }
@@ -40,6 +41,15 @@ export async function captureRecoveryWorkspace(paths: KeystonePaths, root: strin
     const covered = new Set([...tracked, ...untracked]);
     if ([...before.files.keys()].some((path) => !covered.has(path))) return undefined;
     const files: WorkspaceCapsule["files"] = [];
+    const trackedModes: NonNullable<WorkspaceCapsule["trackedModes"]> = [];
+    for (const path of dirty.filter((path) => tracked.includes(path))) {
+      const info = await lstat(join(root, path)).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      });
+      // Git omits non-executable permission bits; deletions and links have no regular-file mode to restore.
+      if (info?.isFile()) trackedModes.push({ path, mode: info.mode & 0o777 });
+    }
     let bytes = Buffer.byteLength(patch);
     for (const path of untracked) {
       const info = await lstat(join(root, path));
@@ -47,7 +57,7 @@ export async function captureRecoveryWorkspace(paths: KeystonePaths, root: strin
       files.push({ path, bytes: (await readFile(join(root, path))).toString("base64"), mode: info.mode & 0o777 });
     }
     if ((await observeWorkspace(root)).fingerprint !== before.fingerprint) return undefined;
-    return (await putJsonArtifact(paths, { version: "keystone.workspace-recovery/1", head, patch, changedPaths: dirty, files,
+    return (await putJsonArtifact(paths, { version: "keystone.workspace-recovery/1", head, patch, changedPaths: dirty, files, trackedModes,
       fingerprint: before.fingerprint, observedFiles: [...before.files] })).artifactId;
   } catch { return undefined; }
 }
@@ -68,6 +78,12 @@ export async function forkContinuousBranch(paths: KeystonePaths, taskId: string,
   }
   if (!capsule || !binding || capsule.fingerprint !== checkpoint.verification.workspaceFingerprint) {
     throw new Error("checkpoint has no exact supported workspace capsule; historical execution fork unavailable");
+  }
+  const trackedModes = capsule.trackedModes ?? [];
+  if (!Array.isArray(trackedModes) || trackedModes.some((file) => !file || typeof file.path !== "string" ||
+    !confined(file.path) || !capsule.changedPaths?.includes(file.path) ||
+    !Number.isInteger(file.mode) || file.mode < 0 || file.mode > 0o777)) {
+    throw new Error("unsafe or unadmitted capsule tracked mode");
   }
   // The detached fork receives the checkpoint contract; permissions remain the
   // user's existing task envelope. No source session events are appended.
@@ -101,6 +117,18 @@ export async function forkContinuousBranch(paths: KeystonePaths, taskId: string,
       if (!confined(file.path)) throw new Error("unsafe capsule path");
       await mkdir(join(workPath, file.path, ".."), { recursive: true });
       await writeFile(join(workPath, file.path), Buffer.from(file.bytes, "base64"), { mode: file.mode });
+    }
+    for (const file of trackedModes) {
+      if (!filesGrant?.ok) throw new Error("tracked mode restore requires filesystem lease");
+      const parts = file.path.split("/");
+      for (let depth = 1; depth < parts.length; depth++) {
+        if (!(await lstat(join(workPath, ...parts.slice(0, depth)))).isDirectory()) {
+          throw new Error("tracked mode restore cannot traverse a non-directory");
+        }
+      }
+      const target = join(workPath, file.path);
+      if (!(await lstat(target)).isFile()) throw new Error("tracked mode restore requires a regular file");
+      await chmod(target, file.mode);
     }
     const nextBinding = await putJsonArtifact(paths, runBindingSchema.parse({ ...binding,
       workPath, workspacePath: binding.workspacePath,

@@ -1,4 +1,4 @@
-const empty = () => ({ request: "", writePaths: "", allowedCommands: "", access: "read", attachmentIds: [], references: [], reason: "", goal: "" });
+const empty = () => ({ request: "", writePaths: "", allowedCommands: "", access: "read", attachmentIds: [], references: [], reason: "", goal: "", modelId: "" });
 
 export function createDraftStore(storage) {
   const memory = new Map();

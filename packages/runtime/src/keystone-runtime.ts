@@ -39,6 +39,7 @@ import {
 } from "@keystone/pack-engineering";
 import {
   buildActionPrompt,
+  MODEL_ROLES,
   ModelRouter,
   parseActionEnvelope,
   toActionProposals,
@@ -48,11 +49,17 @@ import {
 } from "@keystone/models";
 import {
   derivedIdBody,
+  arrayOf,
   canonicalJson,
   contentHash,
+  defineSchema,
+  lit,
+  nonEmptyStr,
   newId,
   nowIso,
+  objectOf,
   runBindingSchema,
+  sha256Validator,
   sha256Bytes,
   userDecisionSchema,
   type ActionProposal,
@@ -147,6 +154,9 @@ export interface TaskReference {
 export interface RunTaskOptions {
   readonly workspacePath: string;
   readonly request: string;
+  readonly taskIntent?: "analysis" | "engineering";
+  /** Selects only a registered model for this run's immutable route snapshot. */
+  readonly modelId?: string;
   readonly references?: readonly TaskReference[];
   readonly attachments?: readonly InputAttachment[];
   readonly attachmentParts?: readonly ModelContentPart[];
@@ -235,6 +245,24 @@ const DEFAULT_STEP_TOKEN_BUDGET = 24_000;
 const MAX_FILES_PER_PLAN = 40;
 const MAX_FILE_BYTES = 48_000;
 
+const taskModelRoutesSchema = defineSchema("keystone.runtime.taskModelRoutes", "1.0.0", objectOf({
+  kind: lit("runtime.task-model-routes"),
+  routes: objectOf({
+    builder: arrayOf(nonEmptyStr()),
+    planner: arrayOf(nonEmptyStr()),
+    summarizer: arrayOf(nonEmptyStr()),
+  }),
+  registrationFingerprint: sha256Validator,
+}));
+
+function modelRegistrationFingerprint(router: ModelRouter): string {
+  return contentHash(router.listAdapters().map(adapter => ({
+    descriptor: adapter.descriptor,
+    ...(adapter.configurationDigest === undefined ? {} : { configurationDigest: adapter.configurationDigest }),
+    ...(adapter.transportPermission === undefined ? {} : { transportPermission: adapter.transportPermission }),
+  })));
+}
+
 export class KeystoneRuntime {
   private readonly paths: KeystonePaths;
   private router = new ModelRouter();
@@ -270,6 +298,14 @@ export class KeystoneRuntime {
   /** Where this runtime's model traffic would go, for the user to inspect. */
   describeEgress(): ReturnType<ModelRouter["describeEgress"]> {
     return this.router.describeEgress();
+  }
+
+  listModels(): ReturnType<ModelRouter["listModels"]> {
+    return this.router.listModels();
+  }
+
+  listModelAdapters(): readonly ModelAdapter[] {
+    return this.router.listAdapters();
   }
 
   /** Swap routing for subsequent tasks; each active run holds its old router. */
@@ -325,6 +361,10 @@ export class KeystoneRuntime {
    */
   async runTask(options: RunTaskOptions): Promise<RunTaskResult> {
     const router = this.router.snapshot();
+    if (options.modelId) {
+      if (!router.listModels().some(entry => entry.id === options.modelId)) throw new Error("selected model is unavailable");
+      for (const role of ["builder", "planner", "summarizer"] as const) router.setRoute(role, [options.modelId]);
+    }
     const projectId = await projectIdForWorkspace(options.workspacePath);
     const releaseWrite = this.acquireWorkspaceWrite(projectId);
     try {
@@ -353,6 +393,10 @@ export class KeystoneRuntime {
     const projectId = await projectIdForWorkspace(options.workspacePath);
     if (projectId !== session.projectId) throw new Error("draft task belongs to another workspace");
     const router = this.router.snapshot();
+    if (options.modelId) {
+      if (!router.listModels().some(entry => entry.id === options.modelId)) throw new Error("selected model is unavailable");
+      for (const role of ["builder", "planner", "summarizer"] as const) router.setRoute(role, [options.modelId]);
+    }
     const releaseWrite = this.acquireWorkspaceWrite(projectId);
     try {
       return await this.executeTask({
@@ -379,12 +423,17 @@ export class KeystoneRuntime {
     const checkpoint = await session.latestCheckpoint();
     if (!checkpoint) throw new Error("resume requires a complete checkpoint");
     let binding: RunBinding | undefined;
+    let taskModelRoutes: ReturnType<typeof taskModelRoutesSchema.parse> | undefined;
     for (const ref of checkpoint.artifactRefs) {
       const bytes = await getArtifactBytes(this.paths, ref);
       if (!bytes || `art_${sha256Bytes(bytes)}` !== ref) throw new Error("resume artifact missing or corrupt");
       try {
         const value = JSON.parse(new TextDecoder().decode(bytes));
         if (value.schemaVersion === "keystone.runtime.runBinding@1.0.0") binding = runBindingSchema.parse(value);
+        if (value.kind === "runtime.task-model-routes") {
+          if (taskModelRoutes !== undefined) throw new Error("resume has conflicting model route bindings");
+          taskModelRoutes = taskModelRoutesSchema.parse(value);
+        }
       } catch (error) {
         if (error instanceof SyntaxError) continue;
         throw error;
@@ -397,7 +446,27 @@ export class KeystoneRuntime {
       throw new Error("resume inputs differ from the recorded task; revise explicitly");
     }
     if (binding.mode !== this.mode) throw new Error("resume mode differs from the recorded run");
-    const router = this.router.snapshot();
+    let router = this.router.snapshot();
+    if (taskModelRoutes !== undefined) {
+      if (taskModelRoutes.registrationFingerprint !== modelRegistrationFingerprint(router)) {
+        throw new Error("resume model registration configuration changed");
+      }
+      for (const role of MODEL_ROLES) {
+        const ids = taskModelRoutes.routes[role];
+        if (ids.some(id => !router.listModels().some(model => model.id === id))) {
+          throw new Error("selected model is unavailable");
+        }
+        router.setRoute(role, ids);
+      }
+    } else if (binding.configurationSnapshot?.builderModelId !== undefined) {
+      // Older selected tasks recorded only the builder ID. Preserve distinct
+      // default roles if only that original configuration matches the binding.
+      const selected = router.snapshot();
+      const modelId = binding.configurationSnapshot.builderModelId;
+      if (!selected.listModels().some(model => model.id === modelId)) throw new Error("selected model is unavailable");
+      for (const role of MODEL_ROLES) selected.setRoute(role, [modelId]);
+      if (binding.executionFingerprint === await this.executionFingerprint(selected)) router = selected;
+    }
     if (binding.executionFingerprint !== await this.executionFingerprint(router)) throw new Error("resume execution configuration or active extension identities changed");
     if (options.configurationSnapshot && contentHash(options.configurationSnapshot) !== contentHash(binding.configurationSnapshot)) {
       throw new Error("resume configuration snapshot changed");
@@ -420,9 +489,12 @@ export class KeystoneRuntime {
   }
 
   private async executionFingerprint(router: ModelRouter): Promise<string> {
+    const modelConfigurations = router.listAdapters().flatMap(adapter => adapter.configurationDigest === undefined
+      ? [] : [{ modelId: adapter.descriptor.id, configurationDigest: adapter.configurationDigest }]);
     const base = contentHash({ tools: this.tools.map((tool) => tool.descriptor),
       verifiers: this.verifiers.map((verifier) => verifier.descriptor),
-      models: router.listModels(), egress: router.describeEgress() });
+      models: router.listModels(), egress: router.describeEgress(),
+      ...(modelConfigurations.length === 0 ? {} : { modelConfigurations }) });
     const extensions = (await this.extensionService.list()).filter((entry) => entry.lifecycleStatus === "active")
       .map((entry) => ({ manifest: entry.manifest, reviewHash: entry.reviewHash, source: entry.source.locator }))
       .sort((a, b) => a.manifest.name.localeCompare(b.manifest.name));
@@ -476,6 +548,7 @@ export class KeystoneRuntime {
       paths: this.paths,
       projectId: attachment.projectId as never,
       request: options.request,
+      ...(options.taskIntent === undefined ? {} : { taskIntent: options.taskIntent }),
       references: options.references,
       ...(options.attachments === undefined ? {} : { attachments: options.attachments }),
       ...(options.configurationSnapshot === undefined ? {} : { configurationSnapshot: options.configurationSnapshot }),
@@ -627,10 +700,18 @@ export class KeystoneRuntime {
       executionFingerprint: await this.executionFingerprint(router),
     });
     const bindingArtifact = await putJsonArtifact(this.paths, binding);
+    const modelRoutesArtifact = await putJsonArtifact(this.paths, taskModelRoutesSchema.parse({
+      kind: "runtime.task-model-routes",
+      routes: Object.fromEntries(MODEL_ROLES.map(role => [
+        role, router.route(role).map(adapter => adapter.descriptor.id),
+      ])),
+      registrationFingerprint: modelRegistrationFingerprint(router),
+    }));
     const checkpointRun = async (reason: import("@keystone/schemas").CheckpointReason): Promise<void> => {
       const observation = await observeWorkspace(workPath);
       const workspaceArtifact = await captureRecoveryWorkspace(this.paths, workPath);
-      await session.checkpoint(reason, { artifactRefs: [bindingArtifact.artifactId, ...(workspaceArtifact ? [workspaceArtifact] : [])],
+      await session.checkpoint(reason, { artifactRefs: [bindingArtifact.artifactId, modelRoutesArtifact.artifactId,
+        ...(workspaceArtifact ? [workspaceArtifact] : [])],
         contractDigest: contentHash(contract),
         workspaceSnapshotId: snapshotId,
         verification: { workspaceFingerprint: observation.fingerprint as never } });
@@ -830,6 +911,13 @@ export class KeystoneRuntime {
           break;
         }
 
+        const publicAnswer = (envelope.answer ?? envelope.summary).trim();
+        const responseModel = router.listModels().find((entry) => entry.id === envelope.producerModelId);
+        if (publicAnswer && responseModel) await session.recordModelResponse({
+          stepId: plan.plan.stepId, modelId: responseModel.id, provider: responseModel.provider,
+          modelName: responseModel.modelName, text: publicAnswer,
+        });
+
         if (envelope.needs_user !== undefined) {
           const request = buildInterventionRequest({
             taskId: session.taskId,
@@ -864,14 +952,14 @@ export class KeystoneRuntime {
 
         if (
           envelope.actions.length === 0 ||
-          envelope.actions.some((action) => action.intent === "finish")
+          envelope.actions[0]?.intent === "finish"
         ) {
           break;
         }
 
         const builder = router.listModels().find((descriptor) => descriptor.id === envelope.producerModelId);
         const proposals = toActionProposals(
-          envelope,
+          { ...envelope, actions: envelope.actions.slice(0, 1) },
           {
             taskId: session.taskId,
             branchId: session.branchId,
@@ -942,7 +1030,12 @@ export class KeystoneRuntime {
         }
         await checkpointRun("stage_boundary");
 
-        const progressKey = `${[...changedPaths].sort().join(",")}`;
+        const lastExecution = session.events().filter((event) => event.type === "action.executed").at(-1);
+        const progressKey = contentHash({
+          changedPaths: [...changedPaths].sort(),
+          tool: proposal.tool.id, parameters: proposal.parameters,
+          outputHash: lastExecution?.payload["outputHash"] ?? null,
+        });
         noProgressStreak = progressKey === lastProgressKey ? noProgressStreak + 1 : 0;
         lastProgressKey = progressKey;
         if (noProgressStreak >= 2) {
@@ -992,7 +1085,26 @@ export class KeystoneRuntime {
         session,
         contract,
         changedPaths: [...changedPaths],
-        verifiers: [...this.verifiers, ...(extensions?.verifiers ?? [])] as readonly Verifier[],
+        verifiers: [...this.verifiers, ...(extensions?.verifiers ?? []),
+          ...(session.taskIntent() === "analysis" ? [{
+            descriptor: {
+              kind: "custom" as const, id: "verifier.analysis_workspace", version: "1.0.0",
+              evidenceLevel: "E2" as const, canSatisfyRequiredCondition: true, timeoutMs: 30000,
+              requiresCommand: false,
+              independence: { mode: "same_process" as const, independentOf: ["builder_loop_model" as const] },
+              description: "Compares complete observed workspace content before and after analysis",
+            },
+            async run() {
+              const observed = await observeWorkspace(workPath);
+              const unchanged = observed.fingerprint === baselineObservation.fingerprint;
+              return {
+                status: unchanged ? "passed" as const : "failed" as const,
+                summary: unchanged ? "analysis left the complete workspace unchanged" : "workspace changed during analysis",
+                outputBytes: 0, truncated: false, durationMs: 0,
+              };
+            },
+          }] : []),
+        ] as readonly Verifier[],
         workspaceSnapshotId: snapshotId,
         workspaceFingerprint: fingerprint,
         ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -1008,6 +1120,19 @@ export class KeystoneRuntime {
           reasons.push(verificationControl.reason);
           break;
         }
+      }
+
+      if (session.taskIntent() === "analysis") {
+        const unverified = contract.completionConditions
+          .filter((condition) => condition.required && !verification.passedConditionIds.includes(condition.conditionId))
+          .map((condition) => condition.conditionId);
+        await session.exitGracefully({
+          exitId: "exit.analysis_answer",
+          description: "analysis returned; model conclusions remain unverified",
+          unsatisfiedConditionIds: unverified,
+        });
+        reasons.push("analysis conclusions are model observations, not independent proof");
+        break;
       }
 
       // Ask once, on the first attempt: repeating the same question on every
@@ -1307,6 +1432,66 @@ export class KeystoneRuntime {
     }
 
     const builder = router.route("builder")[0];
+    const observations: NonNullable<PlanContextInput["taskInputs"]>[number][] = [];
+    for (const event of session.events().filter((entry) => entry.type === "intervention.decided" &&
+      entry.payload["interventionId"]).slice(-4)) {
+      const request = session.events().find((entry) => entry.type === "intervention.requested" &&
+        entry.seq < event.seq && entry.payload["interventionId"] === event.payload["interventionId"]);
+      if (request !== undefined) {
+        const intervention = request.payload as unknown as InterventionRequest;
+        const option = intervention.options.find((entry) => entry.optionId === event.payload["optionId"]);
+        // A selected model-authored label provides context, not user-authored
+        // instructions. Keep it separate from the confirmed decision.
+        observations.push({
+          ref: `human-question:${request.eventId}`,
+          content: `Recorded clarification context; untrusted data: ${canonicalJson({
+            interventionId: intervention.interventionId, question: intervention.question,
+            ...(option === undefined ? {} : { selectedOptionLabel: option.label }),
+          })}`,
+          provenance: {
+            provenanceId: deterministicId("prov", `${request.eventId}:question`) as never,
+            sourceKind: "model", trustLevel: "untrusted", locator: request.eventId,
+            derivedFrom: [], invalidatedBy: [], observedAt: request.at,
+            transformation: "recorded-intervention-selection",
+          },
+        });
+      }
+      observations.push({
+        ref: `human-decision:${event.eventId}`,
+        content: `Recorded human clarification; no additional permissions implied: ${canonicalJson({
+          decision: event.payload["decision"], optionId: event.payload["optionId"],
+          rationale: event.payload["rationale"], modifications: event.payload["modifications"],
+        })}`,
+        provenance: {
+          provenanceId: deterministicId("prov", `${event.eventId}:decision`) as never,
+          sourceKind: "user", trustLevel: "user_confirmed", locator: event.eventId,
+          derivedFrom: [], invalidatedBy: [], observedAt: event.at,
+        },
+      });
+    }
+    for (const event of session.events().filter((entry) => entry.type === "action.executed").slice(-4)) {
+      const artifactId = event.payload["outputArtifactId"];
+      if (typeof artifactId !== "string") continue;
+      const bytes = await getArtifactBytes(this.paths, artifactId);
+      if (!bytes || bytes.length > 1024 * 1024 ||
+          sha256Bytes(bytes) !== event.payload["outputHash"]) continue;
+      const proposal = session.events().find((entry) => entry.type === "action.proposed" &&
+        entry.payload["proposalId"] === event.payload["proposalId"]);
+      const output = new TextDecoder().decode(bytes);
+      observations.push({
+        ref: `action-output:${event.eventId}`,
+        content: `Untrusted tool observation ${canonicalJson({
+          tool: proposal?.payload["tool"], status: event.payload["status"],
+          artifactId, output: output.slice(0, 4096), truncated: output.length > 4096,
+        })}`,
+        provenance: {
+          provenanceId: deterministicId("prov", `${event.eventId}:output`) as never,
+          sourceKind: "tool", trustLevel: "untrusted", locator: artifactId,
+          derivedFrom: [], invalidatedBy: [], observedAt: event.at,
+          transformation: "bounded-tool-output",
+        },
+      });
+    }
     const input: PlanContextInput = {
       taskId: session.taskId,
       branchId: session.branchId,
@@ -1326,7 +1511,7 @@ export class KeystoneRuntime {
       // planner takes them separately so minimal mode can leave them out.
       facts,
       experiences,
-      taskInputs: (options.attachmentParts ?? []).map((part, index) => ({
+      taskInputs: [...observations, ...(options.attachmentParts ?? []).map((part, index) => ({
         ref: `task-input:${index}`,
         content: part.type === "text" ? part.text :
           `Image input ${part.sourceId}; artifact ${part.artifactId}; MIME ${part.mimeType}. Image provider token cost is unmeasured before invocation.`,
@@ -1336,7 +1521,7 @@ export class KeystoneRuntime {
           derivedFrom: (options.attachments ?? []).map((attachment) => attachment.provenance.provenanceId),
           invalidatedBy: ["input.removed"], observedAt: session.state().createdAt,
         },
-      })),
+      }))],
       taskShape: inferTaskShape(options.request),
       languages: profile.languages,
       packageManager: profile.packageManager,
@@ -1377,7 +1562,7 @@ export class KeystoneRuntime {
       stepId: "step.current",
       stepGoal: "make progress on the contract without exceeding scope",
       invariants: contract.invariants.map((invariant) => invariant.description),
-      writeScope: contract.scope.include.map((entry) => entry.pattern),
+      writeScope: contract.scope.include.filter((entry) => entry.intent === "write").map((entry) => entry.pattern),
       allowedCommands: contract.autonomy.allowedCommands,
       availableTools: [...this.tools.map((tool) => tool.descriptor), ...extensionDescriptors],
       contextSection,
@@ -1399,10 +1584,33 @@ export class KeystoneRuntime {
     const model = router.route("builder")[0];
     if (model === undefined) throw new Error("no builder model is configured");
     const attempts = new Map<string, { leaseId: string; started: number }>();
+    const transportLeases: string[] = [];
     const outcome = await router.complete("builder", {
         messages: [{ role: "user", content: attachmentParts.length === 0 ? prompt : [{ type: "text", text: prompt }, ...attachmentParts] }],
         tools: [], jsonMode: true,
         maxTokens: Math.max(1, Math.min(8192, contract.budget.maxTokens - session.state().budgetUsed.tokens)),
+        async authorizeTransport(proposal) {
+          if (signal?.aborted) throw new Error("model transport cancelled");
+          if ("nativeAuthFile" in proposal.parameters) {
+            const auth = await session.authorizeOperation({
+              subject: proposal.subject, capability: "credential.use", resourceValues: ["trae-cli-native-login"],
+              parametersHash: proposal.parametersHash,
+            });
+            if (!auth.ok) throw new Error(auth.denial.detail);
+            transportLeases.push(auth.lease.leaseId);
+          }
+          const grant = await session.authorizeOperation({
+            subject: proposal.subject, capability: "cmd.exec",
+            resourceValues: proposal.resource.values, parametersHash: proposal.parametersHash,
+            workingDirectory: proposal.parameters.cwd, timeoutMs: proposal.parameters.timeoutMs,
+            maxOutputBytes: proposal.parameters.maxOutputBytes,
+            argvPrefix: proposal.parameters.args.slice(0, 1),
+            ttlMs: Math.min(300000, proposal.parameters.timeoutMs + 5000),
+          });
+          if (!grant.ok) throw new Error(grant.denial.detail);
+          transportLeases.push(grant.lease.leaseId);
+          return grant.lease;
+        },
         ...(signal === undefined ? {} : { signal }),
       }, {
         async beforeAttempt(descriptor) {
@@ -1418,6 +1626,7 @@ export class KeystoneRuntime {
           const attempt = attempts.get(descriptor.id);
           if (attempt === undefined) throw new Error("model invocation has no capability lease");
           await session.consumeExecutionLease(attempt.leaseId);
+          for (const leaseId of transportLeases.splice(0)) await session.consumeExecutionLease(leaseId);
           await session.recordBudget({
             tokens: response === undefined ? 0 : response.usage.inputTokens + response.usage.outputTokens,
             wallClockMs: Math.max(1, Date.now() - attempt.started),
@@ -1500,6 +1709,10 @@ export class KeystoneRuntime {
     }
     const after = await observeWorkspace(workPath);
     const actualChangedPaths = [...new Set([...result.changedPaths, ...changedObservedPaths(before, after)])];
+    const outputArtifact = result.stdout || result.stderr
+      ? await putJsonArtifact(this.paths, { stdout: (result.stdout ?? "").slice(0, 32768),
+          stderr: (result.stderr ?? "").slice(0, 32768), truncated: result.truncated ?? false })
+      : undefined;
 
     await session.recordExecution({
       proposalId: proposal.proposalId,
@@ -1507,7 +1720,9 @@ export class KeystoneRuntime {
       status: result.status,
       ...(result.exitCode === undefined ? {} : { exitCode: result.exitCode }),
       durationMs: result.durationMs || Date.now() - started,
-      ...(result.artifactId === undefined ? {} : { artifactId: result.artifactId }),
+      ...(outputArtifact ? { artifactId: outputArtifact.artifactId } :
+        result.artifactId === undefined ? {} : { artifactId: result.artifactId }),
+      ...(outputArtifact === undefined ? {} : { outputHash: outputArtifact.sha256 }),
       ...(result.outputBytes === undefined ? {} : { outputBytes: result.outputBytes }),
       changedPaths: actualChangedPaths,
       ...(result.errorCode === undefined ? {} : { errorCode: result.errorCode }),

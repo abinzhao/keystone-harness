@@ -114,8 +114,8 @@ function collapse(text: string): string {
 function goalFromRequest(request: string): string {
   const collapsed = collapse(request);
   if (collapsed.length === 0) return "Complete the requested task";
-  const match = collapsed.match(/^[^。！？.!?]*[。！？.!?]?/);
-  const sentence = (match?.[0] ?? collapsed).trim();
+  const boundary = /[。！？]|[.!?](?=\s|$)/.exec(collapsed);
+  const sentence = (boundary ? collapsed.slice(0, boundary.index + 1) : collapsed).trim();
   const base = sentence.length > 0 ? sentence : collapsed;
   return base.length <= MAX_GOAL_CHARS ? base : `${base.slice(0, MAX_GOAL_CHARS - 1)}…`;
 }
@@ -178,6 +178,7 @@ function inferScopeDirectories(
 }
 
 export function compileContract(input: CompileContractInput): CompileContractResult {
+  if (input.taskIntent === "analysis") return compileAnalysisContract(input);
   const questions: ContractQuestion[] = [];
   const invariants: Invariant[] = [];
   const conditions: CompletionCondition[] = [];
@@ -357,4 +358,37 @@ export function compileContract(input: CompileContractInput): CompileContractRes
   }) as OutcomeContract;
 
   return { contract, questions };
+}
+
+function compileAnalysisContract(input: CompileContractInput): CompileContractResult {
+  const include: ScopeEntry[] = input.autonomy.readPaths.map((pattern) => ({
+    kind: "glob", pattern, intent: "read",
+  }));
+  const contract = outcomeContractSchema.parse({
+    contractId: newId("contract"), version: 1, taskId: input.taskId, projectId: input.projectId,
+    createdAt: new Date().toISOString(), createdBy: "kernel", goal: goalFromRequest(input.request),
+    scope: { include, exclude: EXCLUDED_SCOPE, unknown: [] },
+    invariants: [{ invariantId: "inv.readonly", description: "analysis cannot modify the workspace" }],
+    completionConditions: [
+      {
+        conditionId: "cond.analysis_answer", description: "the analysis conclusions have independent supporting evidence",
+        verifier: { kind: "custom", id: "verifier.analysis_answer", version: "1.0.0" },
+        minEvidenceLevel: "E2", requiresIndependence: true, required: true,
+      },
+      {
+        conditionId: "cond.scope_check", description: "the analysis leaves the workspace unchanged",
+        verifier: { kind: "custom", id: "verifier.analysis_workspace", version: "1.0.0" },
+        minEvidenceLevel: "E2", requiresIndependence: false, required: true,
+      },
+    ],
+    budget: input.budget ?? DEFAULT_BUDGET,
+    autonomy: { ...input.autonomy, writePaths: [], allowedCommands: [] },
+    uncertainties: [], interventionTriggers: DEFAULT_TRIGGERS,
+    exitConditions: [...DEFAULT_EXIT_CONDITIONS, {
+      exitId: "exit.analysis_answer", kind: "external_dependency",
+      description: "analysis returned; model conclusions remain unverified",
+    }],
+    status: "ready", schemaVersion: "keystone.contract.outcome@1.0.0",
+  }) as OutcomeContract;
+  return { contract, questions: [] };
 }

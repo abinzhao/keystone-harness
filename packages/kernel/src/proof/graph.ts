@@ -34,6 +34,7 @@ export type { EvaluateInput } from "./evaluate.ts";
 
 export interface ProofGraphInput {
   readonly contract: OutcomeContract;
+  readonly taskIntent?: "analysis" | "engineering";
   readonly branchId: string;
   /** Paths the change set actually touched (from git diff). */
   readonly changedPaths: readonly string[];
@@ -125,6 +126,7 @@ function evidenceNodeState(
 export function buildProofGraph(input: ProofGraphInput): ProofGraph {
   const decision = evaluateCompletion({
     contract: input.contract,
+    taskIntent: input.taskIntent,
     branchId: input.branchId,
     changedPaths: input.changedPaths,
     workspaceFingerprint: input.workspaceFingerprint,

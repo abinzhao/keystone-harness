@@ -45,6 +45,8 @@ export interface ContractProposalInput {
   readonly projectId: string;
   /** The user's request, verbatim. */
   readonly request: string;
+  /** Recorded at creation; absent on legacy engineering tasks. */
+  readonly taskIntent?: "analysis" | "engineering";
   readonly references?: readonly {
     readonly kind: "file" | "directory" | "issue" | "log" | "url" | "text";
     readonly value: string;

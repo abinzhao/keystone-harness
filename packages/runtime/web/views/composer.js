@@ -2,7 +2,7 @@ import { node, button, field, selectField, tr, note, jsonDetails, notify, localG
 import { post, taskPath } from "../client/api.js";
 import { attachmentMime, validateAttachment, imageRouteWarning, parseFileReferences, referencesFromWritePaths, routedModels, confirmAttachmentEgress } from "../state/composer.js";
 
-export function createComposer(host, { client, request, drafts, dialogs, getSettings, getEgress = () => [], afterStart, referencePicker }) {
+export function createComposer(host, { client, request, drafts, dialogs, getSettings, getEgress, afterStart, referencePicker, configureModel }) {
   let selectedKey = "";
   let draftProjectId = null;
   let draftTaskId = null;
@@ -17,6 +17,10 @@ export function createComposer(host, { client, request, drafts, dialogs, getSett
   let processors = [];
   let processorsProject = "";
   let preferredProcessor = "";
+  let composing = false;
+  let disposed = false;
+  let modelSignature = "";
+  const runtimeDestinations = () => getEgress?.() ?? [];
   const uploads = new Set();
   const previews = new Map();
   const form = node("form", { class: "composer" });
@@ -30,6 +34,9 @@ export function createComposer(host, { client, request, drafts, dialogs, getSett
   const attachInput = node("input", { type: "file", multiple: true, accept: ".png,.jpg,.jpeg,.webp,.txt,.md,.log,.csv,.json,.jsonl,.pdf,.doc,.docx,.wav,.mp3,.m4a,.ogg", class: "sr-only", tabindex: "-1", "aria-label": tr("Attach local input files") });
   const chips = node("div", { "aria-label": tr("Attachments") });
   const feedback = node("div", { role: "status", "aria-live": "polite" });
+  const readiness = node("div", { class: "composer-readiness muted", role: "status", "aria-live": "polite" });
+  const model = node("select", { id: "composer-model", "aria-label": tr("Model for upcoming task"), title: tr("Applies only to the upcoming task. Active task configuration is unchanged.") });
+  model.value = "";
   const writePaths = node("input", { id: "composer-write", placeholder: "src/**" });
   const commands = node("input", { id: "composer-commands", placeholder: "node, pnpm" });
   const reason = node("input", { id: "composer-reason" });
@@ -155,13 +162,13 @@ export function createComposer(host, { client, request, drafts, dialogs, getSett
     }
   }
   const egress = () => {
-    const models = routedModels(getSettings()?.config, "builder", getEgress());
+    const models = routedModels(getSettings()?.config, "builder", runtimeDestinations(), mode === "new" ? model.value : "");
     const content = node("div", { class: "stack" }, [
       note("Imported locally is not the same as sent. Submitting may send this input to the configured route."),
       jsonDetails("Selected attachments", attachments.map(({ name, mimeType, size, contentHash, kind }) => ({ name, mimeType, size, contentHash, kind }))),
       jsonDetails("Primary and fallback destinations", models.map(({ id, kind, endpointHost, protocol, multimodal }) => ({ id, kind, endpointHost, protocol, multimodal }))),
     ]);
-    const warning = imageRouteWarning(getSettings()?.config, attachments, getEgress());
+    const warning = imageRouteWarning(getSettings()?.config, attachments, runtimeDestinations(), mode === "new" ? model.value : "");
     if (warning) content.prepend(note(warning, "warn"));
     dialogs.open("Input and egress preview", content, [button("Close", () => dialogs.close())]);
   };
@@ -189,11 +196,12 @@ export function createComposer(host, { client, request, drafts, dialogs, getSett
       importedFiles,
       manageProcessors,
       button("Egress preview", egress),
+      ...(configureModel ? [button("Configure a model", configureModel)] : []),
     ]),
   ]);
   form.append(feedback, input, chips, node("div", { class: "composer-controls" }, [
-    inputMenu, operation, access, submit,
-  ]), options, attachInput);
+    inputMenu, operation, access, model, submit,
+  ]), readiness, options, attachInput);
   host.replaceChildren(form);
   const scopeTask = () => mode === "new" ? null : client.state.taskId;
   function persist() {
@@ -201,13 +209,52 @@ export function createComposer(host, { client, request, drafts, dialogs, getSett
     draft = drafts.set(draftProjectId, draftTaskId, {
       request: input.value, writePaths: writePaths.value, allowedCommands: commands.value, access: access.value,
       reason: reason.value, attachmentIds: attachments.map((entry) => entry.attachmentId),
+      modelId: model.value,
     });
   }
-  for (const control of [input, writePaths, commands, reason, access]) control.addEventListener("input", persist);
+  for (const control of [input, writePaths, commands, reason, access]) control.addEventListener("input", () => { persist(); paintAttachments(); });
+  model.onchange = () => { persist(); paintAttachments(); };
+  access.addEventListener("change", () => { persist(); paintAttachments(); });
+  input.addEventListener("compositionstart", () => { composing = true; });
+  input.addEventListener("compositionend", () => { composing = false; });
   input.addEventListener("keydown", (event) => {
+    if (event.isComposing || composing || event.keyCode === 229) return;
+    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault(); event.stopPropagation?.();
+      if (!inputMenu.open) return form.requestSubmit();
+      return;
+    }
     if (event.key === "@" && input.selectionStart === input.value.length) { event.preventDefault(); referencePicker(); }
   });
+  function paintModels(selected = model.value) {
+    model.disabled = mode !== "new";
+    const bound = client.state.detail?.configurationSnapshot?.builderModelId;
+    const config = getSettings()?.config;
+    const available = [...(config?.models ?? []), ...routedModels(null, "builder", runtimeDestinations())]
+      .filter((entry, index, all) => all.findIndex((value) => value.id === entry.id) === index);
+    const signature = JSON.stringify([available, config?.routes, selected, mode, bound, globalThis.KEYSTONE_LANG]);
+    if (signature === modelSignature) return;
+    modelSignature = signature;
+    if (mode !== "new") {
+      model.replaceChildren(node("option", { value: selected, text: bound ?? tr("Task-bound configuration") }));
+      model.value = selected;
+      return;
+    }
+    const primary = routedModels(config, "builder", runtimeDestinations())[0];
+    model.replaceChildren(node("option", { value: "", text: primary
+      ? `${primary.modelName || primary.id} · ${tr(primary.kind === "local" ? "Local" : "Cloud")} · ${tr("Configured route")}` : tr("Configured route") }),
+      ...available.map((entry) => node("option", {
+        value: entry.id,
+        text: `${entry.modelName || entry.id} · ${tr(entry.kind === "local" ? "Local" : "Cloud")}${entry.enabled === false ? ` · ${tr("Disabled")}` : ""}`,
+        disabled: entry.enabled === false,
+      })));
+    if (selected && !available.some((entry) => entry.id === selected)) model.append(node("option", { value: selected, text: `${selected} · ${tr("Selected model unavailable")}`, disabled: true }));
+    model.value = selected;
+    model.disabled = mode !== "new";
+  }
   function paintAttachments() {
+    if (disposed) return;
+    paintModels();
     chips.replaceChildren();
     for (const entry of attachments) {
       const preview = button(`${entry.name} · ${bytes(entry.size)} · ${tr(entry.status)}`, () => {
@@ -223,9 +270,21 @@ export function createComposer(host, { client, request, drafts, dialogs, getSett
       remove.setAttribute("aria-label", tr("Remove {name}", { name: entry.name }));
       chips.append(node("div", { class: "attachment" }, [preview, remove]));
     }
-    const warning = imageRouteWarning(getSettings()?.config, attachments, getEgress());
+    const warning = imageRouteWarning(getSettings()?.config, attachments, runtimeDestinations(), model.value);
     if (warning) chips.append(note(warning, "warn"));
-    submit.disabled = busy || uploading > 0 || !client.state.projectId || !!warning;
+    const knownRouting = !!getEgress || !!getSettings();
+    const unavailableModel = mode === "new" && !!model.value && model.options[model.selectedIndex]?.disabled;
+    const missingModel = unavailableModel || (knownRouting && mode !== "revise" && !routedModels(getSettings()?.config, "builder", runtimeDestinations(), mode === "new" ? model.value : "").length);
+    const message = !client.state.projectId ? "Add or select a project to begin."
+      : unavailableModel ? "Selected model unavailable"
+      : missingModel ? "Configure a model before starting a task. Your draft stays local."
+      : !input.value.trim() ? "Describe an outcome to start. Enter adds a line; Cmd/Ctrl+Enter submits."
+      : uploading ? "Importing attachments; wait before starting. Your draft stays local."
+      : busy ? "Submitting; your draft is retained until the server accepts it."
+      : mode === "new" ? "Applies only to the upcoming task. Active task configuration is unchanged." : "";
+    readiness.replaceChildren(...(message ? [node("span", { text: tr(message) })] : []));
+    if (missingModel && configureModel) readiness.append(button("Configure a model", configureModel));
+    submit.disabled = busy || uploading > 0 || !client.state.projectId || !input.value.trim() || missingModel || !!warning;
   }
   async function bindSelection() {
     const availableDraft = client.state.detail?.status === "draft" && !!client.state.taskId;
@@ -255,6 +314,8 @@ export function createComposer(host, { client, request, drafts, dialogs, getSett
     input.readOnly = mode === "draft";
     attach.disabled = mode === "draft";
     writePaths.value = draft.writePaths; commands.value = draft.allowedCommands; reason.value = draft.reason; access.value = draft.access;
+    // Native selects discard values without options; restore once before asynchronous loads.
+    paintModels(draft.modelId ?? "");
     attachments = []; feedback.replaceChildren();
     reasonField.hidden = mode !== "revise";
     submit.textContent = tr(mode === "revise" ? "Send revision" : mode === "draft" ? "Start imported draft" : "Start task");
@@ -363,7 +424,9 @@ export function createComposer(host, { client, request, drafts, dialogs, getSett
   form.onsubmit = async (event) => {
     event.preventDefault();
     if (busy || uploading || !input.value.trim() || !client.state.projectId) return;
-    const warning = imageRouteWarning(getSettings()?.config, attachments, getEgress());
+    paintAttachments();
+    if (submit.disabled) return;
+    const warning = imageRouteWarning(getSettings()?.config, attachments, runtimeDestinations(), model.value);
     if (warning) { feedback.replaceChildren(note(warning, "bad")); return; }
     const project = client.state.projects.find((entry) => entry.projectId === client.state.projectId);
     const key = selectedKey; const projectId = client.state.projectId; const taskId = client.state.taskId;
@@ -371,7 +434,8 @@ export function createComposer(host, { client, request, drafts, dialogs, getSett
     const selectedVersion = version;
     const selectedSelection = client.selectionVersion;
     const configuration = getSettings();
-    const runtimeEgress = getEgress();
+    const runtimeEgress = runtimeDestinations();
+    const selectedModelId = mode === "new" ? model.value : "";
     const attached = attachments.slice();
     const permissions = {
       access: access.value, writePaths: writePaths.value, commands: commands.value, reason: reason.value,
@@ -379,7 +443,8 @@ export function createComposer(host, { client, request, drafts, dialogs, getSett
     };
     const attachmentSignature = attached.map((entry) => entry.attachmentId).join(",");
     const isCurrent = () => selectedVersion === version && selectedSelection === client.selectionVersion && key === selectedKey && snapshot === input.value
-      && configuration === getSettings() && JSON.stringify(runtimeEgress) === JSON.stringify(getEgress())
+      && configuration === getSettings() && JSON.stringify(runtimeEgress) === JSON.stringify(runtimeDestinations())
+      && selectedModelId === (mode === "new" ? model.value : "")
       && permissions.access === access.value && permissions.writePaths === writePaths.value
       && permissions.commands === commands.value && permissions.reason === reason.value
       && permissions.confirmAllWrites === (localGet("keystone.confirmAllWrites") === "1")
@@ -404,6 +469,8 @@ export function createComposer(host, { client, request, drafts, dialogs, getSett
         if (permissions.access === "write" && !paths.length) { writePaths.focus(); options.open = true; feedback.replaceChildren(note("Scoped writes require explicit write paths.", "warn")); return; }
         const base = {
           workspacePath: project.rootPath, request: snapshot, writePaths: paths, allowedCommands: list(permissions.commands),
+          taskIntent: permissions.access === "write" ? "engineering" : "analysis",
+          ...(selectedModelId ? { modelId: selectedModelId } : {}),
           references: [...referencesFromWritePaths(paths), ...parseFileReferences(snapshot)],
           attachmentIds: attached.map((entry) => entry.attachmentId), confirmAllWrites: permissions.confirmAllWrites,
         };
@@ -434,7 +501,7 @@ export function createComposer(host, { client, request, drafts, dialogs, getSett
             jsonDetails("Attachment source and hashes", plan.files),
           ]),
           "Send these attachments",
-        ), isCurrent, runtimeEgress);
+        ), isCurrent, runtimeEgress, selectedModelId);
         if (!grant || !isCurrent()) {
           if (isCurrent()) feedback.replaceChildren(note("Attachment submission cancelled. Check configuration or confirm cloud egress; the draft is retained.", "warn"));
           return;
@@ -449,7 +516,7 @@ export function createComposer(host, { client, request, drafts, dialogs, getSett
               }
             : { ...base, startMode, ...grant }));
         const navigate = isCurrent();
-        if (key === selectedKey && input.value === snapshot) {
+        if (navigate) {
           drafts.clear(projectId, draftStart ? taskId : null); draft = null; selectedKey = "";
         }
         if (navigate) await afterStart(started.taskId, projectId);
@@ -466,10 +533,14 @@ export function createComposer(host, { client, request, drafts, dialogs, getSett
   return {
     refresh: paintAttachments,
     importFiles,
-    submit() { form.requestSubmit(); },
-    reference(value) { input.value += `${input.value && !input.value.endsWith(" ") ? " " : ""}${value} `; persist(); input.focus(); },
+    submit() { if (!composing && !inputMenu.open) form.requestSubmit(); },
+    example(value) {
+      if (mode !== "new" || busy || input.value.trim()) return false;
+      input.value = value; access.value = "read"; persist(); paintAttachments(); input.focus(); return true;
+    },
+    reference(value) { if (mode === "draft") return; input.value += `${input.value && !input.value.endsWith(" ") ? " " : ""}${value} `; persist(); paintAttachments(); input.focus(); },
     newTask() { persist(); mode = "new"; operation.value = "new"; void bindSelection(); input.focus(); },
-    dispose() { persist(); version += 1; uploads.forEach((value) => value.abort()); previews.forEach((value) => URL.revokeObjectURL(value)); unsubscribe(); },
+    dispose() { persist(); disposed = true; version += 1; uploads.forEach((value) => value.abort()); previews.forEach((value) => URL.revokeObjectURL(value)); unsubscribe(); },
   };
 }
 

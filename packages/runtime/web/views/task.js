@@ -1,5 +1,7 @@
 import { button, node, tr, kv, note, jsonDetails, statusTone, bytes } from "../components/dom.js";
 import { post, taskPath } from "../client/api.js";
+import { modelMessage } from "../components/model-message.js";
+import { interventionText, interventionChoice } from "../state/interventions.js";
 
 const STAGES = ["understanding", "planning", "authorizing", "modifying", "verifying", "delivering"];
 const TERMINAL = new Set(["proven", "exited_gracefully", "failed", "stopped", "unrecoverable"]);
@@ -20,7 +22,7 @@ export function proofIsCurrent(state) {
     && state.detail?.ledger?.integrityOk !== false && (!state.proof.taskId || state.proof.taskId === state.taskId);
 }
 
-export function renderOverview(host, state) {
+export function renderOverview(host, state, actions = {}) {
   const detail = state.detail;
   if (!detail) {
     host.replaceChildren(node("div", { class: "empty" }, [
@@ -29,6 +31,7 @@ export function renderOverview(host, state) {
     return;
   }
   const contract = detail.contract;
+  const analysis = detail.taskIntent === "analysis";
   const open = new Set([...host.querySelectorAll("details")].filter((item) => item.open).map((item) => item.dataset.key));
   const conditions = node("div", { id: "overview-conditions" });
   const summary = node("article", { class: "task-summary stack" }, [
@@ -44,6 +47,15 @@ export function renderOverview(host, state) {
     node("div", {}, [node("h3", { text: tr("Completion conditions") }), conditions]),
   ]);
   host.replaceChildren(summary);
+  if (detail.request) host.prepend(node("div", { class: "user-request" }, [
+    node("span", { class: "eyebrow", text: tr("Your request") }), node("p", { text: detail.request }),
+  ]));
+  const messages = detail.messages?.length ? detail.messages
+    : (state.events ?? []).filter((event) => event.type === "model.response_recorded")
+      .map((event) => ({ ...event.payload, at: event.payload?.at ?? event.at }));
+  if (analysis) host.append(note("Analysis result; model conclusions are not independently verified.", "warn"));
+  if (messages.length) host.append(node("section", { class: "model-messages", "aria-label": tr("Model responses") }, messages.map((message) => modelMessage(message, actions))));
+  else if (["executing", "verifying", "auto_repairing"].includes(detail.status)) host.append(note("Waiting for a recorded model response. Progress is shown by recorded actions and stages."));
   renderConditions(conditions, state);
   const boundaries = node("details", { class: "task-boundaries" }, [node("summary", { text: tr("Scope and invariants") })]);
   boundaries.dataset.key = "boundaries";
@@ -69,7 +81,7 @@ export function renderOverview(host, state) {
   if (detail.degradation) host.prepend(note(tr("Degraded to {mode}: {reason}", detail.degradation), "warn"));
   if (TERMINAL.has(detail.status)) {
     const receipt = node("div", { id: "receipt", class: "notice" });
-    receipt.append(node("h2", { text: tr(proofIsCurrent(state) ? "Safe to deliver" : "The task finished, but its proof is not complete.") }));
+    receipt.append(node("h2", { text: tr(analysis ? "Analysis result" : proofIsCurrent(state) ? "Safe to deliver" : "The task finished, but its proof is not complete.") }));
     const required = (state.proof?.conditions ?? []).filter((entry) => entry.required);
     const known = state.proof?.changes;
     receipt.append(node("p", { text: `${tr("Required conditions")}: ${required.filter((entry) => entry.satisfied).length}/${required.length} · ${tr("Changed files")}: ${known?.changedFileCount ?? tr("Unknown")}` }));
@@ -102,7 +114,7 @@ function renderConditions(host, state, evidence = false) {
     wrap.dataset.key = condition.conditionId;
     wrap.append(node("summary", {}, [
       node("span", { class: `pill ${label === "satisfied" ? "ok" : "warn"}`, text: tr(label) }),
-      node("span", { text: condition.description ?? condition.conditionId }),
+      node("span", { text: tr(condition.description ?? condition.conditionId) }),
     ]));
     wrap.append(node("p", { class: "muted", text: [
       tr(condition.required ? "required" : "auxiliary"), condition.minEvidenceLevel, condition.verifier,
@@ -241,29 +253,74 @@ export function renderInspector(state, { request, dialogs, refresh, drafts }) {
         drafts.set(projectId, taskId, { [`decision-${intervention.interventionId}`]: rationale.value });
       };
       const item = node("div", { class: "decision" }, [
-        node("h3", { text: intervention.question }),
-        node("p", { class: "muted", text: tr("Why you: {text}", { text: intervention.whyUserNeeded }) }),
-        node("p", { class: "muted", text: tr("If ignored: {text}", { text: intervention.ifIgnoredImpact }) }),
+        node("h3", { text: interventionText(intervention.question, intervention.trigger) }),
+        node("p", { class: "muted", text: tr("Why you: {text}", { text: interventionText(intervention.whyUserNeeded) }) }),
+        node("p", { class: "muted", text: tr("If ignored: {text}", { text: interventionText(intervention.ifIgnoredImpact) }) }),
         jsonDetails("Context and requested permissions", intervention),
         node("label", { for: rationale.id, text: tr("Decision rationale") }), rationale,
       ]);
       const controls = node("div", { class: "row" });
-      for (const decision of ["allow", "deny"]) {
-        controls.append(button(decision, async (event) => {
-          const clicked = event.currentTarget;
+      const status = node("div", { role: "status", "aria-live": "polite" });
+      let busy = false;
+      let completed = false;
+      let failed = false;
+      const options = intervention.options?.length ? intervention.options : [
+        { optionId: "legacy.allow", label: "allow", grants: [] },
+        { optionId: "legacy.deny", label: "deny", grants: [] },
+      ];
+      const current = () => taskId === state.taskId && projectId === state.projectId && decisions.dataset.signature === signature;
+      for (const option of options) {
+        const decision = option.optionId === "legacy.allow" ? "allow" : option.optionId === "legacy.deny" ? "deny" : interventionChoice(option, intervention);
+        const choice = node("button", { type: "button", text: interventionText(option.label, intervention.trigger),
+          class: option.optionId === intervention.recommendedAction?.optionId ? "primary" : "",
+          onclick: async () => {
+          if (busy || completed || !current() || !decision) return;
           if (!rationale.value.trim()) { rationale.setCustomValidity(tr("A rationale is required.")); rationale.reportValidity(); return; }
           rationale.setCustomValidity("");
-          const option = intervention.options?.find((entry) => entry.optionId === intervention.recommendedAction?.optionId);
-          if (decision === "allow" && !(await dialogs.confirm("Confirm requested permission", jsonDetails("Exact requested scope", { intervention, grants: option?.grants }), "allow"))) return;
-          if (taskId !== state.taskId || projectId !== state.projectId) return;
-          clicked.disabled = true;
+          const reason = rationale.value.trim();
+          busy = true; failed = false;
+          controls.querySelectorAll("button").forEach((control) => { control.disabled = true; });
+          rationale.readOnly = true;
+          status.replaceChildren(note("Waiting for confirmation or the server. This decision is not recorded yet."));
           try {
-            await request(`${taskPath(taskId)}/decisions`, post({ interventionId: intervention.interventionId, decision, rationale: rationale.value.trim(), ...(decision === "allow" && option?.grants?.[0] ? { grants: option.grants[0] } : {}) }));
+            if ((decision === "allow" || decision === "stop") && !(await dialogs.confirm(
+              decision === "stop" ? "Stop task" : "Confirm requested permission",
+              jsonDetails("Exact requested scope", { interventionId: intervention.interventionId, option, grants: option.grants ?? [] }),
+              interventionText(option.label, intervention.trigger), decision === "stop"))) return;
+            if (!current() || reason !== rationale.value.trim()) return;
+            await request(decision === "stop" ? `${taskPath(taskId)}/control` : `${taskPath(taskId)}/decisions`,
+              post(decision === "stop" ? { kind: "stop", reason } : {
+                interventionId: intervention.interventionId, decision, rationale: reason,
+                ...(option.optionId.startsWith("legacy.") ? {} : { optionId: option.optionId }),
+                ...(decision === "allow" && option.grants?.[0] ? { grants: option.grants[0] } : {}),
+              }));
+            completed = true;
+            status.replaceChildren(note(decision === "stop" ? "Control queued; it applies at the next safe boundary." : "Decision recorded.", "ok"));
             await refresh(taskId);
-          } finally { clicked.disabled = false; }
-        }, decision === "deny" ? "" : "primary"));
+          } catch (error) {
+            failed = true;
+            if (current()) status.replaceChildren(note(error.message, "bad"), note(completed
+              ? "The decision was accepted, but refresh failed. Reconnect to inspect the current state."
+              : "The decision was not confirmed. Reconnect before retrying if the server response is uncertain.", "warn"));
+          } finally {
+            busy = false; rationale.readOnly = completed;
+            if (current()) {
+              if (!completed && !failed) status.replaceChildren();
+              controls.querySelectorAll("button").forEach((control) => { control.disabled = completed || control.dataset.unsupported === "true"; });
+            }
+          }
+        } });
+        choice.disabled = !decision;
+        if (!decision) { choice.dataset.unsupported = "true"; choice.title = tr("This choice cannot be represented by the current decision API. No permission will be granted."); }
+        controls.append(choice);
+        item.append(node("div", { class: "decision-option muted" }, [
+          node("strong", { text: interventionText(option.label, intervention.trigger) }),
+          node("p", { text: [option.effectOnScope, option.effectOnBudget].filter(Boolean).map(interventionText).join(" · ") }),
+          ...(option.optionId === intervention.recommendedAction?.optionId ? [node("p", { text: interventionText(intervention.recommendedAction.rationale, intervention.trigger) })] : []),
+          ...(option.grants?.length ? [node("code", { text: option.grants.join(", ") })] : []),
+        ]));
       }
-      item.append(controls); decisions.append(item);
+      item.append(controls, status); decisions.append(item);
     }
   }
   const evidence = document.getElementById("evidence"); evidence.replaceChildren();

@@ -33,8 +33,12 @@ export function referencesFromWritePaths(paths) {
     .map((value) => ({ kind: /\.[A-Za-z0-9]+$/.test(value) ? "file" : "directory", value }));
 }
 
-export function routedModels(config, role = "builder", runtimeEgress = []) {
+export function routedModels(config, role = "builder", runtimeEgress = [], modelId = "") {
   const enabled = (config?.models ?? []).filter((entry) => entry.enabled);
+  if (modelId) return [...enabled, ...runtimeEgress.filter((entry) => entry.role === role).map((entry) => ({
+    id: entry.modelId, modelName: entry.modelId, kind: entry.local ? "local" : "cloud",
+    endpointHost: entry.endpointHost, multimodal: entry.multimodal, enabled: true,
+  }))].filter((entry) => entry.id === modelId).slice(0, 1);
   const ids = config?.routes?.[role] ?? [];
   const routed = ids.map((id) => enabled.find((entry) => entry.id === id)).filter(Boolean);
   if (routed.length) return routed;
@@ -45,18 +49,18 @@ export function routedModels(config, role = "builder", runtimeEgress = []) {
   }));
 }
 
-export function imageRouteWarning(config, attachments, runtimeEgress = []) {
+export function imageRouteWarning(config, attachments, runtimeEgress = [], modelId = "") {
   if (!attachments.some((entry) => entry.kind === "image")) return null;
-  const models = routedModels(config, "builder", runtimeEgress);
+  const models = routedModels(config, "builder", runtimeEgress, modelId);
   if (!models.length || models.some((model) => model.multimodal !== true)) {
     return "Image input is not declared for every routed model. Remove images or explicitly configure a compatible route; no automatic cloud fallback.";
   }
   return null;
 }
 
-export async function confirmAttachmentEgress(config, attachments, confirm, isCurrent, runtimeEgress = []) {
+export async function confirmAttachmentEgress(config, attachments, confirm, isCurrent, runtimeEgress = [], modelId = "") {
   if (!attachments.length) return {};
-  const models = routedModels(config, "builder", runtimeEgress);
+  const models = routedModels(config, "builder", runtimeEgress, modelId);
   if (!models.length) return null;
   const destinations = models.filter((model) => model.kind === "cloud")
     .map(({ id, modelName, endpointHost, protocol }) => ({ id, modelName, endpointHost, protocol }));

@@ -9,6 +9,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@keystone/extension-trae-cli": "workspace:*",
     "@keystone/extensions": "workspace:*",
     "@keystone/i18n": "workspace:*",
     "@keystone/kernel": "workspace:*",

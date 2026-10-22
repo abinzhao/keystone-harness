@@ -72,7 +72,7 @@ test("the server refuses unauthenticated callers and serves the protocol with a 
 
   try {
     const base = `http://127.0.0.1:${server.port}`;
-    assert.equal(server.protocolVersion, "keystone.run.protocol@1.5.0");
+    assert.equal(server.protocolVersion, "keystone.run.protocol@1.6.0");
 
     // No token, and a wrong token, are both refused.
     const anonymous = await fetch(`${base}/v1/tasks`);

@@ -33,6 +33,8 @@ export { unmetRequiredConditions } from "@keystone/schemas";
 
 export interface EvaluateInput {
   readonly contract: OutcomeContract;
+  /** Recorded intent, supplied by the kernel rather than a verifier or client. */
+  readonly taskIntent?: "analysis" | "engineering";
   readonly branchId: string;
   readonly changedPaths: readonly string[];
   readonly workspaceFingerprint?: string;
@@ -519,10 +521,13 @@ export function evaluateCompletion(input: EvaluateInput): CompletionDecision {
   const cycles = detectCycles(conditions);
   const scopeCheck = checkPaths(input.changedPaths, "write", input.contract.scope);
   const reasons = buildReasons(results, scopeCheck.violations, cycles);
+  if (input.taskIntent === "analysis") {
+    reasons.unshift({ code: "pending", detail: "Analysis conclusions remain unverified; workspace observations do not prove model conclusions." });
+  }
 
   const blocking = results.filter((result) => result.required && !result.satisfied);
   const outcome: ProofOutcome =
-    blocking.length === 0 && cycles.length === 0 && scopeCheck.violations.length === 0
+    input.taskIntent !== "analysis" && blocking.length === 0 && cycles.length === 0 && scopeCheck.violations.length === 0
       ? "proven"
       : "not_proven";
 
@@ -533,7 +538,7 @@ export function evaluateCompletion(input: EvaluateInput): CompletionDecision {
     branchId: input.branchId,
     at: decisionTimestamp(input),
     outcome,
-    reasons,
+    reasons: reasons.slice(0, 64),
     conditionResults: [...results, ...removed].slice(0, 256),
     changedPaths: [...input.changedPaths],
     ...(isSha256(input.workspaceFingerprint) ? { workspaceFingerprint: input.workspaceFingerprint } : {}),

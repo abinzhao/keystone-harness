@@ -9,10 +9,12 @@
 import {
   arrayOf,
   bool,
+  contentHash,
   defineSchema,
   enumOf,
   int,
   nonEmptyStr,
+  nullable,
   num,
   objectOf,
   optional,
@@ -34,7 +36,7 @@ import { dirname } from "node:path";
 
 export const modelConfigEntrySchema = defineSchema(
   "keystone.config.model",
-  "2.1.0",
+  "2.2.0",
   objectOf({
     id: str({ pattern: /^[a-z0-9][a-z0-9._-]{0,63}$/ }),
     kind: enumOf(["cloud", "local"] as const),
@@ -45,9 +47,21 @@ export const modelConfigEntrySchema = defineSchema(
      * a 1.0.0 config with no field is still readable; it defaults to
      * `openai-chat`, the previously only behaviour.
      */
-    protocol: optional(enumOf(MODEL_PROTOCOLS)),
+    protocol: optional(enumOf([...MODEL_PROTOCOLS, "trae-cli-exec"] as const)),
     /** Base URL including the version segment. Required for HTTP models. */
     baseUrl: optional(nonEmptyStr()),
+    cliPath: optional(nonEmptyStr()),
+    /** Approval pins are optional only for reading legacy configs (ADR-0016). */
+    canonicalCliPath: optional(nonEmptyStr()),
+    approvedCliDigest: optional(str({ pattern: /^[a-f0-9]{64}$/ })),
+    /** null records approval without login; undefined requires a new review. */
+    approvedNativeAuthFile: optional(nullable(nonEmptyStr())),
+    /** Optional CLI-owned metadata resource, never its contents. */
+    approvedNativeModelsFile: optional(nullable(nonEmptyStr())),
+    egressHosts: optional(arrayOf(nonEmptyStr(), { maxItems: 16 })),
+    allowPrivateNetwork: optional(bool()),
+    extensionName: optional(nonEmptyStr()),
+    extensionReviewHash: optional(str({ pattern: /^[a-f0-9]{64}$/ })),
     /** Handle of the credential in the credential store. Never the secret. */
     credentialHandle: optional(str({ pattern: /^[a-z0-9][a-z0-9._-]{1,63}$/ })),
     endpointHost: nonEmptyStr(),
@@ -61,7 +75,7 @@ export const modelConfigEntrySchema = defineSchema(
 
 export const keystoneConfigSchema = defineSchema(
   "keystone.config",
-  "2.1.0",
+  "2.2.0",
   objectOf({
     schemaVersion: nonEmptyStr(),
     /**
@@ -138,7 +152,7 @@ function revisionFor(text: string): string {
 
 function parseConfig(value: unknown): KeystoneConfig {
   const config = keystoneConfigSchema.parse(value);
-  if (!["keystone.config@1.0.0", "keystone.config@2.0.0", "keystone.config@2.1.0"].includes(config.schemaVersion)) {
+  if (!["keystone.config@1.0.0", "keystone.config@2.0.0", "keystone.config@2.1.0", "keystone.config@2.2.0"].includes(config.schemaVersion)) {
     throw new Error("unsupported configuration version; preserve the source for export");
   }
   return config;
@@ -152,6 +166,24 @@ export function validateConfigUpdate(value: unknown): KeystoneConfig {
     if (route?.some((id) => !ids.has(id))) throw new Error("route references an unknown model");
   }
   for (const entry of config.models) {
+    if (entry.protocol === "trae-cli-exec") {
+      if (entry.kind !== "cloud" || entry.baseUrl !== undefined || !entry.cliPath?.startsWith("/") ||
+          !entry.extensionName || !entry.extensionReviewHash || !entry.egressHosts?.includes(entry.endpointHost) ||
+          entry.egressHosts.some((host) => !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(host)) ||
+          entry.credentialHandle !== undefined) {
+        throw new Error("CLI models require a reviewed cloud plugin, executable and explicit destinations");
+      }
+      if ((entry.canonicalCliPath !== undefined && !entry.canonicalCliPath.startsWith("/")) ||
+          (entry.approvedNativeAuthFile != null && !entry.approvedNativeAuthFile.startsWith("/")) ||
+          (entry.approvedNativeModelsFile != null && !entry.approvedNativeModelsFile.startsWith("/")) ||
+          (entry.enabled && (!entry.canonicalCliPath || !entry.approvedCliDigest || entry.approvedNativeAuthFile === undefined))) {
+        throw new Error("CLI identity approval pins are required before enabling; review again");
+      }
+    } else if (entry.cliPath !== undefined || entry.extensionName !== undefined || entry.extensionReviewHash !== undefined ||
+        entry.canonicalCliPath !== undefined || entry.approvedCliDigest !== undefined || entry.approvedNativeAuthFile !== undefined ||
+        entry.approvedNativeModelsFile !== undefined) {
+      throw new Error("HTTP models cannot contain CLI transport fields");
+    }
     if (entry.baseUrl !== undefined) {
       const endpoint = new URL(normalizeModelEndpoint(entry.baseUrl));
       if (entry.endpointHost !== endpoint.host) throw new Error("endpointHost must match baseUrl");
@@ -251,8 +283,23 @@ export function stableModelId(input: {
 export function buildAdapter(
   entry: ModelConfigEntry,
   credentials: CredentialResolver,
-  transport: { readonly fetchImpl?: FetchLike; readonly timeoutMs?: number } = {},
+  transport: {
+    readonly fetchImpl?: FetchLike; readonly timeoutMs?: number;
+    readonly pluginFactory?: (entry: ModelConfigEntry) => ModelAdapter;
+  } = {},
 ): ModelAdapter {
+  entry = modelConfigEntrySchema.parse(entry);
+  const configurationDigest = contentHash(entry);
+  const bindConfiguration = (adapter: ModelAdapter): ModelAdapter => ({
+    descriptor: adapter.descriptor,
+    configurationDigest,
+    ...(adapter.transportPermission === undefined ? {} : { transportPermission: adapter.transportPermission }),
+    complete: adapter.complete.bind(adapter),
+  });
+  if (entry.protocol === "trae-cli-exec") {
+    if (transport.pluginFactory === undefined) throw new Error("CLI model requires a runtime plugin factory");
+    return bindConfiguration(transport.pluginFactory(entry));
+  }
   if (entry.baseUrl === undefined) {
     throw new Error(
       `model "${entry.id}" has no baseUrl; HTTP-served models must configure one`,
@@ -287,14 +334,14 @@ export function buildAdapter(
   const options = { descriptor, credentials, baseUrl: entry.baseUrl, ...transport };
   switch (protocol) {
     case "openai-responses":
-      return createOpenAiResponsesAdapter(options);
+      return bindConfiguration(createOpenAiResponsesAdapter(options));
     case "anthropic-messages":
-      return createAnthropicMessagesAdapter(options);
+      return bindConfiguration(createAnthropicMessagesAdapter(options));
     case "gemini-generate":
-      return createGeminiGenerateAdapter(options);
+      return bindConfiguration(createGeminiGenerateAdapter(options));
     case "openai-chat":
     default:
-      return createOpenAiCompatibleAdapter(options);
+      return bindConfiguration(createOpenAiCompatibleAdapter(options));
   }
 }
 

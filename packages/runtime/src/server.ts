@@ -99,6 +99,7 @@ import { compareContinuousBranches, continuousBranchViews, forkContinuousBranch 
 import { createLocalCollaboration } from "./collaboration/index.ts";
 import { ProcessorService, routeInputProcessors, type InputProcessorRegistration } from "./input-processors.ts";
 import { compareBaselineCandidate } from "./baseline-verification.ts";
+import { ModelPluginService, ModelPluginError, buildRuntimeAdapter, withModelTransportPermissions } from "./model-plugins.ts";
 import { checkReleaseReadiness, STABLE_GATES } from "../../../scripts/release/readiness.ts";
 
 const SERVER_DIRECTORY = dirname(fileURLToPath(import.meta.url));
@@ -108,7 +109,7 @@ const SERVER_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 // a 1.0.0/1.1.0 client keeps working, it just loses the low-risk auto-start.
 // 1.5.0 adds draft continuation, local input processing and observation-only
 // historical comparison without changing existing request or response shapes.
-const PROTOCOL_VERSION = "keystone.run.protocol@1.5.0";
+const PROTOCOL_VERSION = "keystone.run.protocol@1.6.0";
 const DEFAULT_INTERVENTION_TIMEOUT_MS = 10 * 60_000;
 
 export interface ServeOptions {
@@ -312,6 +313,11 @@ async function taskDetail(paths: KeystonePaths, taskId: string): Promise<unknown
     proofGraphHash: state.proofGraphHash ?? null,
     proofInvalidated: state.proofInvalidated ?? null,
     request: created?.payload["request"] ?? "",
+    taskIntent: session.taskIntent(),
+    exitReason: state.exitReason ?? null,
+    messages: session.events().filter((event) => event.type === "model.response_recorded").map((event) => ({
+      ...event.payload, at: event.at, eventId: event.eventId,
+    })),
     references: created?.payload["references"] ?? [],
     ledger: {
       events: ledger.events.length,
@@ -472,6 +478,7 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
   let attachments = new AttachmentStore(paths);
   let settings = new SettingsStore(paths);
   let extensions = new ExtensionLifecycleService(defaultRegistryLocation(paths.home));
+  let modelPlugins = new ModelPluginService(paths, extensions);
   let lab = new HarnessLabService({ reportsDirectory: join(paths.home, "lab", "reports") });
   let collaboration = createLocalCollaboration({ paths: () => paths, projects: () => projects.list() });
   let processors = new ProcessorService({ paths, extensions, processors: options.inputProcessors });
@@ -506,7 +513,7 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
       const broker = options.credentials ?? createCredentialBroker({
         credentialsDir: paths.credentialsDir, service: await readCredentialService(paths),
       });
-      runtime.configureModels(enabledModels(configuration.config).map((entry) => buildAdapter(entry, broker)), {
+      runtime.configureModels(enabledModels(configuration.config).map((entry) => buildRuntimeAdapter(entry, broker, modelPlugins)), {
         builder: routeFor(configuration.config, "builder"),
         planner: routeFor(configuration.config, "planner"),
         summarizer: routeFor(configuration.config, "summarizer"),
@@ -518,11 +525,17 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
 
   /** Start a run and answer immediately; decisions arrive over HTTP. */
   const startRun = async (body: Record<string, unknown>, draftTaskId?: string): Promise<{ taskId: string }> => {
+    if (body["taskIntent"] !== undefined && !["analysis", "engineering"].includes(String(body["taskIntent"]))) {
+      throw new HttpError(400, "unknown task intent");
+    }
+    if (body["taskIntent"] === "analysis" && Array.isArray(body["writePaths"]) && body["writePaths"].length) {
+      throw new HttpError(400, "analysis cannot request writable paths");
+    }
     let workspacePath = String(body["workspacePath"] ?? "");
     let requestText = String(body["request"] ?? "");
     let originalAttachments: readonly InputAttachment[] | undefined;
     if (draftTaskId === undefined) {
-      if (workspacePath === "" || requestText === "") {
+      if (workspacePath.trim() === "" || requestText.trim() === "") {
         throw new HttpError(400, "workspacePath and request are required");
       }
       try { workspacePath = (await projects.register({ rootPath: workspacePath })).rootPath; }
@@ -608,7 +621,14 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
     const selected = await attachments.select(projectId, originalAttachments?.map((entry) => entry.attachmentId) ??
       (Array.isArray(body["attachmentIds"]) ? body["attachmentIds"].map(String) : []));
     const configuration = await applyConfiguredModels();
-    const builder = runtime.describeEgress().find((entry) => entry.role === "builder");
+    const requestedModelId = typeof body["modelId"] === "string" ? body["modelId"] : undefined;
+    const descriptor = requestedModelId === undefined ? undefined : runtime.listModels().find((entry) => entry.id === requestedModelId);
+    if (requestedModelId !== undefined && descriptor === undefined) throw new HttpError(400, "selected model is unavailable");
+    const builder = descriptor ? {
+      modelId: descriptor.id, multimodal: descriptor.capabilities.multimodal,
+      local: descriptor.dataEgress.local, endpointHost: descriptor.endpointHost,
+    } : runtime.describeEgress().find((entry) => entry.role === "builder");
+    if (!builder) throw new HttpError(409, "configure a model before starting a task");
     if (selected.some((entry) => entry.kind === "image") && !builder?.multimodal) throw new HttpError(409, "the selected builder does not support image input");
     if (selected.length > 0 && builder?.local === false && body["allowAttachmentEgress"] !== true) {
       throw new HttpError(409, `confirm attachment egress to ${builder.endpointHost} before starting`);
@@ -628,13 +648,17 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
 
     const runOptions: RunDraftTaskOptions = {
         workspacePath,
+        ...(requestedModelId === undefined ? {} : { modelId: requestedModelId }),
         configurationSnapshot: {
           revision: configuration.revision,
           modelIds: runtime.describeEgress().map((entry) => entry.modelId),
           ...(builder === undefined ? {} : { builderModelId: builder.modelId }),
         },
         signal: aborter.signal,
-        autonomy: buildAutonomy(projectId, writePaths, allowedCommands, configuration.config.defaults),
+        autonomy: withModelTransportPermissions(
+          buildAutonomy(projectId, writePaths, allowedCommands, configuration.config.defaults),
+          runtime.listModelAdapters().filter(adapter => !requestedModelId || adapter.descriptor.id === requestedModelId),
+        ),
         // A confirmed (or auto-started low-risk) run accepts the compiled
         // contract without an extra round trip; an unconfirmed write never
         // reaches here — it was refused above.
@@ -673,6 +697,7 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
       ? runtime.runTask({
           ...runOptions,
           request: requestText,
+          ...(body["taskIntent"] === undefined ? {} : { taskIntent: body["taskIntent"] as "analysis" | "engineering" }),
           attachments: selected,
           attachmentParts: await attachments.parts(selected,
             Math.min(24_000, (configuration.config.defaults?.maxTokens ?? 300_000) * 2)),
@@ -790,6 +815,17 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
       }
 
       const segments = url.pathname.slice("/v1/".length).split("/").filter((part) => part !== "");
+      if (segments[0] === "model-plugins" && segments[1] === "trae-cli") {
+        if (request.method === "GET" && segments.length === 2) {
+          json(response, 200, await modelPlugins.status()); return;
+        }
+        if (request.method === "POST" && segments.length === 3) {
+          const result = await modelPlugins.operate(segments[2]!, await readBody(request) as Record<string, unknown>);
+          if (segments[2] === "enable") await applyConfiguredModels();
+          json(response, 200, result); return;
+        }
+        throw new HttpError(405, "unsupported model plugin operation");
+      }
       if (managingData) throw new HttpError(409, "data management is in progress; retry after it finishes");
       const isManagement = request.method === "POST" && segments[0] === "data" &&
         ["cleanup", "migrate"].includes(segments[1] ?? "");
@@ -817,6 +853,7 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
           attachments = new AttachmentStore(paths);
           settings = new SettingsStore(paths);
           extensions = new ExtensionLifecycleService(defaultRegistryLocation(paths.home));
+          modelPlugins = new ModelPluginService(paths, extensions);
           lab = new HarnessLabService({ reportsDirectory: join(paths.home, "lab", "reports") });
           collaboration = createLocalCollaboration({ paths: () => paths, projects: () => projects.list() });
           processors = new ProcessorService({ paths, extensions, processors: options.inputProcessors });
@@ -1276,6 +1313,13 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
             });
             return;
           }
+          if (intervention.taskId !== taskId) throw new HttpError(400, "intervention belongs to another task");
+          const optionId = typeof body["optionId"] === "string" ? body["optionId"] : undefined;
+          const option = optionId === undefined ? undefined : intervention.options.find(entry => entry.optionId === optionId);
+          if (optionId !== undefined && option === undefined) throw new HttpError(400, "unknown intervention option");
+          if (option && body["grants"] !== undefined && !option.grants.includes(body["grants"] as Capability)) {
+            throw new HttpError(400, "capability differs from the selected option");
+          }
 
           // Validated here rather than left to the schema, whose failure would be
           // an unhelpful 500: a decision must name a choice and record a reason,
@@ -1301,6 +1345,7 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
             branchId: intervention.branchId,
             at: nowIso(),
             decision: choice,
+            ...(optionId === undefined ? {} : { optionId }),
             rationale,
             appliesTo: {
               ...(body["grants"] === undefined
@@ -1523,7 +1568,7 @@ export async function startServer(options: ServeOptions = {}): Promise<RunningSe
         return;
       }
       if (error instanceof LocalPackageError) { json(response, 400, { error: error.message }); return; }
-      if (error instanceof SettingsError || error instanceof AttachmentError || error instanceof ProjectServiceError || error instanceof FileServiceError) {
+      if (error instanceof ModelPluginError || error instanceof SettingsError || error instanceof AttachmentError || error instanceof ProjectServiceError || error instanceof FileServiceError) {
         json(response, error.status, { error: error.message }); return;
       }
       if (error instanceof WorkspaceBusyError) { json(response, 409, { error: error.message }); return; }

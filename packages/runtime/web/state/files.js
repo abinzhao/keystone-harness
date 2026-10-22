@@ -1,6 +1,8 @@
 import { post, projectPath } from "../client/api.js";
+import { createFileDraftStore } from "./file-drafts.js";
 
-export function createFileClient({ request, onMutation = () => {} }) {
+export function createFileClient({ request, storage = null, draftLimits, now, onMutation = () => {} }) {
+  const drafts = createFileDraftStore(storage, { limits: draftLimits, now });
   const state = { projectId: null, tabs: [], active: null, entries: [], directory: "", nextOffset: null, results: [], truncated: false, loading: false, error: "", undo: null };
   const listeners = new Set();
   const projects = new Map();
@@ -13,9 +15,21 @@ export function createFileClient({ request, onMutation = () => {} }) {
   const emit = () => listeners.forEach((listener) => listener(state));
   const controller = () => { const value = new AbortController(); requests.add(value); return value; };
   const current = () => state.tabs.find((tab) => tab.path === state.active);
+  const persist = (projectId, tab) => {
+    // A disk conflict must survive refresh without rebasing the recovery draft.
+    tab.draftIssue = tab.dirty ? drafts.set(projectId, { ...tab, hash: tab.conflict?.expectedHash ?? tab.hash }) : drafts.remove(projectId, tab.path);
+  };
   const client = {
     state,
     current,
+    recoverableDrafts() { return drafts.list(state.projectId); },
+    discardStoredDraft(path) {
+      const tab = state.tabs.find((entry) => entry.path === path);
+      if (tab?.saving || tab?.dirty) return;
+      if (tab) { tab.recovery = null; tab.draftIssue = drafts.remove(state.projectId, path); }
+      else drafts.remove(state.projectId, path);
+      emit();
+    },
     subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
     setProject(projectId) {
       if (state.projectId === projectId) return;
@@ -57,6 +71,8 @@ export function createFileClient({ request, onMutation = () => {} }) {
       const existing = state.tabs.find((tab) => tab.path === path);
       if (existing && !reload) { state.active = path; existing.line = line; emit(); return; }
       const selected = version;
+      const editGeneration = existing?.editGeneration ?? 0;
+      const expectedHash = existing?.conflict?.expectedHash ?? existing?.hash;
       const sequence = ++readVersion;
       reads.set(path, sequence);
       const abort = controller();
@@ -64,17 +80,51 @@ export function createFileClient({ request, onMutation = () => {} }) {
       try {
         const data = await request(`${projectPath(state.projectId)}/file?${new URLSearchParams({ path })}`, { signal: abort.signal });
         if (abort.signal.aborted || selected !== version || reads.get(path) !== sequence) return;
-        const draft = savedContent != null && existing?.draft !== savedContent ? existing.draft : data.content ?? "";
-        const tab = { ...data, draft, conflict: null, line, dirty: draft !== (data.content ?? "") };
+        const preserveDraft = existing && (existing.editGeneration !== editGeneration
+          || (savedContent != null && (existing.draft !== savedContent || data.hash !== expectedHash)));
+        const draft = preserveDraft ? existing.draft : data.content ?? "";
+        const conflict = preserveDraft && data.hash !== expectedHash ? { expectedHash, actualHash: data.hash } : null;
+        const stored = !existing ? drafts.get(state.projectId, path) : { record: null, issue: null };
+        const recovery = stored.record && stored.record.draft !== data.content
+          ? { ...stored.record, conflict: stored.record.hash !== data.hash } : null;
+        const tab = { ...data, draft, recovery, draftIssue: stored.issue, saving: existing?.saving ?? false, conflict, editGeneration: existing?.editGeneration ?? 0, line, dirty: draft !== (data.content ?? "") };
         const index = state.tabs.findIndex((item) => item.path === path);
         if (index === -1) state.tabs.push(tab); else state.tabs[index] = tab;
+        if (existing) persist(state.projectId, tab);
         if (sequence === readVersion) state.active = path;
         state.error = "";
       } catch (error) { if (!abort.signal.aborted && selected === version) state.error = error.message; }
       finally { requests.delete(abort); if (selected === version) { state.loading = false; emit(); } }
     },
-    edit(content) { const tab = current(); if (tab) { tab.draft = content; tab.dirty = content !== tab.content; } },
+    edit(content) {
+      const tab = current();
+      if (tab && !tab.binary && !tab.truncated && !tab.recovery) {
+        tab.editGeneration += 1;
+        tab.draft = content; tab.dirty = content !== tab.content;
+        persist(state.projectId, tab);
+      }
+    },
+    recoverDraft({ acceptDiskChange = false } = {}) {
+      const tab = current();
+      if (!tab?.recovery || tab.binary || tab.truncated || (tab.recovery.conflict && !acceptDiskChange)) return false;
+      tab.editGeneration += 1;
+      tab.draft = tab.recovery.draft; tab.recovery = null; tab.dirty = tab.draft !== tab.content;
+      persist(state.projectId, tab); emit(); return true;
+    },
+    discardDraft() {
+      const tab = current();
+      if (!tab || tab.saving) return;
+      tab.editGeneration += 1;
+      tab.recovery = null; tab.conflict = null; tab.draft = tab.content ?? ""; tab.dirty = false;
+      tab.draftIssue = drafts.remove(state.projectId, tab.path); emit();
+    },
+    hasUnsavedDrafts() {
+      return [...projects.values(), state].some((project) => project.tabs.some((tab) => tab.dirty || tab.recovery || tab.saving));
+    },
     close(path) {
+      const tab = state.tabs.find((entry) => entry.path === path);
+      if (tab?.saving) return;
+      if (tab) drafts.remove(state.projectId, path);
       state.tabs = state.tabs.filter((tab) => tab.path !== path);
       if (state.active === path) state.active = state.tabs.at(-1)?.path ?? null;
       emit();
@@ -103,13 +153,31 @@ export function createFileClient({ request, onMutation = () => {} }) {
     },
     async save() {
       const tab = current();
-      if (!tab || tab.binary || tab.truncated || tab.conflict || !tab.dirty) return;
+      if (!tab || tab.binary || tab.truncated || tab.conflict || tab.recovery || tab.saving || !tab.dirty) return;
       const selected = version;
+      const projectId = state.projectId;
       const content = tab.draft;
-      const result = await client.mutate({ operation: "write", path: tab.path, content, expectedHash: tab.hash });
-      if (!result || selected !== version) return;
-      // A reload reconciles the exact server hash, without losing edits made during save.
-      await client.open(tab.path, tab.line, true, content);
+      tab.saving = true; emit();
+      try {
+        const result = await client.mutate({ operation: "write", path: tab.path, content, expectedHash: tab.hash });
+        if (!result) return;
+        if (typeof result.hash === "string") {
+          tab.content = content; tab.hash = result.hash; tab.dirty = tab.draft !== content;
+          persist(projectId, tab);
+        }
+        if (selected !== version) {
+          // The tab still belongs to its cached project, not the selected project's editor.
+          return;
+        }
+        await client.open(tab.path, tab.line, true, content);
+      } finally {
+        tab.saving = false;
+        if (selected === version) {
+          const active = state.tabs.find((entry) => entry.path === tab.path);
+          if (active) active.saving = false;
+          emit();
+        }
+      }
     },
     async undo() {
       if (!state.undo) return;

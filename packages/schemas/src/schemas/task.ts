@@ -270,6 +270,7 @@ export const EVENT_TYPES = [
   "contract.revised",
   // context and budget
   "context.plan_created",
+  "model.response_recorded",
   "budget.consumed",
   "degradation.applied",
   // execution
@@ -332,7 +333,7 @@ export type EventActorKind = (typeof EVENT_ACTOR_KINDS)[number];
  */
 export const runEventSchema = defineSchema(
   "keystone.run.event",
-  "1.0.0",
+  "1.1.0",
   objectOf(
     {
       eventId: eventIdValidator,

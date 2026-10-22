@@ -12,12 +12,12 @@ const PROTOCOLS = [
 ];
 const copy = (value) => JSON.parse(JSON.stringify(value));
 
-export function createSettingsView(host, { request, dialogs, state, capabilities, onPresentation, onSaved, shell, openNativeConfiguration }) {
+export function createSettingsView(host, { request, dialogs, state, capabilities, onPresentation, onSaved, shell, openNativeConfiguration, openModelPlugins, initialPage = "appearance" }) {
   let disposed = false;
   let settings = null;
   let draft = null;
   let presentation = null;
-  let page = "appearance";
+  let page = PAGES.some(([id]) => id === initialPage) ? initialPage : "appearance";
   let dirty = false;
   let inventory = null;
   let editVersion = 0;
@@ -146,12 +146,20 @@ export function createSettingsView(host, { request, dialogs, state, capabilities
   function models() {
     content.append(note("Discovery and generation send real requests only when clicked. Save a model before probing it."));
     if (shell && openNativeConfiguration) content.append(button("Configure model and credential", openNativeConfiguration));
+    if (openModelPlugins) content.append(button("Manage CLI models", openModelPlugins));
     content.append(button("Add model", () => {
       draft.models.push({ id: `model-${crypto.randomUUID().slice(0, 8)}`, kind: "local", provider: "custom", modelName: "", protocol: "openai-chat", baseUrl: "", endpointHost: "", enabled: true });
       changed(); render();
     }));
     for (const entry of draft.models) {
       const section = node("div", { class: "model-entry" });
+      if (entry.protocol === "trae-cli-exec") {
+        section.append(node("h4", { text: entry.modelName || entry.id }),
+          note("This transport is managed by the CLI plugin. Configure and check it in Extensions; HTTP fields do not apply."),
+          jsonDetails("CLI model configuration", entry));
+        content.append(section);
+        continue;
+      }
       const kind = selectField("Location", `kind-${entry.id}`, [["local", "Local"], ["cloud", "Cloud"]], entry.kind);
       kind.input.onchange = () => { entry.kind = kind.input.value; changed(); };
       const protocol = selectField("Protocol", `protocol-${entry.id}`, PROTOCOLS, entry.protocol ?? "openai-chat");

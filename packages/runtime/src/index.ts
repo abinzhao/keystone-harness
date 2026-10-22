@@ -23,4 +23,5 @@ export * from "./continuous-branches.ts";
 export * from "./extension-integration.ts";
 export * from "./extension-context.ts";
 export * from "./input-processors.ts";
+export * from "./model-plugins.ts";
 export * from "./collaboration/index.ts";
